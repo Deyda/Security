@@ -12,10 +12,10 @@
 # including update planning, applicable workarounds, and validation.
 # 
 # Read-only. Run from the ADC shell. Firmware is detected from /nsconfig/ns.conf;
-# Enhanced ISN is taken from live CLI input or arguments. Exported-config mode uses ns.conf:
+# Enhanced ISN is read from saved /nsconfig/ns.conf by default; explicit CLI input or arguments override it.
 # sh /path/to/netscaler-ioc-check.sh
 # or
-# # sh /path/to/netscaler-ioc-check.sh 14.1-73.37.nc ENABLED
+# sh /path/to/netscaler-ioc-check.sh 14.1-73.37.nc ENABLED
 # 
 # Exported configuration: sh /path/to/netscaler-ioc-check.sh --config /path/to/ns.conf
 # 
