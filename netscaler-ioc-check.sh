@@ -1,6 +1,6 @@
 #!/bin/sh
 # NetScaler ADC defensive triage helper
-# Version 9.15
+# Version 9.17
 #
 # Deyda Consulting GmbH
 # Website: https://www.deyda-consulting.de
@@ -8,13 +8,27 @@
 # NetScaler Security Readiness: https://www.deyda-consulting.de/expertise/netscaler-security-readiness/
 # Security Readiness provides managed NetScaler security update readiness,
 # including update planning, applicable workarounds, and validation.
-# Read-only. Run from the ADC shell. Firmware is detected from /nsconfig/ns.conf;
-# Enhanced ISN is read from saved /nsconfig/ns.conf by default; explicit CLI input or arguments override it.
-# sh /path/to/netscaler-ioc-check.sh 14.1-73.37.nc ENABLED
-# Optional third argument: fixed-build installation date (YYYY-MM-DD), used for log-retention context.
-# Exported configuration: sh /path/to/netscaler-ioc-check.sh --config /path/to/ns.conf
+# Read-only. Run from the ADC shell. No interactive prompts are used. Missing or
+# undetected values stay UNKNOWN and produce CHECK results; the scan continues.
+#
+# Positional parameters (in this exact order):
+#   1. FIRMWARE_VERSION  Version/build from "show ns version", e.g. 14.1-73.37.nc.
+#                        If omitted, the script tries /nsconfig/ns.conf, then nsconmsg.
+#   2. ENHANCED_ISN      ENABLED or DISABLED (or the full CLI output). If omitted, the
+#                        saved /nsconfig/ns.conf setting is used; absent means DISABLED.
+#   3. PATCH_DATE        Date the fixed build was installed, in YYYY-MM-DD format.
+#                        This is optional and is used to assess available pre-patch log coverage.
+#
+# Run with automatic detection / no prompts:
+#   sh /path/to/netscaler-ioc-check.sh
+# Supply all values explicitly:
+#   sh /path/to/netscaler-ioc-check.sh 14.1-73.37.nc ENABLED 2026-09-28
+# Scan an exported ns.conf (configuration checks only; no appliance/log checks):
+#   sh /path/to/netscaler-ioc-check.sh --config /path/to/ns.conf 14.1-73.37.nc ENABLED 2026-09-28
+# Do not pass a compact date such as 20260928: PATCH_DATE must be YYYY-MM-DD.
 # Report statuses: [OK] no finding in the scanned scope; [ACTION] potential indicator requires investigation;
 # [CHECK] manual validation is needed or scan coverage is incomplete.
+# The plain-text report is saved in /var/tmp.
 
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 export PATH
@@ -26,12 +40,13 @@ CONFIG=/nsconfig/ns.conf
 RUNNING_ON_ADC=YES
 
 # Prefer explicitly supplied CLI output; otherwise detect the build from the saved
-# configuration header, then nsconmsg. Ask the operator only if neither is available.
+# configuration header, then nsconmsg. If neither is available, continue with an unknown build.
 CURRENT_INPUT=${1-}
 ISN_INPUT=${2-}
 PATCH_DATE_INPUT=${3-}
 ISN_CONFIG_STATE=NOT_EXPLICITLY_SET
-ISN_SOURCE='operator-supplied value'
+ISN_SOURCE='not supplied'
+if [ -n "$ISN_INPUT" ]; then ISN_SOURCE='operator-supplied value'; fi
 if [ "${1-}" = '--config' ]; then
     CONFIG=${2-}
     CURRENT_INPUT=${3-}
@@ -53,10 +68,6 @@ if [ -z "$CURRENT_INPUT" ]; then
     if [ -n "$VERSION_LINE" ]; then
         CURRENT_INPUT=$(printf '%s\n' "$VERSION_LINE" | sed -E -n 's/.*NS([0-9]+\.[0-9]+) Build ([0-9]+\.[0-9]+).*/\1-\2/p')
     fi
-    if [ -z "$CURRENT_INPUT" ]; then
-        printf 'Build could not be detected. Enter the version/build from "show ns version" (or press Enter to skip): ' >&2
-        IFS= read -r CURRENT_INPUT || CURRENT_INPUT=''
-    fi
 fi
 
 # Read Enhanced ISN from the saved ns.conf by default. An explicit CLI value
@@ -74,10 +85,6 @@ if [ -z "$ISN_INPUT" ]; then
     elif [ "$ISN_CONFIG_STATE" = DISABLED_DEFAULT ]; then
         ISN_INPUT=DISABLED
         ISN_SOURCE='saved configuration default (directive absent; Citrix default is DISABLED)'
-    else
-        printf 'No readable ns.conf setting found. Enter the current CLI output or ENABLED/DISABLED (Enter to skip): ' >&2
-        IFS= read -r ISN_INPUT || ISN_INPUT=''
-        if [ -n "$ISN_INPUT" ]; then ISN_SOURCE='operator-supplied CLI value'; else ISN_SOURCE='not supplied'; fi
     fi
 fi
 ISN_NORMALIZED=$(printf '%s\n' "$ISN_INPUT" | tr '[:lower:]' '[:upper:]')
@@ -97,6 +104,7 @@ status() { printf '[%s] %s\n' "$1" "$2"; }
 FW_PATCHED=UNKNOWN
 
 printf 'NetScaler IOC and CVE triage report\nHost: %s\nTime: %s\n' "$HOST" "$NOW"
+printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n'
 printf 'Mode: read-only; no configuration changes, restarts, or cleanup performed\n'
 printf 'Report: %s\n' "$OUT"
 printf 'Interpretation: [OK] means no matching indicator was found in the scanned source; it does not prove the appliance is clean or patched.\n'
@@ -649,10 +657,6 @@ fi
 section 'Log coverage and event analysis'
 printf '\n--- Log retention and pre-patch coverage ---\n'
 printf 'The checks below only cover files currently available on this appliance. File timestamps are a retention clue, not proof that logs are complete or contain every event.\n'
-if [ -z "$PATCH_DATE_INPUT" ]; then
-    printf 'Enter fixed-build installation date as YYYY-MM-DD (or press Enter to skip): '
-    IFS= read -r PATCH_DATE_INPUT || PATCH_DATE_INPUT=''
-fi
 LOG_FILES_LIST=''
 for pattern in /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages*; do
     for f in $pattern; do
