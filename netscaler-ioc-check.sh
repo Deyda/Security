@@ -1,6 +1,6 @@
 #!/bin/sh
 # NetScaler ADC defensive triage helper
-# Version 9.21
+# Version 9.27
 #
 # Deyda Consulting GmbH
 # Website: https://www.deyda-consulting.de
@@ -8,6 +8,13 @@
 # NetScaler Security Readiness: https://www.deyda-consulting.de/expertise/netscaler-security-readiness/
 # NetScaler CVE checklist (DE): https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/
 # NetScaler CVE checklist (EN): https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/
+# Public NetScaler detection research (PitScaler): https://pitscaler.com/netscaler-detection/
+# Public NetScaler IoCs: https://pitscaler.com/netscaler-iocs/
+# Remediation and timeline context: https://pitscaler.com/netscaler-remediation/ and https://pitscaler.com/netscaler-timeline/
+# CVE-2026-88771 log-chain checks are independently implemented from CERT-EU's
+# public incident analysis: https://cert.europa.eu/blog/taking-execute-logging-a-bit-too-literally-cve-2026-88771
+# Incident-response reminders follow Citrix CTX694799. Matches are leads, not
+# proof of compromise or attribution.
 # Security Readiness provides managed NetScaler security update readiness,
 # including update planning, applicable workarounds, and validation.
 # Read-only. Run from the ADC shell. No interactive prompts are used. Missing or
@@ -15,19 +22,20 @@
 #
 # Positional parameters (in this exact order):
 #   1. FIRMWARE_VERSION  Version/build from "show ns version", e.g. 14.1-73.37.nc.
-#                        If omitted, the script tries /nsconfig/ns.conf, then nsconmsg.
+#                        If omitted, it prefers the running kernel path and live
+#                        nsconmsg; saved loader/config files are fallback sources.
 #   2. ENHANCED_ISN      ENABLED or DISABLED (or the full CLI output). If omitted, the
 #                        saved /nsconfig/ns.conf setting is used; absent means DISABLED.
-#   3. PATCH_DATE        Date the fixed build was installed, in YYYY-MM-DD format.
-#                        This is optional and is used to assess available pre-patch log coverage.
+#   No third positional parameter is used. On an ADC, the script reads the
+#   modification time of /var/nsinstall/installns_state as the install marker.
+#   Confirm this timestamp against change records; exported-config mode has no marker.
 #
 # Run with automatic detection / no prompts:
 #   sh /path/to/netscaler-ioc-check.sh
 # Supply all values explicitly:
-#   sh /path/to/netscaler-ioc-check.sh 14.1-73.37.nc ENABLED 2026-09-28
+#   sh /path/to/netscaler-ioc-check.sh 14.1-73.37.nc ENABLED
 # Scan an exported ns.conf (configuration checks only; no appliance/log checks):
-#   sh /path/to/netscaler-ioc-check.sh --config /path/to/ns.conf 14.1-73.37.nc ENABLED 2026-09-28
-# Do not pass a compact date such as 20260928: PATCH_DATE must be YYYY-MM-DD.
+#   sh /path/to/netscaler-ioc-check.sh --config /path/to/ns.conf 14.1-73.37.nc ENABLED
 # Report statuses: [OK] no finding in the scanned scope; [ACTION] potential indicator requires investigation;
 # [CHECK] manual validation is needed or scan coverage is incomplete.
 # The plain-text report is saved in /var/tmp.
@@ -41,11 +49,15 @@ OUT="/var/tmp/netscaler-ioc-check_${HOST}_${NOW}.txt"
 CONFIG=/nsconfig/ns.conf
 RUNNING_ON_ADC=YES
 
-# Prefer explicitly supplied CLI output; otherwise detect the build from the saved
-# configuration header, then nsconmsg. If neither is available, continue with an unknown build.
+# Prefer an explicitly supplied version. Otherwise, on an ADC prefer the booted
+# kernel path, then live nsconmsg, then the active boot loader configuration.
+# The saved ns.conf header is only a last fallback because it can be stale after upgrade.
 CURRENT_INPUT=${1-}
 ISN_INPUT=${2-}
-PATCH_DATE_INPUT=${3-}
+VERSION_SOURCE='not determined'
+CONFIG_VERSION_LINE=''
+CONFIG_VERSION=''
+RUNTIME_FAMILY=''
 ISN_CONFIG_STATE=NOT_EXPLICITLY_SET
 ISN_SOURCE='not supplied'
 if [ -n "$ISN_INPUT" ]; then ISN_SOURCE='operator-supplied value'; fi
@@ -53,7 +65,6 @@ if [ "${1-}" = '--config' ]; then
     CONFIG=${2-}
     CURRENT_INPUT=${3-}
     ISN_INPUT=${4-}
-    PATCH_DATE_INPUT=${5-}
     RUNNING_ON_ADC=NO
 elif [ -n "${1-}" ] && [ -r "${1-}" ] && [ -f "${1-}" ]; then
     CONFIG=$1
@@ -61,14 +72,52 @@ elif [ -n "${1-}" ] && [ -r "${1-}" ] && [ -f "${1-}" ]; then
     ISN_INPUT=${2-}
     RUNNING_ON_ADC=NO
 fi
-if [ -z "$CURRENT_INPUT" ]; then
-    VERSION_LINE=''
-    if [ -r "$CONFIG" ]; then VERSION_LINE=$(head -n 5 "$CONFIG" 2>/dev/null | grep -iE '^#NS[0-9]+\.[0-9]+ Build' | head -1); fi
-    if [ -z "$VERSION_LINE" ] && command -v nsconmsg >/dev/null 2>&1; then
-        VERSION_LINE=$(nsconmsg -K /var/nslog/newnslog -d setime 2>/dev/null | grep -iE 'NS[0-9]+\.[0-9]+ Build' | head -1)
+if [ -r "$CONFIG" ]; then
+    CONFIG_VERSION_LINE=$(head -n 5 "$CONFIG" 2>/dev/null | grep -iE '^#NS[0-9]+\.[0-9]+ Build' | head -1)
+    CONFIG_VERSION=$(printf '%s\n' "$CONFIG_VERSION_LINE" | sed -E -n 's/.*NS([0-9]+\.[0-9]+) Build ([0-9]+\.[0-9]+).*/\1-\2/p')
+fi
+if [ -n "$CURRENT_INPUT" ]; then
+    VERSION_SOURCE='operator-supplied version'
+else
+    if [ "$RUNNING_ON_ADC" = YES ]; then
+        RUNTIME_FAMILY=$(uname -r 2>/dev/null | sed -nE 's/.*NETSCALER-([0-9]+\.[0-9]+).*/\1/p')
+        BOOT_KERNEL=$(sysctl -n kern.bootfile 2>/dev/null)
+        BOOT_VERSION=$(printf '%s\n' "$BOOT_KERNEL" | sed -nE 's/.*ns-([0-9]+\.[0-9]+)-([0-9]+\.[0-9]+).*/\1-\2/p')
+        if [ -n "$BOOT_VERSION" ]; then
+            CURRENT_INPUT=$BOOT_VERSION
+            VERSION_SOURCE="running kernel path ($BOOT_KERNEL)"
+        fi
+        if [ -z "$CURRENT_INPUT" ] && command -v nsconmsg >/dev/null 2>&1; then
+            LIVE_VERSION_LINE=$(nsconmsg -K /var/nslog/newnslog -d setime 2>/dev/null | grep -iE 'NS[0-9]+\.[0-9]+ Build' | head -1)
+            LIVE_VERSION=$(printf '%s\n' "$LIVE_VERSION_LINE" | sed -E -n 's/.*NS([0-9]+\.[0-9]+) Build ([0-9]+\.[0-9]+).*/\1-\2/p')
+            LIVE_FAMILY=$(printf '%s\n' "$LIVE_VERSION" | sed -nE 's/^([0-9]+\.[0-9]+)-.*/\1/p')
+            if [ -n "$LIVE_VERSION" ] && { [ -z "$RUNTIME_FAMILY" ] || [ "$LIVE_FAMILY" = "$RUNTIME_FAMILY" ]; }; then
+                CURRENT_INPUT=$LIVE_VERSION
+                VERSION_SOURCE='live nsconmsg output'
+            fi
+        fi
     fi
-    if [ -n "$VERSION_LINE" ]; then
-        CURRENT_INPUT=$(printf '%s\n' "$VERSION_LINE" | sed -E -n 's/.*NS([0-9]+\.[0-9]+) Build ([0-9]+\.[0-9]+).*/\1-\2/p')
+    if [ -z "$CURRENT_INPUT" ]; then
+        LOADER_KERNEL=$(grep -hE '^[[:space:]]*kernel[[:space:]]*=' /flash/boot/loader.conf /flash/boot/loader.conf.local 2>/dev/null | tail -1)
+        LOADER_VERSION=$(printf '%s\n' "$LOADER_KERNEL" | sed -nE 's/.*ns-([0-9]+\.[0-9]+)-([0-9]+\.[0-9]+).*/\1-\2/p')
+        LOADER_FAMILY=$(printf '%s\n' "$LOADER_VERSION" | sed -nE 's/^([0-9]+\.[0-9]+)-.*/\1/p')
+        if [ -n "$LOADER_VERSION" ] && { [ -z "$RUNTIME_FAMILY" ] || [ "$LOADER_FAMILY" = "$RUNTIME_FAMILY" ]; }; then
+            CURRENT_INPUT=$LOADER_VERSION
+            VERSION_SOURCE='boot loader configuration (configured kernel; not proof of the currently booted kernel)'
+        fi
+    fi
+    if [ -z "$CURRENT_INPUT" ] && [ -n "$RUNTIME_FAMILY" ]; then
+        CURRENT_INPUT=$RUNTIME_FAMILY
+        VERSION_SOURCE='running kernel release family only; build number unavailable'
+    fi
+    if [ -z "$CURRENT_INPUT" ] && [ -n "$CONFIG_VERSION" ]; then
+            if [ "$RUNNING_ON_ADC" != YES ] || [ -z "$RUNTIME_FAMILY" ] || [ "${CONFIG_VERSION%%-*}" = "$RUNTIME_FAMILY" ]; then
+                CURRENT_INPUT=$CONFIG_VERSION
+                VERSION_SOURCE="saved configuration header ($CONFIG; fallback only)"
+            else
+                CURRENT_INPUT=$RUNTIME_FAMILY
+                VERSION_SOURCE='running kernel release family only; saved config header disagrees and build is unavailable'
+            fi
     fi
 fi
 
@@ -106,18 +155,33 @@ status() { printf '[%s] %s\n' "$1" "$2"; }
 FW_PATCHED=UNKNOWN
 
 printf 'NetScaler IOC and CVE triage report\nHost: %s\nTime: %s\n' "$HOST" "$NOW"
-printf 'Script version: 9.21\n'
+printf 'Script version: 9.27\n'
 printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n'
 printf 'Related articles (DE): https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
 printf 'Related articles (EN): https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/\n'
+printf 'Additional public detection research: https://pitscaler.com/netscaler-detection/ (independent snapshot; indicator coverage changes over time)\n'
 printf 'Mode: read-only; no configuration changes, restarts, or cleanup performed\n'
 printf 'Report: %s\n' "$OUT"
-printf 'Interpretation: [OK] means no matching indicator was found in the scanned source; it does not prove the appliance is clean or patched.\n'
-printf 'Build input/source: %s\n' "${CURRENT_INPUT:-not supplied}"
+printf 'Interpretation: [OK] no match in scanned scope; [CHECK] verify evidence/context; [ACTION] preserve and investigate promptly.\n'
+printf 'Build input/source: %s / %s\n' "${CURRENT_INPUT:-not supplied}" "$VERSION_SOURCE"
+if [ "$RUNNING_ON_ADC" = YES ] && [ -n "$CONFIG_VERSION" ] && [ -n "$RUNTIME_FAMILY" ] && [ "${CONFIG_VERSION%%-*}" != "$RUNTIME_FAMILY" ]; then
+    status CHECK "Saved ns.conf header reports $CONFIG_VERSION, but the running kernel release identifies $RUNTIME_FAMILY. The running-kernel source takes precedence; treat the saved header as stale until verified."
+elif [ "$RUNNING_ON_ADC" = YES ] && [ -n "$CONFIG_VERSION" ] && [ -n "$CURRENT_INPUT" ] && [ "$CONFIG_VERSION" != "$CURRENT_INPUT" ] && [ "$VERSION_SOURCE" != 'operator-supplied version' ] && [ "$CURRENT_INPUT" = *-* ]; then
+    status CHECK "Saved ns.conf header reports $CONFIG_VERSION while the running build source reports $CURRENT_INPUT. The saved header may be stale after upgrade."
+fi
 printf 'Enhanced ISN state/source: %s / %s\n' "$ISN_STATE" "$ISN_SOURCE"
 printf 'Enhanced ISN setting in saved config %s: %s\n' "$CONFIG" "$ISN_CONFIG_STATE"
 
-section 'Platform and uptime'
+section 'How to read this report'
+cat <<'READ_GUIDE'
+[OK] means the selected pattern was not found in the source and time range the check scanned. It is not a clean bill of health.
+[CHECK] means the output needs human validation, usually against an approved change, a trusted same-build baseline, or a wider evidence source.
+[ACTION] means a higher-priority indicator matched. Preserve the relevant evidence and correlate it before cleanup, restart, or rebuild. It is not automatic proof that the appliance was compromised.
+
+Read the report in this order: firmware/CVE applicability; host integrity and persistence; web configuration and files; log coverage and attack indicators; then the final next-action list.
+READ_GUIDE
+
+section '1. Platform and uptime'
 if [ "$RUNNING_ON_ADC" = YES ]; then
     uname -a 2>&1
     uptime 2>&1
@@ -125,7 +189,10 @@ else
     status CHECK "Offline configuration mode: host checks and live ADC state are not available; config file is $CONFIG."
 fi
 
-section 'Security bulletin and CVE configuration checks'
+section '2. Firmware and CVE applicability'
+subsection 'Purpose and follow-up'
+printf '%s\n' 'Purpose: compare the detected build with the bulletin threshold and inventory saved-config preconditions.'
+printf '%s\n' 'If below threshold: schedule the fixed build. If at/above threshold: treat matching config lines as historical-exposure context, then review the pre-update logs and file evidence.'
 cat <<'NOTE'
 Citrix fixed-build thresholds stated in the bulletin:
   Standard 14.1: 14.1-73.37 or later
@@ -161,16 +228,20 @@ if [ -n "$CURRENT_INPUT" ]; then
             printf '\nFirmware comparison: detected %s build %s; required fixed build is %s-%s or later.\n' "$FW_FAMILY" "$FW_BUILD" "$FW_FAMILY" "$REQUIRED_BUILD"
             if [ "$FW_MAJOR" -gt "$REQ_MAJOR" ] || { [ "$FW_MAJOR" -eq "$REQ_MAJOR" ] && [ "$FW_MINOR" -ge "$REQ_MINOR" ]; }; then
                 FW_PATCHED=YES
-                status OK 'Entered firmware build meets or exceeds the fixed-build threshold in the bulletin.'
+                status OK 'Detected/supplied firmware build meets or exceeds the fixed-build threshold in the bulletin.'
             else
                 FW_PATCHED=NO
-                status ACTION 'Entered firmware build is below the fixed-build threshold; update urgently.'
+                status ACTION 'Detected/supplied firmware build is below the fixed-build threshold; update urgently.'
             fi
         else
             status CHECK "Could not select a fixed-build threshold for detected family $FW_FAMILY."
         fi
     else
-        status CHECK 'Version input was not recognized. Paste the version/build from show ns version, e.g. 14.1-73.37.nc.'
+        if [ "$CURRENT_INPUT" = '14.1' ] || [ "$CURRENT_INPUT" = '13.1' ]; then
+            status CHECK "Running release family $CURRENT_INPUT was identified, but the build number is unavailable. Do not assess the fixed-build threshold from a conflicting saved config; verify with show ns version."
+        else
+            status CHECK 'Version input was not recognized. Paste the version/build from show ns version, e.g. 14.1-73.37.nc.'
+        fi
     fi
 else
     status CHECK 'Firmware comparison skipped; rerun with the version from show ns version as argument, e.g. sh netscaler-ioc-check.sh 14.1-73.37.nc.'
@@ -308,7 +379,10 @@ else
 fi
 
 if [ "$RUNNING_ON_ADC" = YES ]; then
-section 'System integrity and persistence checks'
+section '3. Host integrity and persistence'
+subsection 'Purpose and follow-up'
+printf '%s\n' 'Purpose: review reboot/core history, install timing, startup/persistence locations, user-owned processes, shell permissions, and selected SUID/SGID files.'
+printf '%s\n' 'For each [CHECK]: compare path, owner, mode, hash, and timestamp with a trusted appliance on the same build; correlate with installns_state, change records, and HA peer evidence. Preserve unexpected files before changing them.'
 subsection 'Recent reboot / shutdown history'
 if command -v last >/dev/null 2>&1; then
     last -n 80 2>&1 | head -80
@@ -344,9 +418,27 @@ fi
 printf '\n--- Firmware installation directory / possible review window ---\n'
 if [ -d /var/nsinstall ]; then
     ls -lt /var/nsinstall 2>/dev/null | head -8
-    status CHECK 'Use the installation history as context only; verify the actual upgrade date and review the exposure window in available logs.'
+    INSTALL_STATE_FILE=/var/nsinstall/installns_state
+    INSTALL_EPOCH=''
+    if [ -r "$INSTALL_STATE_FILE" ]; then
+        if command -v perl >/dev/null 2>&1; then
+            INSTALL_EPOCH=$(perl -e '@s=stat($ARGV[0]); print $s[9] if @s' "$INSTALL_STATE_FILE" 2>/dev/null)
+        elif stat -f %m "$INSTALL_STATE_FILE" >/dev/null 2>&1; then
+            INSTALL_EPOCH=$(stat -f %m "$INSTALL_STATE_FILE" 2>/dev/null)
+        elif stat -c %Y "$INSTALL_STATE_FILE" >/dev/null 2>&1; then
+            INSTALL_EPOCH=$(stat -c %Y "$INSTALL_STATE_FILE" 2>/dev/null)
+        fi
+    fi
+    if [ -n "$INSTALL_EPOCH" ]; then
+        INSTALL_TIME=$(date -r "$INSTALL_EPOCH" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null)
+        [ -n "$INSTALL_TIME" ] || INSTALL_TIME=$(perl -MPOSIX -e 'print strftime("%Y-%m-%d %H:%M:%S %Z", localtime($ARGV[0]))' "$INSTALL_EPOCH" 2>/dev/null)
+        printf 'Install-time marker: %s\nFile: %s\n' "${INSTALL_TIME:-epoch $INSTALL_EPOCH (date formatting unavailable)}" "$INSTALL_STATE_FILE"
+        status CHECK 'The marker is the file modification time, not independent proof of a completed firmware installation; verify it against change records and appliance version/boot history.'
+    else
+        status CHECK "$INSTALL_STATE_FILE is absent, unreadable, or its modification time could not be read; no install time was inferred."
+    fi
 else
-    status CHECK '/var/nsinstall is unavailable; determine the last firmware installation date from change records.'
+    status CHECK '/var/nsinstall is unavailable; no install-time marker could be read.'
 fi
 
 printf '\n--- Cron entries for nobody ---\n'
@@ -455,7 +547,11 @@ else
 fi
 
 
-section 'Web server configuration and served-file checks'
+section '4. Web configuration and served-file integrity'
+subsection 'Purpose and follow-up'
+printf '%s\n' 'Purpose: inspect httpd.conf indicators, web-facing files, known webshell/payload markers, custom language files, and recent file changes.'
+printf '%s\n' 'For each [CHECK]: validate the exact file and timestamp against the firmware install/change window, compare hashes with a trusted same-build node, and inspect suspicious content from a preserved copy. A normal vendor package or upgrade timestamp can explain a match.'
+printf '%s\n' 'Request-path hits are not automatically malicious: check the request date, source address, method, response, and whether the requested path is a normal NetScaler resource. Prior-year scanner noise should stay classified as historical unless correlated evidence says otherwise.'
 subsection 'httpd.conf metadata and indicators'
 FOUND_HTTPD=0
 for f in /etc/httpd.conf /nsconfig/httpd.conf /netscaler/httpd.conf; do
@@ -518,7 +614,7 @@ STAGING_FILES=''
 for d in /var/netscaler/gui/vpn/scripts/linux /netscaler/ns_gui/vpn/scripts/linux /netscaler/gui/vpns/scripts/vista /netscaler/gui/vpns/scripts/mac /netscaler/ns_gui/vpns/scripts/vista /netscaler/ns_gui/vpns/scripts/mac; do
     [ -d "$d" ] || continue
     STAGING_PATHS_FOUND=1
-    files=$(find "$d" -type f \( -name '*.sig' -o -name '*.deb' -o -name '*.php' \) -print 2>/dev/null | head -100)
+    files=$(find "$d" -type f \( -name '*.sig' -o -name '*.deb' -o -name '*.php' -o -name 'nginstaller*' -o -name 'nsgclient*' -o -name 'e6ee7c85*' \) -print 2>/dev/null | head -100)
     if [ -n "$files" ]; then STAGING_FILES="${STAGING_FILES}${STAGING_FILES:+
 --- $d ---
 }$files"; fi
@@ -530,7 +626,7 @@ if [ -n "$STAGING_FILES" ]; then
         case "$f" in ---*) continue ;; esac
         [ -f "$f" ] || continue
         ls -l "$f" 2>/dev/null
-        if grep -qE -i 'HTTP_NSC_(LDAP|CLIENTTYPE)|HTTP_X_UX(_[0-9]+)?|UXD_IDLE_EXIT|base64_decode[[:space:]]*\(|eval[[:space:]]*\(|shell_exec[[:space:]]*\(|<FATO>' "$f" 2>/dev/null; then
+        if grep -qE -i 'HTTP_NSC_(LDAP|CLIENTTYPE)|HTTP_X_UX(_[0-9]+)?|UXD_IDLE_EXIT|base64_decode[[:space:]]*\(|eval[[:space:]]*\(|shell_exec[[:space:]]*\(|<\?php|nsginstaller|nsgclient' "$f" 2>/dev/null; then
             status ACTION "Webshell/tunneler behavior strings found in $f; preserve it and investigate as a potential compromise artifact."
         fi
     done
@@ -567,27 +663,32 @@ elif [ ! -d /var/netscaler/logon/LogonPoint/custom ] && [ ! -d /var/vpn ]; then
 else
     status OK 'No selected PHP/webshell signatures found in LogonPoint/custom or /var/vpn.'
 fi
-KNOWN_RECEIVER_HASH='6f5a2a452a7901323abd21879c6cecccb47c06aeeaccb1b467212f3b11e4b1e7'
-RECEIVER_HASH_HITS=''
+KNOWN_WEBSHELL_HASHES='6f5a2a452a7901323abd21879c6cecccb47c06aeeaccb1b467212f3b11e4b1e7
+ed082f744f035035900f67edf438f2f7d0528ac501234f63d476d65273cdb9a1
+5ea5ea61e9062822bee3f66ef5ff47c217178d9e31936ad6daf10c5dfae44d12
+7add390ceee4a1373211b3e340451b34f08965fc4d805f94c9b8cebdc0775774'
+WEBSHELL_HASH_HITS=''
 if command -v sha256 >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1; then
-    for d in /var/netscaler/logon/LogonPoint/custom /var/vpn; do
+    for d in /var/netscaler/logon/LogonPoint/custom /var/vpn /var/netscaler/gui/vpn/scripts/linux /netscaler/ns_gui/vpn/scripts/linux /netscaler/gui/vpns/scripts/vista /netscaler/gui/vpns/scripts/mac /netscaler/ns_gui/vpns/scripts/vista /netscaler/ns_gui/vpns/scripts/mac; do
         [ -d "$d" ] || continue
         for f in $(find "$d" -type f -print 2>/dev/null); do
             if command -v sha256 >/dev/null 2>&1; then FILE_HASH=$(sha256 -q "$f" 2>/dev/null); else FILE_HASH=$(sha256sum "$f" 2>/dev/null | awk '{print $1}'); fi
-            [ "$FILE_HASH" = "$KNOWN_RECEIVER_HASH" ] && RECEIVER_HASH_HITS="${RECEIVER_HASH_HITS}${RECEIVER_HASH_HITS:+
-}$f"
+            if printf '%s\n' "$KNOWN_WEBSHELL_HASHES" | grep -F -x -q "$FILE_HASH"; then
+                WEBSHELL_HASH_HITS="${WEBSHELL_HASH_HITS}${WEBSHELL_HASH_HITS:+
+}$FILE_HASH  $f"
+            fi
         done
     done
-    if [ -n "$RECEIVER_HASH_HITS" ]; then
-        status ACTION 'File matching a publicly reported .ctxs.receiver webshell SHA-256 found; preserve it and investigate the appliance and HA peer:'
-        printf '%s\n' "$RECEIVER_HASH_HITS"
+    if [ -n "$WEBSHELL_HASH_HITS" ]; then
+        status ACTION 'File matching a publicly reported NetScaler webshell SHA-256 found; the list contains samples from multiple sources and is not exhaustive. Preserve it and investigate the appliance and HA peer:'
+        printf '%s\n' "$WEBSHELL_HASH_HITS"
     elif [ ! -d /var/netscaler/logon/LogonPoint/custom ] && [ ! -d /var/vpn ]; then
         status CHECK 'Neither target customization directory exists; the known webshell hash check could not run.'
     else
-        status OK 'No file matching the known .ctxs.receiver SHA-256 was found in the targeted directories.'
+        status OK 'No file matching the selected publicly reported webshell SHA-256 values was found in the targeted directories. Victim-specific variants may have different hashes.'
     fi
 else
-    status CHECK 'No SHA-256 utility is available; the known .ctxs.receiver hash check could not run.'
+    status CHECK 'No SHA-256 utility is available; the selected public webshell hash checks could not run.'
 fi
 CTX_RECEIVER_FILES=$(find /var/netscaler/logon /netscaler/ns_gui /var/vpn -type f -name '.ctxs*' -print 2>/dev/null)
 if [ -n "$CTX_RECEIVER_FILES" ]; then
@@ -597,6 +698,26 @@ elif [ -d /var/netscaler/logon ] || [ -d /netscaler/ns_gui ] || [ -d /var/vpn ];
     status OK 'No .ctxs* files found in the candidate web-facing paths.'
 else
     status CHECK 'Candidate web-facing paths are absent; .ctxs* file coverage is unknown.'
+fi
+
+printf '\n--- Publicly reported NX-CVE-OK test markers ---\n'
+NX_MARKER_DIRS_FOUND=0
+NX_MARKER_HITS=''
+for d in /netscaler/ns_gui /var/netscaler; do
+    [ -d "$d" ] || continue
+    NX_MARKER_DIRS_FOUND=1
+    found=$(grep -r -l -I -F 'NX-CVE-OK' "$d" 2>/dev/null | head -50)
+    if [ -n "$found" ]; then NX_MARKER_HITS="${NX_MARKER_HITS}${NX_MARKER_HITS:+
+--- $d ---
+}$found"; fi
+done
+if [ -n "$NX_MARKER_HITS" ]; then
+    status CHECK 'NX-CVE-OK marker found. This can show that a vulnerability check reached the appliance; it is not proof that a backdoor was installed. Preserve the file and correlate its time/content with logs and authorized testing:'
+    printf '%s\n' "$NX_MARKER_HITS"
+elif [ "$NX_MARKER_DIRS_FOUND" -eq 1 ]; then
+    status OK 'No NX-CVE-OK marker found in the readable candidate web directories. A reboot may rebuild /netscaler/ns_gui and remove earlier markers.'
+else
+    status CHECK 'Neither /netscaler/ns_gui nor /var/netscaler is present; NX-CVE-OK marker coverage is unavailable.'
 fi
 
 printf '\n--- CVE-2026-88771 exploit-written file indicators ---\n'
@@ -620,12 +741,16 @@ done
 if [ -n "$ID_OUTPUT_FILES" ]; then PAYLOAD_FILES="${PAYLOAD_FILES}${PAYLOAD_FILES:+
 }$ID_OUTPUT_FILES"; fi
 if [ -n "$PAYLOAD_FILES" ]; then
-    status ACTION 'Exploit-associated canary or command-output file(s) found; a matching uid/gid output is strong evidence that a command ran. Preserve files before further response:'
+    if [ -n "$ID_OUTPUT_FILES" ]; then
+        status ACTION 'File(s) containing uid/gid command output were found; this is strong evidence that a command ran. Preserve files before further response:'
+    else
+        status CHECK 'Known exploit-test/canary or payload-target file(s) found. nx_verify.html can be created by testing and does not alone prove a backdoor; validate every hit and preserve unexpected files:'
+    fi
     for f in $(printf '%s\n' "$PAYLOAD_FILES" | sort -u); do
         ls -l "$f" 2>&1
         case "$f" in
             /var/netscaler/logon/insight-new.js|/netscaler/ns_gui/admin_ui/e.txt)
-                status CHECK "Payload-targeted file exists: $f. Do not print its contents automatically; it may contain appliance configuration data. Preserve and inspect it securely."
+                status CHECK "Payload-targeted file exists: $f. Its presence alone is not proof of compromise. Do not print contents automatically; it may contain appliance configuration data. Preserve and inspect it securely."
                 ;;
             *) printf '%s\n' "$f" ;;
         esac
@@ -674,6 +799,11 @@ RECENT_WEB_FILES=$(find /var/netscaler/logon /netscaler/ns_gui /var/vpn /var/nsp
 if [ -n "$RECENT_WEB_FILES" ]; then
     status CHECK 'Web/application files changed within 14 days; check timestamps against upgrades and approved changes. This is a heuristic, not an IOC by itself:'
     echo "$RECENT_WEB_FILES"
+    WEB_BOOT_EPOCH=$(sysctl -n kern.boottime 2>/dev/null | sed -nE 's/.*sec = ([0-9]+),.*/\1/p')
+    WEB_CHANGE_GROUPS=$(find /var/netscaler/logon /netscaler/ns_gui /var/vpn /var/nsproflog /var/python /var/netscaler/gui /netscaler/gui /netscaler/portal -type f \( -name '*.php' -o -name '*.xml' -o -name '*.js' -o -name '*.html' -o -name '*.xhtml' -o -name '*.py' -o -name '*.pl' -o -name '*.sh' \) -mtime -14 -print 2>/dev/null | perl -ne 'BEGIN{$b=shift @ARGV} chomp; @s=stat($_); next unless @s; $m=int($s[9]/60)*60; $g{$m}++; $f{$m}.="\n  $_"; END { for $m (sort {$a<=>$b} keys %g) { $near=(defined($b) && $b ne "" && abs($m-$b)<=1800) ? "; within 30 min of current boot" : ""; print scalar(localtime($m)), " [",$g{$m}," file(s)$near]",$f{$m},"\n" } }' "$WEB_BOOT_EPOCH" | head -100)
+    if [ -n "$WEB_CHANGE_GROUPS" ]; then
+        printf '\nModification-time groups (clusters near the current boot are marked; upgrade activity and HA sync still require change records/peer comparison):\n%s\n' "$WEB_CHANGE_GROUPS"
+    fi
 elif [ "$WEB_DIRS_FOUND" -eq 0 ]; then
     status CHECK 'None of the candidate web directories exists; file-change coverage is unknown.'
 else
@@ -762,9 +892,14 @@ else
     status CHECK "Language-file directory $LANGUAGE_DIR is absent; this targeted content check could not run."
 fi
 
-section 'Log coverage and event analysis'
+section '5. Log coverage and event correlation'
+subsection 'Purpose and follow-up'
+printf '%s\n' 'Purpose: establish which retained logs overlap the suspected pre-patch period, then search for selected HTTP, authentication, DTLS, and system-event indicators.'
+printf '%s\n' 'Time handling: the CVE-2026-88771 campaign review begins with the reported activity window shown above and ends at the verified update time. Older path hits (for example, routine scans from 2025) are historical context, not evidence of this campaign by themselves.'
+printf '%s\n' 'For a hit: record the original timestamp and source, correlate HTTP and authentication entries with file/config changes, and preserve the raw logs. A missing match is meaningful only for the periods and log formats actually retained.'
 printf '\n--- Log retention and pre-patch coverage ---\n'
 printf 'The checks below only cover files currently available on this appliance. File timestamps are a retention clue, not proof that logs are complete or contain every event.\n'
+printf 'Public incident-response reporting places CVE-2026-88771 exploitation as early as 2026-09-05. If the appliance was internet-facing and below the fixed build then, include that period in the investigation where retained logs permit.\n'
 LOG_FILES_LIST=''
 for pattern in /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages*; do
     for f in $pattern; do
@@ -778,17 +913,14 @@ if [ -n "$LOG_FILES_LIST" ]; then
     LOG_COUNT_FILES=$(printf '%s\n' "$LOG_FILES_LIST" | wc -l | tr -d ' ')
     [ -n "$LOG_OLDEST_EPOCH" ] && printf 'Oldest candidate log file mtime: %s\n' "$(date -r "$LOG_OLDEST_EPOCH" '+%Y-%m-%d %H:%M' 2>/dev/null || echo unknown)"
     printf 'Readable candidate files: %s\n' "$LOG_COUNT_FILES"
-    if [ -n "$PATCH_DATE_INPUT" ]; then
-        PATCH_EPOCH=$(printf '%s\n' "$PATCH_DATE_INPUT" | perl -MTime::Local -ne 'if (/^(\d{4})-(\d{2})-(\d{2})$/) { print timelocal(0,0,0,$3,$2-1,$1) }' 2>/dev/null)
-        if [ -z "$PATCH_EPOCH" ]; then
-            status CHECK 'Patch date was not recognized; use YYYY-MM-DD. Historical log coverage could not be compared.'
-        elif [ -n "$LOG_OLDEST_EPOCH" ] && [ "$LOG_OLDEST_EPOCH" -le "$PATCH_EPOCH" ]; then
-            status CHECK 'At least one candidate log file predates the patch date by file mtime. This does not prove continuous pre-patch log coverage; inspect rotation, gaps, and timestamps inside the logs.'
+    if [ -n "${INSTALL_EPOCH-}" ]; then
+        if [ -n "$LOG_OLDEST_EPOCH" ] && [ "$LOG_OLDEST_EPOCH" -le "$INSTALL_EPOCH" ]; then
+            status CHECK 'At least one candidate log file has a modification time at or before installns_state. This suggests some pre-install log material may remain, but does not prove continuous coverage; inspect timestamps inside rotated logs and gaps.'
         else
-            status CHECK 'Available candidate log files do not appear to predate the patch date; a clean IOC search cannot assess the pre-patch exposure window.'
+            status CHECK 'No candidate log file modification time predates installns_state. This does not prove the logs lack older entries; inspect timestamps inside rotated logs, but pre-install coverage is not established by file metadata.'
         fi
     else
-        status CHECK 'Patch installation date was not supplied; pre-patch log coverage cannot be assessed.'
+        status CHECK 'No installns_state timestamp is available for comparison. Review file contents, rotation history, and earliest log timestamps against a verified change record; file modification times alone do not prove coverage.'
     fi
 else
     status CHECK 'No readable candidate HTTP/system logs found; log-based IOC checks have no usable retention coverage.'
@@ -807,7 +939,7 @@ done
 
 subsection 'CVE-2026-88772 DTLS and NSPPE event correlation'
 DTLS_EVENT_LINES=$(zgrep -E -i -n 'SSL_HANDSHAKE_FAILURE.*DTLSv1[.]0.*Handshake failure-Internal Error' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -30)
-NSPPE_EVENT_LINES=$(zgrep -E -i -n 'orphan rings|NOT restarting NSPPE|NSPPE[^[:cntrl:]]*(exit|crash|signal|terminated)' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -50)
+NSPPE_EVENT_LINES=$(zgrep -E -i -n 'orphan rings|pitboss[^[:cntrl:]]*NOT restarting NSPPE|NSPPE[^[:cntrl:]]*(exit|crash|signal|terminated)' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -50)
 if [ -n "$DTLS_EVENT_LINES" ]; then
     printf '%s\n' "$DTLS_EVENT_LINES"
     DTLS_EVENT_FOUND=1
@@ -856,33 +988,70 @@ elif [ "$MATCH_COUNT" -eq 0 ]; then
     status OK "No b64decode matches in $LOG_COUNT readable candidate log file(s) scanned. This covers only retained log content; use the pre-patch coverage result above before drawing conclusions about the exposure window."
 fi
 
-printf '\n--- CVE-2026-88771 targeted log indicators: INDEX User-Agent and pitboss/PPE injection ---\n'
+printf '\n--- CVE-2026-88771 two-stage log-chain indicators ---\n'
 HTTP_IOC_LOGS_FOUND=0
 for f in /var/log/httpaccess* /var/log/httperror*; do [ -f "$f" ] && [ -r "$f" ] && HTTP_IOC_LOGS_FOUND=1; done
 INDEX_LINES=$(zgrep -hE -i 'INDEX:[A-Za-z0-9+/=]{8,}' /var/log/httpaccess* /var/log/httperror* 2>/dev/null | tail -20)
 INDEX_PAYLOADS=$(zgrep -hoE 'INDEX:[A-Za-z0-9+/=]{8,}' /var/log/httpaccess* /var/log/httperror* 2>/dev/null | sort -u | head -10)
 if [ -n "$INDEX_PAYLOADS" ]; then
-    status ACTION 'Base64 INDEX: payload(s) found in HTTP logs; this is a targeted-attack indicator. Decoded text is shown as inert text only and is never executed:'
+    status ACTION 'Base64 INDEX: payload candidate(s) found in HTTP logs. These are public-chain indicators, not proof of successful execution. Decoded content is displayed as inert text only:'
     for encoded in $INDEX_PAYLOADS; do
         decoded=$(printf '%s' "${encoded#INDEX:}" | perl -MMIME::Base64 -ne 'print decode_base64($_)' 2>/dev/null | tr -c '[:print:]' ' ' | cut -c1-180)
         printf '  %s -> %s\n' "$encoded" "$decoded"
     done
     printf '%s\n' "$INDEX_LINES" | tail -10
 elif [ "$HTTP_IOC_LOGS_FOUND" -eq 0 ]; then
-    status CHECK 'No readable HTTP access/error logs found; the INDEX: User-Agent check has no log coverage.'
+    status CHECK 'No readable HTTP access/error logs found; the INDEX: payload check has no coverage.'
 else
-    status OK 'No INDEX: base64 payload patterns found in available HTTP access/error logs. This covers only retained log content; see the pre-patch coverage result above.'
+    status OK 'No INDEX: base64 token found in available HTTP access/error logs. This covers retained files and the searched format only.'
 fi
 SYS_IOC_LOGS_FOUND=0
 for f in /var/log/ns.log* /var/log/messages*; do [ -f "$f" ] && [ -r "$f" ] && SYS_IOC_LOGS_FOUND=1; done
-PITBOSS_LINES=$(zgrep -hE -i 'pitboss.*PPE.*(missed too many heartbeats|unexpectedly died).*NSPPE[^[:cntrl:]]*(;|%3[bB]|`|%60|\$\(|\$\{IFS\}|%24%7BIFS%7D)' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -30)
+# CERT-EU describes the authentication-log marker followed by shell syntax as
+# the second part of the chain. Do not infer that a background helper executed it.
+PITBOSS_LINES=$(zgrep -hE -i 'pitboss PPE missed too many heartbeatsNSPPE[^[:cntrl:]]*(;|%3[bB]|`|%60|\$\(|\$\{IFS\}|%24%7BIFS%7D)' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -30)
 if [ -n "$PITBOSS_LINES" ]; then
-    status ACTION 'PPE/pitboss log entries contain shell metacharacters after the crafted NSPPE trigger. This is strong evidence of exploit attempts being logged, not by itself proof that commands executed. Correlate with timestamps, HTTP logs, and command-output artifacts:'
+    status ACTION 'Authentication-log line matches the public PPE heartbeat trigger followed by shell syntax. This records an exploit attempt; it does not prove the line was later processed or that a command ran. Preserve and correlate it:'
     printf '%s\n' "$PITBOSS_LINES"
 elif [ "$SYS_IOC_LOGS_FOUND" -eq 0 ]; then
-    status CHECK 'No readable ns.log/messages files found; pitboss/PPE log-injection check has no log coverage.'
+    status CHECK 'No readable ns.log/messages files found; the authentication-trigger check has no coverage.'
 else
-    status OK 'No selected pitboss/PPE log-injection strings found in available ns.log/messages files. This covers only retained log content; see the pre-patch coverage result above.'
+    status OK 'No selected PPE heartbeat-trigger plus shell-syntax pattern found in retained ns.log/messages files.'
+fi
+if [ -n "$PITBOSS_LINES" ] && [ -n "$INDEX_LINES" ]; then
+    status ACTION 'Both selected stages of the publicly described log chain are present. Raise incident priority and correlate timestamps with httpd.conf changes, webshell/payload artifacts, and system events. Available log matches cannot confirm whether the background helper processed the trigger or whether a command executed.'
+elif [ -n "$PITBOSS_LINES" ]; then
+    status CHECK 'The authentication trigger was found without an INDEX: token in available HTTP logs. Review log format, coverage, and other delivery paths.'
+elif [ -n "$INDEX_LINES" ]; then
+    status CHECK 'An INDEX: token was found without the selected authentication trigger. Review decoded text and correlate its timestamp with authentication logs and resulting files.'
+fi
+
+printf '\n--- Additional public exploit-path, webshell-staging, and callback indicators ---\n'
+EXPLOIT_PATH_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -40)
+if [ -n "$EXPLOIT_PATH_HITS" ]; then
+    status CHECK 'Requests to endpoints observed in public honeypot/research reporting found. These are legitimate NetScaler paths; the requests alone are not IOCs. Review any logged username/body/User-Agent for shell metacharacters or payloads and correlate with auth/system logs:'
+    printf '%s\n' "$EXPLOIT_PATH_HITS"
+else
+    status OK 'No requests to the selected public exploit paths found in available HTTP logs; this is limited by log retention and format.'
+fi
+AUTH_POISON_HTTP_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html)[^[:cntrl:]]*(pitboss|NSPPE|PPE unexpectedly died|missed too many heartbeats|%3[bB]|%60|\$\{IFS\}|curl[[:space:]]|wget[[:space:]]|fetch[[:space:]])' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -30)
+if [ -n "$AUTH_POISON_HTTP_HITS" ]; then
+    status ACTION 'A logged exploit-path request also contains a public log-poisoning trigger or shell/download marker. Review the full request and correlate with ns.log/messages and file artifacts; this indicates an attempt, not automatically successful execution:'
+    printf '%s\n' "$AUTH_POISON_HTTP_HITS"
+fi
+ICO_STAGE_HITS=$(zgrep -E -i -n '/vpn/media/[^[:space:]]+[.]ico[^[:cntrl:]]*PD9[A-Za-z0-9+/=]{12,}|PD9[A-Za-z0-9+/=]{12,}[^[:cntrl:]]*/vpn/media/[^[:space:]]+[.]ico' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -30)
+if [ -n "$ICO_STAGE_HITS" ]; then
+    status ACTION 'HTTP log line combines a /vpn/media/*.ico request with a User-Agent-like base64 PHP prefix (PD9). Treat as a targeted exploitation lead and correlate with log injection and resulting files:'
+    printf '%s\n' "$ICO_STAGE_HITS"
+else
+    status OK 'No selected /vpn/media/*.ico plus base64-PHP (PD9...) pattern found in available HTTP logs.'
+fi
+PUBLIC_CALLBACK_HITS=$(zgrep -E -i -n 'instances[.]httpworkbench[.]com|httpworkbench[.]com|31[.]56[.]197[.]72|64[.]94[.]85[.]67|139[.]180[.]152[.]138|77[.]83[.]199[.]39|104[.]248[.]244[.]66|23[.]27[.]143[.]20|62[.]133[.]62[.]80' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -40)
+if [ -n "$PUBLIC_CALLBACK_HITS" ]; then
+    status CHECK 'References to selected public NetScaler campaign payload/callback indicators found in retained logs. IPs/domains are time-sensitive, may be reused or victim-specific, and must not be treated as a blocklist or attribution by themselves:'
+    printf '%s\n' "$PUBLIC_CALLBACK_HITS"
+else
+    status OK 'No references to the selected public payload/callback indicators found in the searched retained logs. The source IoC lists are not exhaustive.'
 fi
 
 printf '\n--- Script extension references in HTTP error logs ---\n'
@@ -907,33 +1076,39 @@ for f in /var/log/sh.log* /var/log/bash.log*; do
 done
 if [ -n "$SHELL_AUDIT_HITS" ]; then status CHECK 'Command-pattern matches found in available shell audit logs; these are heuristic and need contextual review:'; printf '%b\n' "$SHELL_AUDIT_HITS" | head -120; elif [ "$SHELL_AUDIT_LOGS_FOUND" -eq 1 ]; then status OK 'No configured command patterns found in readable shell audit logs.'; else status CHECK 'No readable sh.log/bash.log files found; shell command-history coverage is unknown.'; fi
 
-printf '\n--- Browser/clientless VPN log requests (heuristic) ---\n'
-VPN_LOGS_FOUND=0
-for f in /var/log/httpaccess-vpn.log*; do [ -f "$f" ] && VPN_LOGS_FOUND=1; done
-NON_RECEIVER_HITS=$(zgrep -E -i -v 'CitrixReceiver' /var/log/httpaccess-vpn.log* 2>/dev/null | grep ' 200 ' | tail -50)
-if [ -n "$NON_RECEIVER_HITS" ]; then
-    NON_RECEIVER_COUNT=$(printf '%s\n' "$NON_RECEIVER_HITS" | wc -l | tr -d ' ')
-    status CHECK "$NON_RECEIVER_COUNT successful requests without a CitrixReceiver marker. Browser/clientless Gateway access and static resources (for example plugins.xml, CSS, or JavaScript) can be normal; this is not an IOC by itself. Review source and timing only if that access is unexpected. Showing up to 5 examples:"
-    printf '%s\n' "$NON_RECEIVER_HITS" | tail -5
-elif [ "$VPN_LOGS_FOUND" -eq 0 ]; then
-    status CHECK 'No candidate VPN access log files found; this check could not run.'
+printf '\n--- Admin partition Enhanced ISN configuration ---\n'
+PARTITION_DIR="$(dirname "$CONFIG")/partitions"
+PARTITION_CONFIGS=$(find "$PARTITION_DIR" -mindepth 2 -maxdepth 2 -type f -name ns.conf -print 2>/dev/null)
+if [ -n "$PARTITION_CONFIGS" ]; then
+    PARTITION_TCP_FOUND=0
+    while IFS= read -r partition_conf; do
+        [ -r "$partition_conf" ] || { status CHECK "Partition config is unreadable: $partition_conf"; continue; }
+        PARTITION_TCP=$(grep -E -i '^[[:space:]]*add (lb|cs|vpn|authentication|gslb|cr) vserver .* (HTTP|SSL|SSL_BRIDGE|TCP|SSL_TCP|FTP|NNTP|RTSP|RDP|DNS_TCP|DOT|SIP_TCP|SIP_SSL|DIAMETER|SSL_DIAMETER|MYSQL|MSSQL|ORACLE|SMPP|MQTT|MQTT_TLS|MONGO|MONGO_TLS|PROXY|SSL_PROXY|USER_TCP|USER_SSL_TCP)([[:space:]]|$)' "$partition_conf" 2>/dev/null | head -1)
+        [ -n "$PARTITION_TCP" ] || continue
+        PARTITION_TCP_FOUND=$((PARTITION_TCP_FOUND + 1))
+        if grep -E -i -q '^[[:space:]]*set ns tcpParam .*-[eE]nhancedISNGeneration[[:space:]]+ENABLED' "$partition_conf"; then
+            status OK "Enhanced ISN is enabled in partition config $partition_conf. Verify the live partition state if configuration may be unsaved."
+        else
+            status ACTION "Supported TCP vServer type found in admin partition config $partition_conf, but saved Enhanced ISN is absent/disabled. Check live partition state and enable if needed."
+            printf '  %s\n' "$PARTITION_TCP"
+        fi
+    done <<EOF_PARTITIONS
+$PARTITION_CONFIGS
+EOF_PARTITIONS
+    [ "$PARTITION_TCP_FOUND" -gt 0 ] || status OK 'No supported TCP vServer types were found in the readable admin-partition configs.'
 else
-    status OK 'No matching successful non-Receiver requests found in candidate VPN access logs.'
+    status OK "No admin-partition ns.conf files found beneath $PARTITION_DIR. This check covers saved configs only."
 fi
-if [ "$VPN_LOGS_FOUND" -eq 1 ]; then
-    HEADLESS_CHROME_HITS=$(zgrep -E -i -n 'HeadlessChrome' /var/log/httpaccess-vpn.log* 2>/dev/null | tail -5)
-    if [ -n "$HEADLESS_CHROME_HITS" ]; then
-        status CHECK 'HeadlessChrome user-agent found in VPN access logs; automation can be legitimate, review source, URL, and timing:'
-        echo "$HEADLESS_CHROME_HITS"
-    else
-        status OK 'No HeadlessChrome user-agent found in candidate VPN access logs.'
-    fi
-fi
+
 status CHECK 'For HA pairs, run this check on both nodes. A clean result on one node does not establish the state of its peer.'
 status CHECK 'For official Citrix IoCs, use the supported NetScaler Console Security Advisory scan or work with Citrix Support. Preserve relevant logs and evidence before rebooting or upgrading if compromise is suspected.'
 status CHECK 'This live sweep does not run YARA against disk images or core dumps. If compromise is suspected, preserve appliance images and NSPPE core dumps for offline forensic analysis.'
+status CHECK 'Complementary public detections are not bundled: consider vetted offline YARA/THOR rules and SIEM/Zeek/Elastic hunts. Published YARA names include G_APT_Backdoorwebshell_WHIPSHOT_1, G_APT_Tunneler_SLAPSHOT_1, G_Hunting_Backdoorwebshell_NetScaler_C2Headers_1, G_Hunting_Config_NetScaler_PHP_1, and G_Hunting_Script_NetScaler_Persistence_1. PitScaler also lists THOR Preview, Elastic and Corelight hunts; preview matches are leads, not proof. This script intentionally sends no active PoC/Nuclei/watchTowr probes.'
+status CHECK 'If NetScaler Console reports certificate-digest verification failures or binary fingerprinting alerts, investigate them with trusted same-build hashes and certificate/key inventory; those Console findings cannot be read from this local shell script.'
 
-section 'Post-scan validation'
+section '6. Post-scan validation'
+subsection 'Purpose and follow-up'
+printf '%s\n' 'Purpose: complete vendor-supported integrity validation that this read-only helper does not perform.'
 subsection 'File Integrity Monitoring'
 status CHECK 'Run the supported Citrix/NetScaler File Integrity Monitoring scan and compare results with a known-good baseline; this script does not run that scan.'
 else
@@ -941,7 +1116,7 @@ section 'Appliance-only checks'
 status CHECK 'Skipped: this run targets an exported configuration file. Run the script locally on each ADC to scan logs, files, reboots, and other host indicators.'
 fi
 
-section 'Incident response guidance — use if compromise is suspected'
+section '7. Incident response guidance — use if compromise is suspected'
 cat <<'IRGUIDE'
 These are response reminders, not automated actions. Follow your incident-response process and coordinate with security, operations, and legal teams as appropriate.
 
@@ -954,6 +1129,23 @@ These are response reminders, not automated actions. Follow your incident-respon
 
 Citrix guidance: https://support.citrix.com/external/article/CTX694799/steps-to-take-if-netscaler-adc-is-suspec.html
 IRGUIDE
+
+section '8. Triage summary and next actions'
+ACTION_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[ACTION\]/{n++} END{print n+0}' "$OUT")
+CHECK_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[CHECK\]/{n++} END{print n+0}' "$OUT")
+OK_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[OK\]/{n++} END{print n+0}' "$OUT")
+printf 'Finding-message counts: ACTION=%s, CHECK=%s, OK=%s. These counts are not a risk score.\n' "$ACTION_COUNT" "$CHECK_COUNT" "$OK_COUNT"
+if [ "$ACTION_COUNT" -gt 0 ]; then
+    printf '%s\n' 'PRIORITY 1 — ACTION: preserve matching files and raw logs; record time/timezone; do not clean up or reboot before evidence is secured.'
+    printf '%s\n' 'Correlate each hit across HTTP access/error logs, ns.log/messages, file metadata, and approved change records. Escalate to incident response.'
+else
+    printf '%s\n' 'PRIORITY 1 — No selected high-priority pattern was reported. This does not exclude activity outside scanned paths, formats, or retention.'
+fi
+if [ "$CHECK_COUNT" -gt 0 ]; then
+    printf '%s\n' 'PRIORITY 2 — CHECK: resolve each item in its section against same-build baselines, change records, and (for HA) the peer node. Record the evidence and disposition.'
+fi
+printf '%s\n' 'PRIORITY 3 — Coverage: confirm logs reach the relevant pre-patch period; document any gaps. Missing/rotated logs are not a clean result.'
+printf '%s\n' 'PRIORITY 4 — Validation: run Citrix/NetScaler File Integrity Monitoring or the Console advisory scan as a separate check.'
 
 printf '\nCompleted. Plain-text report saved at: %s\n' "$OUT"
 exec 1>&3 2>&4 3>&- 4>&-
