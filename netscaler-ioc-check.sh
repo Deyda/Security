@@ -1,6 +1,6 @@
 #!/bin/sh
 # NetScaler ADC defensive triage helper
-# Version 9.20
+# Version 9.21
 #
 # Deyda Consulting GmbH
 # Website: https://www.deyda-consulting.de
@@ -106,6 +106,7 @@ status() { printf '[%s] %s\n' "$1" "$2"; }
 FW_PATCHED=UNKNOWN
 
 printf 'NetScaler IOC and CVE triage report\nHost: %s\nTime: %s\n' "$HOST" "$NOW"
+printf 'Script version: 9.21\n'
 printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n'
 printf 'Related articles (DE): https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
 printf 'Related articles (EN): https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/\n'
@@ -414,7 +415,12 @@ if [ -e /bin/sh ]; then
         fi
     fi
     ls -ld /bin /bin/sh 2>&1
-    status CHECK 'Compare permissions, owner, timestamps, and hash with a known-good appliance on the same build; this script cannot declare them normal.'
+    SHELL_META=$(ls -ln /bin/sh 2>/dev/null | awk 'NR==1{print $1 ":" $3 ":" $4 ":" $5}')
+    if { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; } && [ "$SHELL_META" = '-r-xr-xr-x:0:0:165368' ]; then
+        status OK '/bin/sh mode, numeric owner/group, and size match the internal clean-sample reference for 14.1-73.37; timestamps are host-specific and are not compared. This is not a vendor-published baseline.'
+    else
+        status CHECK "Compare /bin/sh mode, owner, group, size, timestamp, and hash with a trusted same-build reference; observed metadata: ${SHELL_META:-unavailable}. The internal reference is from one clean 14.1-73.37 appliance, not a vendor-published universal baseline."
+    fi
 else
     status ACTION '/bin/sh was not found at the expected path; verify platform paths and investigate.'
 fi
@@ -686,9 +692,48 @@ if [ -d "$LANGUAGE_DIR" ]; then
     if [ -n "$LANGUAGE_FILES" ]; then
         printf '%s\n' "$LANGUAGE_FILES"
         LANGUAGE_PATTERN_HITS=0
+        LANGUAGE_BASELINE_COUNT=0
+        LANGUAGE_BASELINE_MISMATCHES=''
+        LANGUAGE_HASH_UNAVAILABLE=0
         for f in $LANGUAGE_FILES; do
+            LANGUAGE_BASELINE_COUNT=$((LANGUAGE_BASELINE_COUNT + 1))
             ls -l "$f" 2>&1
-            if command -v sha256 >/dev/null 2>&1; then sha256 "$f" 2>&1; elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$f" 2>&1; fi
+            LANGUAGE_HASH=''
+            if command -v sha256 >/dev/null 2>&1; then
+                LANGUAGE_SHA_OUTPUT=$(sha256 "$f" 2>&1)
+                printf '%s\n' "$LANGUAGE_SHA_OUTPUT"
+                LANGUAGE_HASH=$(printf '%s\n' "$LANGUAGE_SHA_OUTPUT" | sed -nE 's/.*([[:xdigit:]]{64}).*/\1/p' | head -1 | tr 'A-F' 'a-f')
+            elif command -v sha256sum >/dev/null 2>&1; then
+                LANGUAGE_SHA_OUTPUT=$(sha256sum "$f" 2>&1)
+                printf '%s\n' "$LANGUAGE_SHA_OUTPUT"
+                LANGUAGE_HASH=$(printf '%s\n' "$LANGUAGE_SHA_OUTPUT" | awk '{print tolower($1)}')
+            else
+                LANGUAGE_HASH_UNAVAILABLE=1
+            fi
+            [ -n "$LANGUAGE_HASH" ] || LANGUAGE_HASH_UNAVAILABLE=1
+            if [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; then
+                LANGUAGE_EXPECTED_HASH=''
+                case "${f##*/}" in
+                    strings.de.js) LANGUAGE_EXPECTED_HASH='60a9b62d59f1e025b9d1b413ec7c926dbe02134d82e8dea902fcb087c2d81879' ;;
+                    strings.en.js) LANGUAGE_EXPECTED_HASH='a5366bdf12ecdd7ff4c87d34ec238717b0c1864598ace0fbd94a5f73f151060f' ;;
+                    strings.es.js) LANGUAGE_EXPECTED_HASH='747d21f81f78d55435bc3857cc201f716979f3422d91427ae1355deda1826b5e' ;;
+                    strings.fr.js) LANGUAGE_EXPECTED_HASH='ee4203c88bd3de082bc67f1de694d93edca795e1106f9f1dbe2e891b3873f83c' ;;
+                    strings.it.js) LANGUAGE_EXPECTED_HASH='8fc91bd3436bc6f958ba2f2897956fb3a24c068f55008adb01f3cb32869fec20' ;;
+                    strings.ja.js) LANGUAGE_EXPECTED_HASH='735e1b0e6ac42ea647198836ec1da79043342596806f83b24584abe79e437405' ;;
+                    strings.ko.js) LANGUAGE_EXPECTED_HASH='4ff2bdcc36c70c2a8cf298a8b92dc536a14e3fe655aa6de3ac9c1eafb27b4ac4' ;;
+                    strings.nl.js) LANGUAGE_EXPECTED_HASH='e0898d41e8c5e0b3b4174307be81ad908c23b3b11180083f4252e5b06d8e23b1' ;;
+                    strings.pt.js) LANGUAGE_EXPECTED_HASH='847d7fc0724470578d4ef8548a2b0eedef54da9ea61c964986e32ae74d90de73' ;;
+                    strings.ru.js) LANGUAGE_EXPECTED_HASH='10a1acb645b3a4a7cbc1135088429ac3214643facc3f3c783c909446c4142379' ;;
+                    strings.zh-CN.js) LANGUAGE_EXPECTED_HASH='e1076b3642968044149abe2aabcf681dd22bf3dfb6c1d144f8f3f32a2f12b422' ;;
+                    strings.zh-TW.js) LANGUAGE_EXPECTED_HASH='77417011220bf8e1d1e51d26c780875cbc51593275ff4080d73bb1da2016fbbb' ;;
+                    *) LANGUAGE_BASELINE_MISMATCHES="${LANGUAGE_BASELINE_MISMATCHES}${LANGUAGE_BASELINE_MISMATCHES:+
+}Unrecognized language file: $f" ;;
+                esac
+                if [ -n "$LANGUAGE_EXPECTED_HASH" ] && [ -n "$LANGUAGE_HASH" ] && [ "$LANGUAGE_HASH" != "$LANGUAGE_EXPECTED_HASH" ]; then
+                    LANGUAGE_BASELINE_MISMATCHES="${LANGUAGE_BASELINE_MISMATCHES}${LANGUAGE_BASELINE_MISMATCHES:+
+}Hash differs: $f"
+                fi
+            fi
             LANGUAGE_HITS=$(grep -nE -i 'new[[:space:]]+XMLHttpRequest|[.]open[[:space:]]*\(|[.]send[[:space:]]*\(|fetch[[:space:]]*\(|sendBeacon|document[.]cookie|btoa[[:space:]]*\(|atob[[:space:]]*\(|https?://' "$f" 2>/dev/null)
             if [ -n "$LANGUAGE_HITS" ]; then
                 LANGUAGE_PATTERN_HITS=$((LANGUAGE_PATTERN_HITS + 1))
@@ -697,10 +742,21 @@ if [ -d "$LANGUAGE_DIR" ]; then
             fi
         done
         if [ "$LANGUAGE_PATTERN_HITS" -eq 0 ]; then
-            status OK 'No selected network/request-related patterns found in strings.*.js files. Compare their hashes with a trusted same-build baseline anyway.'
+            status OK 'No selected network/request-related patterns found in strings.*.js files.'
+        fi
+        if [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; then
+            if [ "$LANGUAGE_BASELINE_COUNT" -eq 12 ] && [ "$LANGUAGE_HASH_UNAVAILABLE" -eq 0 ] && [ -z "$LANGUAGE_BASELINE_MISMATCHES" ]; then
+                status OK 'All 12 strings.*.js files, filenames, and SHA-256 hashes match the internal clean-sample reference for NetScaler 14.1-73.37. This is an internal single-appliance reference, not a Citrix-published checksum set or a universal baseline.'
+            else
+                status CHECK "Language-file baseline differs or could not be fully checked (observed count: $LANGUAGE_BASELINE_COUNT; expected: 12; hash tool unavailable: $LANGUAGE_HASH_UNAVAILABLE). Review filenames and hashes against a trusted same-build appliance."
+                [ -n "$LANGUAGE_BASELINE_MISMATCHES" ] && printf '%s\n' "$LANGUAGE_BASELINE_MISMATCHES"
+            fi
         fi
     else
         status OK 'No strings.*.js language files found in the LogonPoint/custom directory.'
+        if [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; then
+            status CHECK 'The internal 14.1-73.37 reference contains 12 strings.*.js files, but none were found here.'
+        fi
     fi
 else
     status CHECK "Language-file directory $LANGUAGE_DIR is absent; this targeted content check could not run."
