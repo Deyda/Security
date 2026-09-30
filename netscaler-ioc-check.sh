@@ -1,11 +1,13 @@
 #!/bin/sh
 # NetScaler ADC defensive triage helper
-# Version 9.17
+# Version 9.20
 #
 # Deyda Consulting GmbH
 # Website: https://www.deyda-consulting.de
 # Author: Manuel Winkel
 # NetScaler Security Readiness: https://www.deyda-consulting.de/expertise/netscaler-security-readiness/
+# NetScaler CVE checklist (DE): https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/
+# NetScaler CVE checklist (EN): https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/
 # Security Readiness provides managed NetScaler security update readiness,
 # including update planning, applicable workarounds, and validation.
 # Read-only. Run from the ADC shell. No interactive prompts are used. Missing or
@@ -105,6 +107,8 @@ FW_PATCHED=UNKNOWN
 
 printf 'NetScaler IOC and CVE triage report\nHost: %s\nTime: %s\n' "$HOST" "$NOW"
 printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n'
+printf 'Related articles (DE): https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
+printf 'Related articles (EN): https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/\n'
 printf 'Mode: read-only; no configuration changes, restarts, or cleanup performed\n'
 printf 'Report: %s\n' "$OUT"
 printf 'Interpretation: [OK] means no matching indicator was found in the scanned source; it does not prove the appliance is clean or patched.\n'
@@ -457,7 +461,9 @@ for f in /etc/httpd.conf /nsconfig/httpd.conf /netscaler/httpd.conf; do
         if find "$f" -mtime -14 -print 2>/dev/null | grep -q .; then status CHECK 'Modification time is within 14 days; compare with approved changes and a known-good baseline.'; else status OK 'Modification time is not within the last 14 days.'; fi
         if [ -r "$f" ]; then
             hits=$(grep -E -i -n 'b64decode|base64|LogonPoint/custom|/bin/sh|/\.ctxs|receiver[.]min|^[[:space:]]*(Alias|AliasMatch)[[:space:]].*(receiver|\.ctxs)|^[[:space:]]*(php_flag|php_admin_flag)[[:space:]]+engine[[:space:]]+on|^[[:space:]]*php_engine[[:space:]]+on|^[[:space:]]*(AddHandler|SetHandler)[[:space:]].*php' "$f" 2>/dev/null)
-            if [ -n "$hits" ]; then status CHECK 'Potential webshell alias, PHP-enabling directive, encoded-command, or payload-related configuration indicator found; compare with a trusted same-build baseline and preserve unexpected changes:'; echo "$hits"; else status OK 'No selected webshell aliases, PHP-enabling directives, or encoded-command indicators found. Standard NetScaler PHP mappings and php_flag engine off are not treated as indicators by themselves.'; fi
+            MANDIANT_HTTPD_HITS=$(grep -E -i -n '^[[:space:]]*(AddType|AddHandler|SetHandler)[[:space:]].*application/x-httpd-php.*[.](deb|sig|rpm|tgz|html)([[:space:]]|$)|^[[:space:]]*AliasMatch[[:space:]].*/vpn/(media|theme|images)/.*(/vpn/scripts/linux|/gui/vpn/scripts/linux|/ns_gui/vpn/scripts/linux)' "$f" 2>/dev/null)
+            if [ -n "$MANDIANT_HTTPD_HITS" ]; then status ACTION 'Non-standard PHP handler or VPN web-path alias matching publicly reported persistence patterns found; preserve httpd.conf and compare with a trusted same-build baseline:'; echo "$MANDIANT_HTTPD_HITS"; fi
+            if [ -n "$hits" ]; then status CHECK 'Potential webshell alias, PHP-enabling directive, encoded-command, or payload-related configuration indicator found; compare with a trusted same-build baseline and preserve unexpected changes:'; echo "$hits"; else status OK 'No selected webshell aliases, PHP-enabling directives, encoded-command, or payload indicators found. Standard NetScaler PHP mappings and php_flag engine off are not treated as indicators by themselves.'; fi
         else
             status CHECK "$f exists but is not readable; indicator search could not be performed."
         fi
@@ -500,6 +506,52 @@ elif [ -d /var/netscaler ]; then
 else
     status CHECK '/var/netscaler is absent; the broad PHP/XHTML inventory could not run.'
 fi
+subsection 'VPN script staging and WHIPSHOT/SLAPSHOT artifacts'
+STAGING_PATHS_FOUND=0
+STAGING_FILES=''
+for d in /var/netscaler/gui/vpn/scripts/linux /netscaler/ns_gui/vpn/scripts/linux /netscaler/gui/vpns/scripts/vista /netscaler/gui/vpns/scripts/mac /netscaler/ns_gui/vpns/scripts/vista /netscaler/ns_gui/vpns/scripts/mac; do
+    [ -d "$d" ] || continue
+    STAGING_PATHS_FOUND=1
+    files=$(find "$d" -type f \( -name '*.sig' -o -name '*.deb' -o -name '*.php' \) -print 2>/dev/null | head -100)
+    if [ -n "$files" ]; then STAGING_FILES="${STAGING_FILES}${STAGING_FILES:+
+--- $d ---
+}$files"; fi
+done
+if [ -n "$STAGING_FILES" ]; then
+    status CHECK 'Files with .sig/.deb/.php extensions found in VPN script staging paths reported in public research. These paths may contain legitimate vendor files; verify ownership, hashes, contents, and timestamps against the same build:'
+    printf '%s\n' "$STAGING_FILES"
+    printf '%s\n' "$STAGING_FILES" | while IFS= read -r f; do
+        case "$f" in ---*) continue ;; esac
+        [ -f "$f" ] || continue
+        ls -l "$f" 2>/dev/null
+        if grep -qE -i 'HTTP_NSC_(LDAP|CLIENTTYPE)|HTTP_X_UX(_[0-9]+)?|UXD_IDLE_EXIT|base64_decode[[:space:]]*\(|eval[[:space:]]*\(|shell_exec[[:space:]]*\(|<FATO>' "$f" 2>/dev/null; then
+            status ACTION "Webshell/tunneler behavior strings found in $f; preserve it and investigate as a potential compromise artifact."
+        fi
+    done
+elif [ "$STAGING_PATHS_FOUND" -eq 0 ]; then
+    status OK 'No reported VPN script staging files found; none of the candidate staging directories exists on this build. Confirm the path map if this build is expected to use one of them.'
+else
+    status OK 'No .sig/.deb/.php files found in the reported VPN script staging paths.'
+fi
+UXD_ARTIFACT_FOUND=0
+for f in /tmp/.uxdport /tmp/.uxdlock /var/tmp/.uxdport /var/tmp/.uxdlock; do
+    if [ -e "$f" ]; then UXD_ARTIFACT_FOUND=1; ls -l "$f" 2>&1; case "$f" in *uxdport) printf 'Recorded loopback port: '; head -c 128 "$f" 2>/dev/null; printf '\n' ;; esac; fi
+done
+if [ "$UXD_ARTIFACT_FOUND" -eq 1 ]; then
+    status ACTION 'SLAPSHOT-related .uxdport/.uxdlock artifact found. Record the port and process/socket state, preserve evidence, and investigate; do not delete the files.'
+    if command -v sockstat >/dev/null 2>&1; then sockstat -4 -l 2>&1 | head -60; fi
+    ps auxww 2>/dev/null | grep -E '[p]ython.*(UXD_IDLE_EXIT|base64|127[.]0[.]0[.]1)' | head -20
+else
+    status OK 'No .uxdport/.uxdlock artifacts found in /tmp or /var/tmp.'
+fi
+UX_HEADER_LOG_HITS=$(zgrep -E -i -n 'HTTP_NSC_(LDAP|CLIENTTYPE)|HTTP_X_UX(_[0-9]+)?|/vpn/media/[^[:space:]]+[.]ico|/vpn/scripts/(linux|vista|mac)/[^[:space:]]+[.](sig|deb|php)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -40)
+if [ -n "$UX_HEADER_LOG_HITS" ]; then
+    status CHECK 'HTTP logs contain reported webshell/tunneler header names or VPN staging-path requests. Logs may not record request headers; correlate timestamps and inspect response status, size, duration, and corresponding error-log entries:'
+    printf '%s\n' "$UX_HEADER_LOG_HITS"
+else
+    status OK 'No selected WHIPSHOT/SLAPSHOT header names or reported VPN staging-path requests found in available HTTP logs; coverage depends on retained logs and log format.'
+fi
+
 MISPLACED_PHP=$(grep -rlE '<\?[[:space:]]*php|passthru[[:space:]]*\(|NSC_TASS' /var/netscaler/logon/LogonPoint/custom /var/vpn 2>/dev/null)
 if [ -n "$MISPLACED_PHP" ]; then
     status ACTION 'PHP/webshell-like code found in Gateway customization paths where it is unexpected; inspect contents and preserve evidence:'
@@ -697,6 +749,31 @@ for f in /var/log/messages /var/log/ns.log /var/log/boot.log; do
 done
 [ "$FOUND_REBOOT_LOG" -eq 1 ] || status CHECK 'No readable candidate system logs were found at the paths checked.'
 
+subsection 'CVE-2026-88772 DTLS and NSPPE event correlation'
+DTLS_EVENT_LINES=$(zgrep -E -i -n 'SSL_HANDSHAKE_FAILURE.*DTLSv1[.]0.*Handshake failure-Internal Error' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -30)
+NSPPE_EVENT_LINES=$(zgrep -E -i -n 'orphan rings|NOT restarting NSPPE|NSPPE[^[:cntrl:]]*(exit|crash|signal|terminated)' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -50)
+if [ -n "$DTLS_EVENT_LINES" ]; then
+    printf '%s\n' "$DTLS_EVENT_LINES"
+    DTLS_EVENT_FOUND=1
+else
+    DTLS_EVENT_FOUND=0
+fi
+if [ -n "$NSPPE_EVENT_LINES" ]; then
+    printf '%s\n' "$NSPPE_EVENT_LINES"
+    NSPPE_EVENT_FOUND=1
+else
+    NSPPE_EVENT_FOUND=0
+fi
+if [ "$DTLS_EVENT_FOUND" -eq 1 ] && [ "$NSPPE_EVENT_FOUND" -eq 1 ]; then
+    status ACTION 'Both the reported DTLS handshake-failure pattern and NSPPE termination/orphan-ring indicators appear in retained system logs. This is a high-priority correlation lead, not proof by itself; correlate timestamps on the same appliance with core files and other evidence.'
+elif [ "$DTLS_EVENT_FOUND" -eq 1 ]; then
+    status CHECK 'Reported DTLS handshake-failure pattern found without a matching NSPPE event in the scanned logs. Review timestamps, log coverage, and source addresses; a handshake error alone is not proof of exploitation.'
+elif [ "$NSPPE_EVENT_FOUND" -eq 1 ]; then
+    status CHECK 'NSPPE termination/orphan-ring indicator found without the reported DTLS handshake pattern. Unexpected crashes have other causes; correlate with DTLS logs, core files, and maintenance events.'
+else
+    status OK 'No selected CVE-2026-88772 DTLS/NSPPE event patterns found in available ns.log/messages files. This covers only retained log content and does not rule out exploitation.'
+fi
+
 subsection 'Encoded-command references in HTTP and system logs'
 LOG_COUNT=0
 MATCH_COUNT=0
@@ -756,9 +833,9 @@ printf '\n--- Script extension references in HTTP error logs ---\n'
 ERROR_LOGS_FOUND=0
 for f in /var/log/httperror.log*; do [ -f "$f" ] && ERROR_LOGS_FOUND=1; done
 PHP_ERROR_HITS=$(zgrep -E -i -n '\.php' /var/log/httperror.log* 2>/dev/null | tail -50)
-SCRIPT_ERROR_HITS=$(zgrep -E -i -n '\.(sh|pl)' /var/log/httperror.log* 2>/dev/null | tail -50)
+SCRIPT_ERROR_HITS=$(zgrep -E -i -n '\.(sh|pl|sig|deb|rpm|tgz)' /var/log/httperror.log* /var/log/httperror-vpn.log* 2>/dev/null | tail -50)
 if [ -n "$PHP_ERROR_HITS" ]; then status CHECK 'PHP references found in HTTP error logs; review the request context and correlate timestamps:'; echo "$PHP_ERROR_HITS"; elif [ "$ERROR_LOGS_FOUND" -eq 0 ]; then status CHECK 'No candidate HTTP error log files found; coverage is unknown.'; else status OK 'No PHP references found in candidate HTTP error logs.'; fi
-if [ -n "$SCRIPT_ERROR_HITS" ]; then status CHECK 'References to .sh/.pl paths found in HTTP error logs; review the full request and correlate timestamps:'; echo "$SCRIPT_ERROR_HITS"; elif [ "$ERROR_LOGS_FOUND" -eq 1 ]; then status OK 'No .sh/.pl references found in candidate HTTP error logs.'; fi
+if [ -n "$SCRIPT_ERROR_HITS" ]; then status CHECK 'References to .sh/.pl/.sig/.deb/.rpm/.tgz paths found in HTTP error logs; review the full request and correlate timestamps:'; echo "$SCRIPT_ERROR_HITS"; elif [ "$ERROR_LOGS_FOUND" -eq 1 ]; then status OK 'No .sh/.pl/.sig/.deb/.rpm/.tgz references found in candidate HTTP error logs.'; fi
 
 printf '\n--- Suspicious command patterns in shell audit logs ---\n'
 SHELL_AUDIT_LOGS_FOUND=0
@@ -807,6 +884,20 @@ else
 section 'Appliance-only checks'
 status CHECK 'Skipped: this run targets an exported configuration file. Run the script locally on each ADC to scan logs, files, reboots, and other host indicators.'
 fi
+
+section 'Incident response guidance — use if compromise is suspected'
+cat <<'IRGUIDE'
+These are response reminders, not automated actions. Follow your incident-response process and coordinate with security, operations, and legal teams as appropriate.
+
+1. Preserve evidence before changing the appliance: for VPX, coordinate a hypervisor snapshot; record system time, timezone, and NTP configuration; preserve local, remote syslog, and NetScaler Console logs. Generate a support bundle.
+2. NSPPE core-dump collection causes a warm restart and disconnects SSH. Do not start it casually: first preserve other available evidence and coordinate the required restart with incident response and service owners. Preserve NSPPE core files for offline analysis.
+3. Contain suspected compromise by isolating the appliance as directed by the incident-response lead, considering service impact. Investigate connected authentication, web, management, and application systems for lateral activity.
+4. If compromise is confirmed, plan a trusted rebuild/replacement rather than relying on patching or deleting suspicious files. Restore only a known-good configuration backup that predates compromise, then validate the configuration.
+5. Revoke or rotate secrets and credentials stored on or used through the appliance, including service-account credentials, shared secrets, API keys, and affected user accounts. Revoke certificates/private keys as appropriate; after rebuild, rotate local passwords and key-encryption keys and replace revoked certificates.
+6. Harden the rebuilt system, keep NetScaler management services off the public internet, and monitor closely for at least 90 days. Preserve chain-of-custody evidence if legal or law-enforcement action may follow.
+
+Citrix guidance: https://support.citrix.com/external/article/CTX694799/steps-to-take-if-netscaler-adc-is-suspec.html
+IRGUIDE
 
 printf '\nCompleted. Plain-text report saved at: %s\n' "$OUT"
 exec 1>&3 2>&4 3>&- 4>&-
