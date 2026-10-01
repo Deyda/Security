@@ -2,7 +2,7 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.28
+# Version: 9.29
 #
 # Publisher
 #   Deyda Consulting GmbH
