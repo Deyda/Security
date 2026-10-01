@@ -1,53 +1,71 @@
 #!/bin/sh
-# NetScaler ADC defensive triage helper
-# Version 9.28
 #
-# Deyda Consulting GmbH
-# Website: https://www.deyda-consulting.de
-# Author: Manuel Winkel
-# NetScaler Security Readiness: https://www.deyda-consulting.de/expertise/netscaler-security-readiness/
-# NetScaler CVE checklist (DE): https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/
-# NetScaler CVE checklist (EN): https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/
-# Public NetScaler detection research (PitScaler): https://pitscaler.com/netscaler-detection/
-# Public NetScaler IoCs: https://pitscaler.com/netscaler-iocs/
-# Remediation and timeline context: https://pitscaler.com/netscaler-remediation/ and https://pitscaler.com/netscaler-timeline/
-# CVE-2026-88771 log-chain checks are independently implemented from CERT-EU's
-# public incident analysis: https://cert.europa.eu/blog/taking-execute-logging-a-bit-too-literally-cve-2026-88771
-# Additional CVE-2026-88771/88772 indicators: Unit 42 threat brief, updated 2026-09-30:
-# https://unit42.paloaltonetworks.com/netscaler-zero-days-exploited/
-# Incident-response reminders follow Citrix CTX694799. Matches are leads, not
-# proof of compromise or attribution.
-# Security Readiness provides managed NetScaler security update readiness,
-# including update planning, applicable workarounds, and validation.
-# Read-only. Run from the ADC shell. No interactive prompts are used. Missing or
-# undetected values stay UNKNOWN and produce CHECK results; the scan continues.
+# Deyda Consulting | NetScaler ADC Defensive Triage
+# Script:  deyda-netscaler-ioc-check.sh
+# Version: 9.28
 #
-# Positional parameters (in this exact order):
-#   1. FIRMWARE_VERSION  Version/build from "show ns version", e.g. 14.1-73.37.nc.
-#                        If omitted, it prefers the running kernel path and live
-#                        nsconmsg; saved loader/config files are fallback sources.
-#   2. ENHANCED_ISN      ENABLED or DISABLED (or the full CLI output). If omitted, the
-#                        saved /nsconfig/ns.conf setting is used; absent means DISABLED.
-#   No third positional parameter is used. On an ADC, the script reads the
-#   modification time of /var/nsinstall/installns_state as the install marker.
-#   Confirm this timestamp against change records; exported-config mode has no marker.
+# Publisher
+#   Deyda Consulting GmbH
+#   Website: https://www.deyda-consulting.de
+#   Author: Manuel Winkel
+#   Security Readiness:
+#   https://www.deyda-consulting.de/expertise/netscaler-security-readiness/
 #
-# Run with automatic detection / no prompts:
-#   sh /path/to/netscaler-ioc-check.sh
-# Supply all values explicitly:
-#   sh /path/to/netscaler-ioc-check.sh 14.1-73.37.nc ENABLED
-# Scan an exported ns.conf (configuration checks only; no appliance/log checks):
-#   sh /path/to/netscaler-ioc-check.sh --config /path/to/ns.conf 14.1-73.37.nc ENABLED
-# Report statuses: [OK] no finding in the scanned scope; [ACTION] potential indicator requires investigation;
-# [CHECK] manual validation is needed or scan coverage is incomplete.
-# The plain-text report is saved in /var/tmp.
-
+# References
+#   NetScaler CVE checklist (DE):
+#   https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/
+#   NetScaler CVE checklist (EN):
+#   https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/
+#   Public detection research: https://pitscaler.com/netscaler-detection/
+#   Public IoCs: https://pitscaler.com/netscaler-iocs/
+#   Remediation/timeline: https://pitscaler.com/netscaler-remediation/
+#   https://pitscaler.com/netscaler-timeline/
+#   CERT-EU (CVE-2026-88771 log-chain analysis):
+#   https://cert.europa.eu/blog/taking-execute-logging-a-bit-too-literally-cve-2026-88771
+#   Unit 42 (CVE-2026-88771/88772 indicators, updated 2026-09-30):
+#   https://unit42.paloaltonetworks.com/netscaler-zero-days-exploited/
+#   Citrix incident response: CTX694799
+#
+# Operation
+#   Read-only. Run from the ADC shell. No interactive prompts are used.
+#   No configuration changes, restarts, or cleanup are performed.
+#   Matches are investigative leads, not proof of compromise or attribution.
+#   Missing or undetected values stay UNKNOWN and produce CHECK results;
+#   the scan continues.
+#
+# Parameters (in this exact order)
+#   1. FIRMWARE_VERSION
+#      Version/build from "show ns version", e.g. 14.1-73.37.nc.
+#      If omitted, the script prefers the running kernel path and live
+#      nsconmsg; saved loader/config files are fallback sources.
+#   2. ENHANCED_ISN
+#      ENABLED or DISABLED (or the full CLI output).
+#      If omitted, /nsconfig/ns.conf is used; absent means DISABLED.
+#   Install-time marker
+#      On an ADC, the script reads the modification time of
+#      /var/nsinstall/installns_state. Confirm it against change records.
+#      Exported-config mode has no install-time marker.
+#   No third positional parameter is used.
+#
+# Usage
+#   Automatic detection:
+#     sh /path/to/deyda-netscaler-ioc-check.sh
+#   Explicit version and Enhanced ISN state:
+#     sh /path/to/deyda-netscaler-ioc-check.sh 14.1-73.37.nc ENABLED
+#   Exported ns.conf (configuration checks only):
+#     sh /path/to/deyda-netscaler-ioc-check.sh \
+#       --config /path/to/ns.conf 14.1-73.37.nc ENABLED
+#
+# Status labels: [OK] no match in scanned scope; [ACTION] investigate indicator;
+# [CHECK] manual validation required or scan coverage incomplete.
+# Report output: /var/tmp/deyda-netscaler-ioc-check_<host>_<time>.txt
+#
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 export PATH
 umask 077
 HOST=$(hostname 2>/dev/null || echo unknown-host)
 NOW=$(date '+%Y-%m-%d_%H%M%S' 2>/dev/null || echo unknown-time)
-OUT="/var/tmp/netscaler-ioc-check_${HOST}_${NOW}.txt"
+OUT="/var/tmp/deyda-netscaler-ioc-check_${HOST}_${NOW}.txt"
 CONFIG=/nsconfig/ns.conf
 RUNNING_ON_ADC=YES
 
@@ -153,18 +171,18 @@ exec > "$OUT" 2>&1
 
 section() { printf '\n===== %s =====\n' "$1"; }
 subsection() { printf '\n--- %s ---\n' "$1"; }
-status() { printf '[%s] %s\n' "$1" "$2"; }
+status() { printf '\n[%s] %s\n' "$1" "$2"; }
 FW_PATCHED=UNKNOWN
 
-printf 'NetScaler IOC and CVE triage report\nHost: %s\nTime: %s\n' "$HOST" "$NOW"
-printf 'Script version: 9.28\n'
-printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n'
-printf 'Related articles (DE): https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
-printf 'Related articles (EN): https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/\n'
-printf 'Additional public detection research: https://pitscaler.com/netscaler-detection/ (independent snapshot; indicator coverage changes over time)\n'
+printf 'Deyda Consulting NetScaler IOC and CVE triage report\n'
+printf 'Host: %s\nTime: %s\nScript version: 9.28\n\n' "$HOST" "$NOW"
+printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n\n'
+printf 'Related articles\n  DE: https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
+printf '  EN: https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/\n\n'
+printf 'Additional research: https://pitscaler.com/netscaler-detection/ (independent snapshot; coverage changes over time)\n'
 printf 'Mode: read-only; no configuration changes, restarts, or cleanup performed\n'
 printf 'Report: %s\n' "$OUT"
-printf 'Interpretation: [OK] no match in scanned scope; [CHECK] verify evidence/context; [ACTION] preserve and investigate promptly.\n'
+printf 'Interpretation: [OK] no match in scanned scope; [CHECK] verify evidence/context; [ACTION] preserve and investigate promptly.\n\n'
 printf 'Build input/source: %s / %s\n' "${CURRENT_INPUT:-not supplied}" "$VERSION_SOURCE"
 if [ "$RUNNING_ON_ADC" = YES ] && [ -n "$CONFIG_VERSION" ] && [ -n "$RUNTIME_FAMILY" ] && [ "${CONFIG_VERSION%%-*}" != "$RUNTIME_FAMILY" ]; then
     status CHECK "Saved ns.conf header reports $CONFIG_VERSION, but the running kernel release identifies $RUNTIME_FAMILY. The running-kernel source takes precedence; treat the saved header as stale until verified."
@@ -246,7 +264,7 @@ if [ -n "$CURRENT_INPUT" ]; then
         fi
     fi
 else
-    status CHECK 'Firmware comparison skipped; rerun with the version from show ns version as argument, e.g. sh netscaler-ioc-check.sh 14.1-73.37.nc.'
+    status CHECK 'Firmware comparison skipped; rerun with the version from show ns version as argument, e.g. sh deyda-netscaler-ioc-check.sh 14.1-73.37.nc.'
 fi
 printf '\nCVE configuration matches below show feature/precondition clues from the configuration file.\n'
 printf 'If the entered build meets the fixed threshold, these matches do not mean the patched appliance remains vulnerable; they may matter when assessing exposure before the update.\n'
