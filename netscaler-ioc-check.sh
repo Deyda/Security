@@ -1,6 +1,6 @@
 #!/bin/sh
 # NetScaler ADC defensive triage helper
-# Version 9.27
+# Version 9.28
 #
 # Deyda Consulting GmbH
 # Website: https://www.deyda-consulting.de
@@ -13,6 +13,8 @@
 # Remediation and timeline context: https://pitscaler.com/netscaler-remediation/ and https://pitscaler.com/netscaler-timeline/
 # CVE-2026-88771 log-chain checks are independently implemented from CERT-EU's
 # public incident analysis: https://cert.europa.eu/blog/taking-execute-logging-a-bit-too-literally-cve-2026-88771
+# Additional CVE-2026-88771/88772 indicators: Unit 42 threat brief, updated 2026-09-30:
+# https://unit42.paloaltonetworks.com/netscaler-zero-days-exploited/
 # Incident-response reminders follow Citrix CTX694799. Matches are leads, not
 # proof of compromise or attribution.
 # Security Readiness provides managed NetScaler security update readiness,
@@ -155,7 +157,7 @@ status() { printf '[%s] %s\n' "$1" "$2"; }
 FW_PATCHED=UNKNOWN
 
 printf 'NetScaler IOC and CVE triage report\nHost: %s\nTime: %s\n' "$HOST" "$NOW"
-printf 'Script version: 9.27\n'
+printf 'Script version: 9.28\n'
 printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n'
 printf 'Related articles (DE): https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
 printf 'Related articles (EN): https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/\n'
@@ -666,7 +668,10 @@ fi
 KNOWN_WEBSHELL_HASHES='6f5a2a452a7901323abd21879c6cecccb47c06aeeaccb1b467212f3b11e4b1e7
 ed082f744f035035900f67edf438f2f7d0528ac501234f63d476d65273cdb9a1
 5ea5ea61e9062822bee3f66ef5ff47c217178d9e31936ad6daf10c5dfae44d12
-7add390ceee4a1373211b3e340451b34f08965fc4d805f94c9b8cebdc0775774'
+7add390ceee4a1373211b3e340451b34f08965fc4d805f94c9b8cebdc0775774
+ae22ef2517b5c0fb47f78745b9cb5260acee0e751b89bcd354640ff8bc8d29ec
+1bd314b661396c7086f6367fbbb48025e03ca2de69c073d53a8b0a38aa5fbb7d
+79c65fa04541032e251fa4796b97800374b63c7982593dd1a2e0db605d429186'
 WEBSHELL_HASH_HITS=''
 if command -v sha256 >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1; then
     for d in /var/netscaler/logon/LogonPoint/custom /var/vpn /var/netscaler/gui/vpn/scripts/linux /netscaler/ns_gui/vpn/scripts/linux /netscaler/gui/vpns/scripts/vista /netscaler/gui/vpns/scripts/mac /netscaler/ns_gui/vpns/scripts/vista /netscaler/ns_gui/vpns/scripts/mac; do
@@ -680,7 +685,7 @@ if command -v sha256 >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1; th
         done
     done
     if [ -n "$WEBSHELL_HASH_HITS" ]; then
-        status ACTION 'File matching a publicly reported NetScaler webshell SHA-256 found; the list contains samples from multiple sources and is not exhaustive. Preserve it and investigate the appliance and HA peer:'
+        status ACTION 'File matching a publicly reported NetScaler webshell, package, or payload SHA-256 found. Hash matches are specific sample indicators; preserve the file and investigate the appliance and HA peer:'
         printf '%s\n' "$WEBSHELL_HASH_HITS"
     elif [ ! -d /var/netscaler/logon/LogonPoint/custom ] && [ ! -d /var/vpn ]; then
         status CHECK 'Neither target customization directory exists; the known webshell hash check could not run.'
@@ -1009,14 +1014,14 @@ SYS_IOC_LOGS_FOUND=0
 for f in /var/log/ns.log* /var/log/messages*; do [ -f "$f" ] && [ -r "$f" ] && SYS_IOC_LOGS_FOUND=1; done
 # CERT-EU describes the authentication-log marker followed by shell syntax as
 # the second part of the chain. Do not infer that a background helper executed it.
-PITBOSS_LINES=$(zgrep -hE -i 'pitboss PPE missed too many heartbeatsNSPPE[^[:cntrl:]]*(;|%3[bB]|`|%60|\$\(|\$\{IFS\}|%24%7BIFS%7D)' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -30)
+PITBOSS_LINES=$(zgrep -hE -i 'pitboss PPE (missed too many heartbeats|unexpectedly died)[[:space:]]?NSPPE(-[0-9]+)?[^[:cntrl:]]*(;|%3[bB]|`|%60|\$\(|\$\{IFS\}|%24%7BIFS%7D)' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -40)
 if [ -n "$PITBOSS_LINES" ]; then
-    status ACTION 'Authentication-log line matches the public PPE heartbeat trigger followed by shell syntax. This records an exploit attempt; it does not prove the line was later processed or that a command ran. Preserve and correlate it:'
+    status ACTION 'System/authentication-log line matches a publicly reported PPE trigger (missed heartbeats or unexpectedly died) followed by shell syntax. This records an exploit attempt; it does not prove the line was later processed or that a command ran. Preserve and correlate it:'
     printf '%s\n' "$PITBOSS_LINES"
 elif [ "$SYS_IOC_LOGS_FOUND" -eq 0 ]; then
     status CHECK 'No readable ns.log/messages files found; the authentication-trigger check has no coverage.'
 else
-    status OK 'No selected PPE heartbeat-trigger plus shell-syntax pattern found in retained ns.log/messages files.'
+    status OK 'No selected PPE-trigger (missed heartbeats or unexpectedly died) plus shell-syntax pattern found in retained ns.log/messages files.'
 fi
 if [ -n "$PITBOSS_LINES" ] && [ -n "$INDEX_LINES" ]; then
     status ACTION 'Both selected stages of the publicly described log chain are present. Raise incident priority and correlate timestamps with httpd.conf changes, webshell/payload artifacts, and system events. Available log matches cannot confirm whether the background helper processed the trigger or whether a command executed.'
@@ -1027,14 +1032,14 @@ elif [ -n "$INDEX_LINES" ]; then
 fi
 
 printf '\n--- Additional public exploit-path, webshell-staging, and callback indicators ---\n'
-EXPLOIT_PATH_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -40)
+EXPLOIT_PATH_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html|/logon/LogonPoint/Authentication/GetUserName)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -40)
 if [ -n "$EXPLOIT_PATH_HITS" ]; then
     status CHECK 'Requests to endpoints observed in public honeypot/research reporting found. These are legitimate NetScaler paths; the requests alone are not IOCs. Review any logged username/body/User-Agent for shell metacharacters or payloads and correlate with auth/system logs:'
     printf '%s\n' "$EXPLOIT_PATH_HITS"
 else
-    status OK 'No requests to the selected public exploit paths found in available HTTP logs; this is limited by log retention and format.'
+    status OK 'No requests to selected public exploit/authentication paths found in available HTTP logs; this is limited by log retention and format.'
 fi
-AUTH_POISON_HTTP_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html)[^[:cntrl:]]*(pitboss|NSPPE|PPE unexpectedly died|missed too many heartbeats|%3[bB]|%60|\$\{IFS\}|curl[[:space:]]|wget[[:space:]]|fetch[[:space:]])' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -30)
+AUTH_POISON_HTTP_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html|/logon/LogonPoint/Authentication/GetUserName)[^[:cntrl:]]*(pitboss|NSPPE|PPE unexpectedly died|missed too many heartbeats|%3[bB]|%60|\$\{IFS\}|curl[[:space:]]|wget[[:space:]]|fetch[[:space:]])' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -30)
 if [ -n "$AUTH_POISON_HTTP_HITS" ]; then
     status ACTION 'A logged exploit-path request also contains a public log-poisoning trigger or shell/download marker. Review the full request and correlate with ns.log/messages and file artifacts; this indicates an attempt, not automatically successful execution:'
     printf '%s\n' "$AUTH_POISON_HTTP_HITS"
