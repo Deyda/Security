@@ -2,7 +2,7 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.38
+# Version: 9.43
 #
 # Publisher
 #   Deyda Consulting GmbH
@@ -65,7 +65,8 @@
 # Optional trusted same-build hash for the existing NetScaler customsnmpd component:
 #   DEYDA_CUSTOMSNMPD_REFERENCE_SHA256=<64-hex-SHA256> sh /path/to/deyda-netscaler-ioc-check.sh
 #   Obtain the reference from a trusted, identical firmware build; never infer it from an
-#   appliance under investigation. A public malicious-sample hash is checked separately.
+#   appliance under investigation. Internal /var/python/bin and /var/configd_devno values
+#   below come from one clean 14.1-73.37 appliance and are not Citrix-published checksums.
 #
 # Status labels: [OK] no match in scanned scope; [ACTION] investigate indicator;
 # [CHECK] manual validation required or scan coverage incomplete.
@@ -210,14 +211,57 @@ check_1417337_reference() {
 }
 reference_suid_1417337() {
     case "$1" in
-        /var/nslog/nslog.nextfile) check_1417337_reference "$1" 'be4726ae5ae22d77622cee76c71caafe9f1d3150290da881d4bff5a581857ced' ;;
-        /var/run/nsprofmgmt.pid) check_1417337_reference "$1" '00b88b95f53d94afa0fe916585d58503c5e22b70ceef24cccb335ac0c1ddac27' ;;
+        /var/nslog/nslog.nextfile) check_nslog_nextfile_state "$1" ;;
+        /var/run/nsprofmgmt.pid) check_nsprofmgmt_pid "$1" ;;
+        /var/configd_devno) check_1417337_reference "$1" '5b76771117eacc288a42de079a719402e26528e997cfa82241c4d7a842eba5d2' ;;
     esac
+}
+check_nsprofmgmt_pid() {
+    _pid_file=$1
+    _pid=$(tr -d '[:space:]' < "$_pid_file" 2>/dev/null)
+    _pid_meta=$(ls -ln "$_pid_file" 2>/dev/null | awk 'NR==1{print $1 ":" $3 ":" $4}')
+    if [ -z "$_pid" ] || ! printf '%s\n' "$_pid" | grep -E -q '^[0-9]+$'; then
+        status CHECK "$_pid_file does not contain a numeric PID; preserve and inspect the file."
+        return
+    fi
+    # NetScaler's FreeBSD ps output is reliable in the traditional auxww form;
+    # avoid comma-separated -o formatting, which is not parsed consistently here.
+    _pid_process=$(ps auxww 2>/dev/null | awk -v target="$_pid" '$2 == target {print}')
+    if [ -n "$_pid_process" ] && printf '%s\n' "$_pid_process" | grep -E -q '/netscaler/nsprofmgmt([[:space:]]|$)'; then
+        status OK "$_pid_file contains PID $_pid and it resolves to the expected /netscaler/nsprofmgmt process. PID-file hashes are not compared because the PID changes at runtime."
+        printf 'Matched process: %s\n' "$_pid_process"
+    elif [ -n "$_pid_process" ]; then
+        status CHECK "$_pid_file contains PID $_pid, but that PID belongs to a different process; investigate the mismatch:"
+        printf '%s\n' "$_pid_process"
+    else
+        status CHECK "$_pid_file contains PID $_pid, but no matching live process was found; check for a stale PID file or stopped service."
+    fi
+    if [ "$_pid_meta" = '---x--S---:0:0' ]; then
+        status OK 'nsprofmgmt.pid mode and numeric owner/group match the internal 14.1-73.37 sample; size, timestamp, and hash are intentionally not compared.'
+    else
+        status CHECK "nsprofmgmt.pid mode/owner/group differ from the internal sample (observed ${_pid_meta:-unavailable}); validate against a trusted same-build peer."
+    fi
+}
+check_nslog_nextfile_state() {
+    _state_file=$1
+    _next_value=$(tr -d '[:space:]' < "$_state_file" 2>/dev/null)
+    _state_meta=$(ls -ln "$_state_file" 2>/dev/null | awk 'NR==1{print $1 ":" $3 ":" $4}')
+    if [ -n "$_next_value" ] && printf '%s\n' "$_next_value" | grep -E -q '^[0-9]+$'; then
+        status OK "$_state_file contains a numeric next-file value. Its content can change with log rotation, so the one-appliance SHA-256 is not used as a fixed baseline."
+    else
+        status CHECK "$_state_file does not contain the expected numeric next-file value; preserve and inspect the content."
+        printf 'Observed content: %s\n' "${_next_value:-<empty>}"
+    fi
+    if [ "$_state_meta" = '-rwS--x---:0:0' ]; then
+        status OK 'nslog.nextfile mode and numeric owner/group match the internal 14.1-73.37 sample; size, timestamp, and hash are intentionally not compared.'
+    else
+        status CHECK "nslog.nextfile mode/owner/group differ from the internal sample (observed ${_state_meta:-unavailable}); validate against a trusted same-build peer."
+    fi
 }
 FW_PATCHED=UNKNOWN
 
 printf 'Deyda Consulting NetScaler IOC and CVE triage report\n'
-printf 'Host: %s\nTime: %s\nScript version: 9.38\n\n' "$HOST" "$NOW"
+printf 'Host: %s\nTime: %s\nScript version: 9.43\n\n' "$HOST" "$NOW"
 printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n\n'
 printf 'Related articles\n  DE: https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
 printf '  EN: https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/\n\n'
@@ -726,6 +770,7 @@ fi
 
 printf '\n--- /var/cron/tabs inventory ---\n'
 if [ -d /var/cron/tabs ]; then
+    printf '%s\n' 'This enumerates every regular per-user crontab file, including users beyond root, nsroot, and nobody checked above. Filenames identify the account; active entries are shown for manual validation.'
     CRON_TAB_LIST=$(ls -la /var/cron/tabs 2>&1)
     printf '%s\n' "$CRON_TAB_LIST"
     CRON_TAB_FILES=$(find /var/cron/tabs -type f -print 2>/dev/null)
@@ -943,7 +988,7 @@ if [ -n "$ROOT_SUID_GID" ]; then
         if command -v file >/dev/null 2>&1; then file "$f" 2>&1; fi
         if command -v sha256 >/dev/null 2>&1; then sha256 "$f" 2>&1; elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$f" 2>&1; else status CHECK "No SHA-256 utility available for $f."; fi
         case "$f" in
-            /var/nslog/nslog.nextfile|/var/run/nsprofmgmt.pid) reference_suid_1417337 "$f" ;;
+            /var/nslog/nslog.nextfile|/var/run/nsprofmgmt.pid|/var/configd_devno) reference_suid_1417337 "$f" ;;
             *) status CHECK "No internal reference hash is configured for $f; compare with a trusted same-build appliance." ;;
         esac
     done <<SUID_FILES_EOF
@@ -960,7 +1005,7 @@ if [ -r "${INSTALL_STATE_FILE-}" ]; then
         while IFS= read -r f; do
             [ -n "$f" ] || continue
             case "$f" in
-                /var/nslog/nslog.nextfile|/var/run/nsprofmgmt.pid)
+                /var/nslog/nslog.nextfile|/var/run/nsprofmgmt.pid|/var/configd_devno)
                     RECENT_SUID_KNOWN="${RECENT_SUID_KNOWN}${f}\n"
                     ;;
                 *)
@@ -975,8 +1020,8 @@ RECENT_SUID_EOF
                 [ -n "$f" ] || continue
                 _expected=''
                 case "$f" in
-                    /var/nslog/nslog.nextfile) _expected='be4726ae5ae22d77622cee76c71caafe9f1d3150290da881d4bff5a581857ced' ;;
-                    /var/run/nsprofmgmt.pid) _expected='00b88b95f53d94afa0fe916585d58503c5e22b70ceef24cccb335ac0c1ddac27' ;;
+                    /var/nslog/nslog.nextfile|/var/run/nsprofmgmt.pid) continue ;;
+                    /var/configd_devno) _expected='5b76771117eacc288a42de079a719402e26528e997cfa82241c4d7a842eba5d2' ;;
                 esac
                 _observed=$(sha256_of "$f")
                 if { [ "$CURRENT_INPUT" = '14.1-73.37' ] || [ "$CURRENT_INPUT" = '14.1-73.37.nc' ]; } && [ -n "$_observed" ] && [ "$_observed" = "$_expected" ]; then
@@ -1287,6 +1332,11 @@ if [ -f "$CUSTOMSNMPD_FILE" ]; then
                 status CHECK '/var/python/bin/customsnmpd differs from the operator-supplied trusted same-build SHA-256 reference. Preserve it and verify the baseline source and approved changes.'
                 printf 'Trusted reference: %s\n' "$DEYDA_CUSTOMSNMPD_REFERENCE_SHA256"
             fi
+        elif { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; } && [ "$CUSTOMSNMPD_HASH" = '1dd0887ff21b18b0eb78a336e76d4dc3bb6f4fc645e9d864414a2958cb1637fe' ]; then
+            status OK '/var/python/bin/customsnmpd matches the internal clean-appliance 14.1-73.37 SHA-256 reference; this is not a Citrix-published checksum.'
+        elif { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; }; then
+            status CHECK '/var/python/bin/customsnmpd differs from the internal one-appliance 14.1-73.37 reference. Compare edition, approved changes, and another trusted same-build node.'
+            printf 'Internal clean reference: %s\n' '1dd0887ff21b18b0eb78a336e76d4dc3bb6f4fc645e9d864414a2958cb1637fe'
         else
             status CHECK '/var/python/bin/customsnmpd does not match the selected public malicious-sample hash, but no valid trusted same-build hash was supplied; integrity remains unverified.'
         fi
@@ -1295,6 +1345,66 @@ if [ -f "$CUSTOMSNMPD_FILE" ]; then
     fi
 else
     status OK 'No /var/python/bin/customsnmpd file found.'
+fi
+if [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; then
+    PYTHON_REFERENCE_NAMES='fixup_pubsub_v1_keywords.py CreateCluster.py MyFirstNitroApplication.py get_config.py jp.py rm_config.py set_config.py stat_config.py'
+    PYTHON_REFERENCE_COUNT=0
+    PYTHON_REFERENCE_MISMATCHES=0
+    for name in $PYTHON_REFERENCE_NAMES; do
+        PYTHON_REFERENCE_COUNT=$((PYTHON_REFERENCE_COUNT + 1))
+        f="/var/python/bin/$name"
+        case "$name" in
+            fixup_pubsub_v1_keywords.py) PYTHON_EXPECTED='c1f44da36acb747f43906abf2c2cdde86f436473c631f603ed7aa0386a996170' ;;
+            CreateCluster.py) PYTHON_EXPECTED='d425f646c717e85e3d799b21eb4bc7032997e8f91afa45a183dd63db6e17e2bf' ;;
+            MyFirstNitroApplication.py) PYTHON_EXPECTED='edf3a5c3ca3621ecd1c4690f57e044ea066ac4c16b3f19914c567e2543c3bdfb' ;;
+            get_config.py) PYTHON_EXPECTED='b681ae3666300014287c2bf7ff286792dc40934cf0ae504325ccfc80b4beb5d9' ;;
+            jp.py) PYTHON_EXPECTED='3e473aaa397c21c6d35219a218da7a627e24079714e211228a7c522f5b01b306' ;;
+            rm_config.py) PYTHON_EXPECTED='597311c15a0570933688320c7f79dd51992ad0503d04e01a75f319d31d524209' ;;
+            set_config.py) PYTHON_EXPECTED='61df56aef3b63bae9436a449afc8c13a02ff202a411357f3d819ac8f0c685971' ;;
+            stat_config.py) PYTHON_EXPECTED='c03a8b059878d685fabd3c3d166965e46cbf9163f6ec9c88cb11eda9d46e2b58' ;;
+        esac
+        if [ ! -f "$f" ]; then
+            status CHECK "$f is absent but exists in the internal clean 14.1-73.37 reference; verify whether the component is expected on this appliance."
+            PYTHON_REFERENCE_MISMATCHES=$((PYTHON_REFERENCE_MISMATCHES + 1))
+            continue
+        fi
+        PYTHON_OBSERVED=$(sha256_of "$f")
+        if [ -n "$PYTHON_OBSERVED" ] && [ "$PYTHON_OBSERVED" = "$PYTHON_EXPECTED" ]; then
+            status OK "$f matches the internal clean 14.1-73.37 SHA-256 reference. This is not a Citrix-published checksum."
+        else
+            status CHECK "$f differs from the internal clean 14.1-73.37 reference or could not be hashed; validate approved changes and compare with another trusted same-build appliance."
+            printf 'Observed: %s\nExpected: %s\n' "${PYTHON_OBSERVED:-unavailable}" "$PYTHON_EXPECTED"
+            PYTHON_REFERENCE_MISMATCHES=$((PYTHON_REFERENCE_MISMATCHES + 1))
+        fi
+    done
+    UNKNOWN_PYTHON_FILES=''
+    for f in /var/python/bin/*.py; do
+        [ -f "$f" ] || continue
+        case "${f##*/}" in
+            fixup_pubsub_v1_keywords.py|CreateCluster.py|MyFirstNitroApplication.py|get_config.py|jp.py|rm_config.py|set_config.py|stat_config.py) ;;
+            *) UNKNOWN_PYTHON_FILES="${UNKNOWN_PYTHON_FILES}${UNKNOWN_PYTHON_FILES:+
+}$f" ;;
+        esac
+    done
+    if [ -n "$UNKNOWN_PYTHON_FILES" ]; then
+        status CHECK 'Additional Python files exist in /var/python/bin outside the supplied clean-reference set; review each against the installed build and approved changes:'
+        printf '%s\n' "$UNKNOWN_PYTHON_FILES"
+        printf '%s\n' "$UNKNOWN_PYTHON_FILES" | while IFS= read -r f; do ls -ln "$f" 2>/dev/null; printf 'SHA-256: %s\n' "$(sha256_of "$f")"; done
+    elif [ "$PYTHON_REFERENCE_MISMATCHES" -eq 0 ]; then
+        status OK "All $PYTHON_REFERENCE_COUNT referenced Python files under /var/python/bin match the internal clean 14.1-73.37 hashes; no additional .py files were found."
+    fi
+fi
+if { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; }; then
+    if [ -f /var/configd_devno ]; then
+        CONFIGD_DEVNO_META=$(ls -ln /var/configd_devno 2>/dev/null | awk 'NR==1{print $1 ":" $3 ":" $4 ":" $5}')
+        if [ "$CONFIGD_DEVNO_META" = '-rwxr-Sr--:0:0:129' ]; then
+            status OK '/var/configd_devno mode, numeric owner/group, and size match the internal clean 14.1-73.37 sample.'
+        else
+            status CHECK "/var/configd_devno metadata differs from the internal clean sample (-rwxr-Sr--:0:0:129); observed: ${CONFIGD_DEVNO_META:-unavailable}. Compare with another trusted same-build appliance."
+        fi
+    else
+        status CHECK '/var/configd_devno was absent on the internal 14.1-73.37 reference; verify whether it is expected to exist on this appliance and compare with a trusted peer.'
+    fi
 fi
 CTX_RECEIVER_FILES=$(find /var/netscaler/logon /netscaler/ns_gui /var/vpn -type f -name '.ctxs*' -print 2>/dev/null)
 if [ -n "$CTX_RECEIVER_FILES" ]; then
@@ -1543,6 +1653,53 @@ else
     status CHECK "Language-file directory $LANGUAGE_DIR is absent; this targeted content check could not run."
 fi
 
+printf '\n--- Additional LogonPoint customization baseline files ---\n'
+if [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; then
+    CUSTOM_ASSET_EXPECTED_COUNT=15
+    CUSTOM_ASSET_OBSERVED_COUNT=0
+    CUSTOM_ASSET_BASELINE_MISMATCHES=''
+    for name in script.js style.css ajax-loader.gif strings.de.json strings.en.json strings.es.json strings.fr.json strings.it.json strings.ja.json strings.nl.json strings.pt.json strings.ko.json strings.ru.json strings.zh-CN.json strings.zh-TW.json; do
+        f="$LANGUAGE_DIR/$name"
+        [ -f "$f" ] || continue
+        CUSTOM_ASSET_OBSERVED_COUNT=$((CUSTOM_ASSET_OBSERVED_COUNT + 1))
+        CUSTOM_ASSET_HASH=$(sha256_of "$f")
+        CUSTOM_ASSET_EXPECTED_HASH=''
+        case "${f##*/}" in
+            script.js) CUSTOM_ASSET_EXPECTED_HASH='31d53110df746be20920919bd72b80408e758a44852d3cf4a3d88e1b7bd5460a' ;;
+            style.css) CUSTOM_ASSET_EXPECTED_HASH='0ecdfbe22feb58756224e2e3b9f38abeafcf4c491f79cdba6ebb8de52acc044b' ;;
+            ajax-loader.gif) CUSTOM_ASSET_EXPECTED_HASH='b98f0466a81ba5642c9bafbc00964f0e559945a4ec996a165d2179d03bd5e8ca' ;;
+            strings.de.json|strings.en.json|strings.fr.json|strings.it.json|strings.ja.json|strings.pt.json|strings.nl.json|strings.ko.json|strings.ru.json|strings.zh-TW.json)
+                CUSTOM_ASSET_EXPECTED_HASH='8eb95bcbc154530931e15fc418c8b1fe991095671409552099ea1aa596999ede' ;;
+            strings.es.json|strings.zh-CN.json)
+                CUSTOM_ASSET_EXPECTED_HASH='d914176fd50bd7f565700006a31aa97b79d3ad17cee20c8e5ff2061d5cb74817' ;;
+        esac
+        printf '%s\n' "$f"
+        printf 'Observed SHA-256: %s\n' "${CUSTOM_ASSET_HASH:-unavailable}"
+        if [ -n "$CUSTOM_ASSET_HASH" ] && [ "$CUSTOM_ASSET_HASH" = "$CUSTOM_ASSET_EXPECTED_HASH" ]; then
+            status OK "$f matches the internal clean 14.1-73.37 single-appliance reference. This is not a vendor checksum."
+        elif [ -n "$CUSTOM_ASSET_HASH" ]; then
+            status CHECK "$f differs from the internal clean 14.1-73.37 reference; validate intended customization and compare with another trusted same-build appliance."
+            printf 'Reference SHA-256: %s\n' "$CUSTOM_ASSET_EXPECTED_HASH"
+            CUSTOM_ASSET_BASELINE_MISMATCHES="${CUSTOM_ASSET_BASELINE_MISMATCHES}${CUSTOM_ASSET_BASELINE_MISMATCHES:+
+}$f"
+        else
+            status CHECK "Could not calculate SHA-256 for $f."
+            CUSTOM_ASSET_BASELINE_MISMATCHES="${CUSTOM_ASSET_BASELINE_MISMATCHES}${CUSTOM_ASSET_BASELINE_MISMATCHES:+
+}$f"
+        fi
+    done
+    if [ "$CUSTOM_ASSET_OBSERVED_COUNT" -eq "$CUSTOM_ASSET_EXPECTED_COUNT" ] && [ -z "$CUSTOM_ASSET_BASELINE_MISMATCHES" ]; then
+        status OK 'All 15 additional LogonPoint assets (script.js, style.css, ajax-loader.gif, and strings.*.json) match the internal clean 14.1-73.37 reference.'
+    else
+        status CHECK "LogonPoint baseline coverage is partial or differs (observed $CUSTOM_ASSET_OBSERVED_COUNT of $CUSTOM_ASSET_EXPECTED_COUNT expected files). Missing files and intentional customizations require local validation."
+        for name in script.js style.css ajax-loader.gif strings.de.json strings.en.json strings.es.json strings.fr.json strings.it.json strings.ja.json strings.nl.json strings.pt.json strings.ko.json strings.ru.json strings.zh-CN.json strings.zh-TW.json; do
+            [ -f "$LANGUAGE_DIR/$name" ] || printf 'Missing reference file: %s/%s\n' "$LANGUAGE_DIR" "$name"
+        done
+    fi
+else
+    status CHECK 'These additional LogonPoint hashes are a single-appliance 14.1-73.37 reference and were not compared because the running build is outside that exact scope.'
+fi
+
 section '5. Log coverage and event correlation'
 subsection 'Purpose and follow-up'
 printf '%s\n' 'Purpose: establish which retained logs overlap the suspected pre-patch period, then search for selected HTTP, authentication, DTLS, and system-event indicators.'
@@ -1690,6 +1847,26 @@ elif [ -n "$INDEX_LINES" ]; then
 fi
 
 printf '\n--- Additional public exploit-path, webshell-staging, and callback indicators ---\n'
+RECON_LOGS_FOUND=0
+for f in /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn*; do [ -f "$f" ] && [ -r "$f" ] && RECON_LOGS_FOUND=1; done
+NSEPA_PROBES=$(zgrep -E -i -n 'nsepa[.]deb' /var/log/httpaccess* 2>/dev/null | grep -E '"[[:space:]]*206[[:space:]]+1([[:space:]]|$)' | tail -20)
+VP_PROBE_HITS=$(zgrep -E -i -n 'vp_probe_nonexist' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -20)
+if [ -n "$NSEPA_PROBES" ]; then
+    status CHECK 'HTTP access logs contain nsepa.deb requests answered with HTTP 206 and a one-byte response. Public reporting associates this with reconnaissance/probing; it does not establish exploitation. Review source, timestamps, and adjacent requests:'
+    printf '%s\n' "$NSEPA_PROBES"
+elif [ "$RECON_LOGS_FOUND" -eq 0 ]; then
+    status CHECK 'No readable candidate HTTP logs found for the nsepa.deb one-byte probe check; coverage is unavailable.'
+else
+    status OK 'No nsepa.deb HTTP 206 one-byte probe pattern found in available access logs. This is limited to retained logs and the selected format.'
+fi
+if [ -n "$VP_PROBE_HITS" ]; then
+    status CHECK 'The public-research marker vp_probe_nonexist occurs in retained HTTP access/error logs. Treat it as a reconnaissance lead, not a compromise indicator; correlate source and timestamp with other activity:'
+    printf '%s\n' "$VP_PROBE_HITS"
+elif [ "$RECON_LOGS_FOUND" -eq 0 ]; then
+    status CHECK 'No readable candidate HTTP logs found for the vp_probe_nonexist check; coverage is unavailable.'
+else
+    status OK 'No vp_probe_nonexist marker found in available HTTP access/error logs. This is limited to retained logs and the selected format.'
+fi
 EXPLOIT_PATH_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html|/logon/LogonPoint/Authentication/GetUserName)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -40)
 if [ -n "$EXPLOIT_PATH_HITS" ]; then
     status CHECK 'Requests to endpoints observed in public honeypot/research reporting found. These are legitimate NetScaler paths; the requests alone are not IOCs. Review any logged username/body/User-Agent for shell metacharacters or payloads and correlate with auth/system logs:'
