@@ -2,7 +2,7 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.49
+# Version: 9.50
 #
 # Publisher
 #   Deyda Consulting GmbH
@@ -219,7 +219,7 @@ if [ "$RUNNING_ON_ADC" = YES ]; then
     printf '  Total on-disk size: about %s MiB (compressed files included)\n' "$LOG_EST_MB" >&3
     printf '  Estimated run time: %s\n' "$LOG_EST_TIME" >&3
     printf '  Rough estimate; compression, storage speed, and appliance load affect actual time.\n' >&3
-    printf "  While the check runs, it's time for a break or to read the newest articles on deyda.net.\n" >&3
+    printf '  While the check runs, take a break or catch up on the latest articles at deyda.net.\n' >&3
     printf '  Starting read-only checks now...\n\n' >&3
 else
     LOG_EST_MB=0
@@ -309,7 +309,7 @@ check_nslog_nextfile_state() {
 FW_PATCHED=UNKNOWN
 
 printf 'Deyda Consulting NetScaler IOC and CVE triage report\n'
-printf 'Host: %s\nTime: %s\nScript version: 9.49\n\n' "$HOST" "$NOW"
+printf 'Host: %s\nTime: %s\nScript version: 9.50\n\n' "$HOST" "$NOW"
 printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n\n'
 printf 'Related articles\n  DE: https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
 printf '  EN: https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/\n\n'
