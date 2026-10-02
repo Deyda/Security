@@ -2,7 +2,7 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.43
+# Version: 9.45
 #
 # Publisher
 #   Deyda Consulting GmbH
@@ -261,7 +261,7 @@ check_nslog_nextfile_state() {
 FW_PATCHED=UNKNOWN
 
 printf 'Deyda Consulting NetScaler IOC and CVE triage report\n'
-printf 'Host: %s\nTime: %s\nScript version: 9.43\n\n' "$HOST" "$NOW"
+printf 'Host: %s\nTime: %s\nScript version: 9.45\n\n' "$HOST" "$NOW"
 printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n\n'
 printf 'Related articles\n  DE: https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
 printf '  EN: https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/\n\n'
@@ -728,7 +728,11 @@ if [ -r /etc/crontab ]; then
                 '0 */12 * * * root /netscaler/adss-licexp.sh'|\
                 '0 * * * * root /netscaler/ns_cleanup.sh'|\
                 '* * * * * root lockf -t 0 -k -s /tmp/.nsfsyncd_lock /netscaler/nsfsyncd -p'|\
-                '55 0-23 * * * root nslog.sh dozip') ;;
+                '55 0-23 * * * root nslog.sh dozip'|\
+                '28 0-23 * * * root nslog.sh dozip'|\
+                'SHELL=/bin/sh'|\
+                'PATH=/netscaler:/etc:/bin:/sbin:/usr/bin:/usr/sbin'|\
+                'HOME=/var/log') ;;
                 *) CRON_UNRECOGNIZED="${CRON_UNRECOGNIZED}${CRON_UNRECOGNIZED:+\n}$CRON_LINE" ;;
             esac
         done <<CRON_EOF
@@ -738,7 +742,7 @@ CRON_EOF
             status CHECK 'Unrecognized /etc/crontab entries differ from the internal 14.1-73.37 sample; validate schedule and command. The comparison covers one appliance, not a Citrix-published universal baseline:'
             printf '%b\n' "$CRON_UNRECOGNIZED"
         else
-            status OK 'All active /etc/crontab entries match the internal 14.1-73.37 sample. This is a single-appliance reference, not a Citrix-published universal baseline.'
+            status OK 'All /etc/crontab entries match recognized NetScaler defaults in the internal 14.1-73.37 sample, including cron environment settings and the nslog.sh dozip schedule. This is a single-appliance reference, not a Citrix-published universal baseline.'
         fi
     else
         status CHECK 'Non-comment entries are present in /etc/crontab; validate each scheduled command against a trusted same-build baseline:'
@@ -795,14 +799,28 @@ fi
 printf '\n--- Startup and monitoring persistence files ---\n'
 PERSIST_FILES_FOUND=0
 PERSIST_READABLE=0
+RCN_PRIMARY_HASH=''
 for f in /nsconfig/rc.netscaler /nsconfig/nsafter.sh /flash/nsconfig/rc.netscaler /etc/monitrc; do
     if [ -e "$f" ]; then
         PERSIST_FILES_FOUND=$((PERSIST_FILES_FOUND + 1))
         printf '\n--- %s ---\n' "$f"
         ls -la "$f" 2>&1
         case "$f" in
-            /flash/nsconfig/rc.netscaler|/nsconfig/rc.netscaler) check_1417337_reference "$f" '7f65ac090000fda7fed9fb56b2d4e7678181f4f9fac71961e4336fdfa7cbf738' ;;
-            /etc/monitrc) check_1417337_reference "$f" 'ab1aae7ba469c122ae16a992da9ddc4b12f81301b0b05d8eba2b379a06d56e54' ;;
+            /nsconfig/rc.netscaler)
+                RCN_PRIMARY_HASH=$(sha256_of "$f")
+                check_1417337_reference "$f" '7f65ac090000fda7fed9fb56b2d4e7678181f4f9fac71961e4336fdfa7cbf738'
+                ;;
+            /flash/nsconfig/rc.netscaler)
+                RCN_SECONDARY_HASH=$(sha256_of "$f")
+                if [ -n "$RCN_PRIMARY_HASH" ] && [ "$RCN_PRIMARY_HASH" = "$RCN_SECONDARY_HASH" ]; then
+                    status OK '/flash/nsconfig/rc.netscaler has the same SHA-256 content as /nsconfig/rc.netscaler; the baseline comparison is reported once.'
+                else
+                    check_1417337_reference "$f" '7f65ac090000fda7fed9fb56b2d4e7678181f4f9fac71961e4336fdfa7cbf738'
+                fi
+                ;;
+            /etc/monitrc)
+                check_1417337_reference "$f" 'ab1aae7ba469c122ae16a992da9ddc4b12f81301b0b05d8eba2b379a06d56e54'
+                ;;
         esac
         if [ -r "$f" ] && [ -f "$f" ]; then
             PERSIST_READABLE=$((PERSIST_READABLE + 1))
@@ -878,7 +896,7 @@ else
     [ -n "$HA_PROCESS" ] && printf '%s\n' "$HA_PROCESS"
 fi
 
-HA_LOG_HITS=$(zgrep -E -i -n 'nsfsyncd|HA[^[:cntrl:]]*(sync|fail|error)|sync[^[:cntrl:]]*(fail|error)' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -60)
+HA_LOG_HITS=$(zgrep -E -i -n 'nsfsyncd|(^|[^[:alnum:]_])HA[[:space:]_-]+(sync|synchronization|state|fail|error)|(^|[^[:alnum:]_])(sync|synchronization)[[:space:]_-]+(HA|peer)' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -60)
 if [ "$HA_CONFIG_STATE" = YES ]; then
     if [ -n "$HA_LOG_HITS" ]; then
         status CHECK 'HA/synchronization-related log lines found; distinguish routine state changes from failures and compare both nodes:'
