@@ -2,7 +2,7 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.45
+# Version: 9.49
 #
 # Publisher
 #   Deyda Consulting GmbH
@@ -179,6 +179,54 @@ esac
 
 # Preserve terminal streams, save a plain-text report, then display it with colored statuses.
 exec 3>&1 4>&2
+
+format_duration() {
+    _duration_seconds=$1
+    if [ "$_duration_seconds" -lt 60 ]; then
+        printf '%ss' "$_duration_seconds"
+    elif [ "$_duration_seconds" -lt 3600 ]; then
+        printf '%sm %ss' "$((_duration_seconds / 60))" "$((_duration_seconds % 60))"
+    else
+        printf '%sh %sm' "$((_duration_seconds / 3600))" "$(((_duration_seconds % 3600) / 60))"
+    fi
+}
+
+LOG_EST_FILES=0
+LOG_EST_BYTES=0
+if [ "$RUNNING_ON_ADC" = YES ]; then
+    # These non-overlapping globs cover local text-log families searched below.
+    for _log_file in /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* \
+        /var/log/messages* /var/log/sh.log* /var/log/bash.log* /var/log/audit.log* \
+        /var/log/named* /var/log/dns* /var/log/boot.log; do
+        [ -f "$_log_file" ] && [ -r "$_log_file" ] || continue
+        _log_size=$(ls -lnL "$_log_file" 2>/dev/null | awk 'NR==1 && $1 ~ /^-/ {print $5}')
+        case "$_log_size" in ''|*[!0-9]*) continue ;; esac
+        LOG_EST_FILES=$((LOG_EST_FILES + 1))
+        LOG_EST_BYTES=$((LOG_EST_BYTES + _log_size))
+    done
+    LOG_EST_MB=$(((LOG_EST_BYTES + 1048575) / 1048576))
+    if [ "$LOG_EST_FILES" -gt 0 ]; then
+        # Selected logs are searched repeatedly. This is a rough range based on
+        # 12-24 sequential passes at 10 MiB/s plus startup overhead.
+        LOG_EST_MIN_SECONDS=$(((LOG_EST_BYTES * 12 + 10485759) / 10485760 + 8))
+        LOG_EST_MAX_SECONDS=$(((LOG_EST_BYTES * 24 + 10485759) / 10485760 + 15))
+        LOG_EST_TIME="$(format_duration "$LOG_EST_MIN_SECONDS")–$(format_duration "$LOG_EST_MAX_SECONDS")"
+    else
+        LOG_EST_TIME='unavailable (no readable candidate log files)'
+    fi
+    printf '\nDeyda NetScaler IOC check pre-scan estimate\n' >&3
+    printf '  Readable candidate log files: %s\n' "$LOG_EST_FILES" >&3
+    printf '  Total on-disk size: about %s MiB (compressed files included)\n' "$LOG_EST_MB" >&3
+    printf '  Estimated run time: %s\n' "$LOG_EST_TIME" >&3
+    printf '  Rough estimate; compression, storage speed, and appliance load affect actual time.\n' >&3
+    printf "  While the check runs, it's time for a break or to read the newest articles on deyda.net.\n" >&3
+    printf '  Starting read-only checks now...\n\n' >&3
+else
+    LOG_EST_MB=0
+    LOG_EST_TIME='not applicable (exported configuration mode skips appliance logs)'
+    printf '\nDeyda NetScaler IOC check: exported configuration mode; appliance log checks are skipped. Starting configuration checks...\n\n' >&3
+fi
+
 exec > "$OUT" 2>&1
 
 section() { printf '\n===== %s =====\n' "$1"; }
@@ -261,13 +309,18 @@ check_nslog_nextfile_state() {
 FW_PATCHED=UNKNOWN
 
 printf 'Deyda Consulting NetScaler IOC and CVE triage report\n'
-printf 'Host: %s\nTime: %s\nScript version: 9.45\n\n' "$HOST" "$NOW"
+printf 'Host: %s\nTime: %s\nScript version: 9.49\n\n' "$HOST" "$NOW"
 printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n\n'
 printf 'Related articles\n  DE: https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
 printf '  EN: https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/\n\n'
 printf 'Additional research: https://pitscaler.com/netscaler-detection/ (independent snapshot; coverage changes over time)\n'
 printf 'Mode: read-only; no configuration changes, restarts, or cleanup performed\n'
 printf 'Report: %s\n' "$OUT"
+if [ "$RUNNING_ON_ADC" = YES ]; then
+    printf 'Pre-scan estimate: %s readable candidate log files, about %s MiB on disk; estimated run time %s (rough estimate)\n' "$LOG_EST_FILES" "$LOG_EST_MB" "$LOG_EST_TIME"
+else
+    printf 'Pre-scan estimate: %s\n' "$LOG_EST_TIME"
+fi
 printf 'Status definitions are provided once in the section \"How to read this report\" below.\n\n'
 printf 'Build input/source: %s / %s\n' "${CURRENT_INPUT:-not supplied}" "$VERSION_SOURCE"
 if [ "$RUNNING_ON_ADC" = YES ] && [ -n "$CONFIG_VERSION" ] && [ -n "$RUNTIME_FAMILY" ] && [ "${CONFIG_VERSION%%-*}" != "$RUNTIME_FAMILY" ]; then
