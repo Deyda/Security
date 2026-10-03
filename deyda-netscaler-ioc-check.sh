@@ -2,13 +2,16 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.61
+# Version: 9.62
 # Sample-specific checks below additionally use the operator-supplied 380d56
 # analysis screenshot and follow-up description (2026-10-02), not independently verified. No partial hash
 # is used. Paths/ports alone are CHECK; matching behavior requires investigation.
 # New operator-reported lead (2026-10-02): pyrlnk.cc and its subdomains as
 # attempted payload delivery destinations; independently unverified, time-sensitive.
-# Changes: tighten real nsaaad lifecycle matching; exclude LDAP username payloads
+# Changes: recognize pol_saml_prefix_v5c and per-vServer AAA_REQUEST bindings;
+# normalize the standard-build reference scope for compact and full CLI versions.
+# Confidential vendor policy expressions are neither embedded nor printed.
+# Earlier changes: tighten real nsaaad lifecycle matching; exclude LDAP username payloads
 # and monitoring command echoes; bound reboot keywords to avoid powerbi noise.
 # Explicit upstream firewall blocking reminder for 213.209.159.55;
 # exclude authentication payload text from nsaaad crash classification;
@@ -170,6 +173,14 @@ else
     fi
 fi
 
+# Scope internal hashes by parsed build rather than exact presentation text.
+# Keep editions without a supplied reference outside this standard-build baseline.
+reference_build_supported() {
+    printf '%s\n' "${CURRENT_INPUT-}" | grep -Eiq 'FIPS|NDcPP' && return 1
+    _reference_build=$(printf '%s\n' "${CURRENT_INPUT-}" | sed -nE 's/.*(14[.]1|13[.]1)[^0-9]*([0-9]+[.][0-9]+).*/\1-\2/p' | head -1)
+    [ "$_reference_build" = '14.1-73.37' ]
+}
+
 # Read Enhanced ISN from the saved ns.conf by default. An explicit CLI value
 # supplied as an argument takes precedence when checking unsaved runtime changes.
 if [ -r "$CONFIG" ]; then
@@ -265,19 +276,29 @@ exec > "$OUT" 2>&1
 section() { progress "$1"; printf '\n===== %s =====\n' "$1"; }
 subsection() { printf '\n--- %s ---\n' "$1"; }
 status() { printf '\n[%s] %s\n' "$1" "$2"; }
+sha256_from_stream() {
+    # Accept native FreeBSD SHA256(path)=digest and GNU digest-first output.
+    # Check the token length explicitly; older BSD sed implementations need not
+    # behave consistently for a 64-character interval expression.
+    awk '{
+        candidate=$NF
+        if(length(candidate)!=64 || candidate ~ /[^0-9a-fA-F]/) candidate=$1
+        if(length(candidate)==64 && candidate !~ /[^0-9a-fA-F]/) {print tolower(candidate); exit}
+    }'
+}
 sha256_of() {
     _hash_path=$1
     if command -v sha256 >/dev/null 2>&1; then
-        sha256 "$_hash_path" 2>/dev/null | sed -nE 's/.*([[:xdigit:]]{64}).*/\1/p' | head -1 | tr 'A-F' 'a-f'
+        sha256 "$_hash_path" 2>/dev/null | sha256_from_stream
     elif command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$_hash_path" 2>/dev/null | awk '{print tolower($1)}'
+        sha256sum "$_hash_path" 2>/dev/null | sha256_from_stream
     fi
 }
 check_1417337_reference() {
     REFERENCE_MATCH=UNKNOWN
     _ref_path=$1
     _ref_hash=$2
-    [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ] || return 0
+    reference_build_supported || return 0
     _actual_hash=$(sha256_of "$_ref_path")
     if [ -n "$_actual_hash" ]; then
         printf 'SHA-256 observed:  %s\n' "$_actual_hash"
@@ -344,7 +365,7 @@ check_nslog_nextfile_state() {
 FW_PATCHED=UNKNOWN
 
 printf 'Deyda Consulting NetScaler IOC and CVE triage report\n'
-printf 'Host: %s\nTime: %s\nScript version: 9.61\n\n' "$HOST" "$NOW"
+printf 'Host: %s\nTime: %s\nScript version: 9.62\n\n' "$HOST" "$NOW"
 printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n\n'
 printf 'Related articles\n  DE: https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
 printf '  EN: https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/\n\n'
@@ -659,57 +680,91 @@ fi
 
 
 subsection 'SAML request workaround: saved policy and binding inventory'
-# Inventory only. A name match cannot verify the vendor workaround or live coverage.
+# Parse names and bindings without exposing proprietary policy expressions.
+# OK confirms selected saved-config structure/bindings, not exact vendor approval.
 if [ -r "$CONFIG" ]; then
-    SAML_ACTIONS=$(grep -Ei '^[[:space:]]*add[[:space:]]+authentication[[:space:]]+samlAction[[:space:]]' "$CONFIG" 2>/dev/null | wc -l | tr -d ' ')
-    printf 'Saved SAML action count: %s\n' "$SAML_ACTIONS"
-    SAML_OTHER_CONFIG=$(grep -Ei '^[[:space:]]*(add[[:space:]]+authentication[[:space:]]+samlIdPProfile[[:space:]]|(add|set)[[:space:]]+vpn[[:space:]]+sessionAction[[:space:]].*-samlSSO[[:space:]]+ENABLED)' "$CONFIG" 2>/dev/null | wc -l | tr -d ' ')
-    if [ "$SAML_ACTIONS" -eq 0 ] && [ "$SAML_OTHER_CONFIG" -eq 0 ] && ! grep -Eiq '^[[:space:]]*add[[:space:]]+responder[[:space:]]+policy[[:space:]]+pol_samlauth_prefixlist_block[[:space:]]' "$CONFIG"; then
-        status OK 'No SAML authentication actions, selected SAML IdP/SSO settings, or named workaround policy found in saved configuration; the SAML workaround warning is not applicable in this scanned scope. Unsaved live changes are outside coverage.'
-    else
-    SAML_WARNING_LEVEL=CHECK
-    if [ "$SAML_ACTIONS" -gt 0 ]; then SAML_WARNING_LEVEL=ACTION; fi
-    SAML_WORKAROUND_PRESENT=NO
-    if grep -Eiq '^[[:space:]]*add[[:space:]]+responder[[:space:]]+policy[[:space:]]+pol_samlauth_prefixlist_block[[:space:]]' "$CONFIG"; then
-        SAML_WORKAROUND_PRESENT=YES
-        SAML_POLICY_SHAPE=$(grep -Ei '^[[:space:]]*add[[:space:]]+responder[[:space:]]+policy[[:space:]]+pol_samlauth_prefixlist_block[[:space:]]' "$CONFIG" |
-            grep -Ei '/cgi/samlauth' | grep -Ei 'PrefixList' | grep -Ei 'B64DECODE' | grep -Ei '[[:space:]]DROP([[:space:]]|$)' | wc -l | tr -d ' ')
-        if [ "$SAML_POLICY_SHAPE" -gt 0 ]; then
-            status CHECK 'The named SAML workaround policy includes selected path/PrefixList/decode/DROP markers. This is not an exact expression validation: compare the full expression and action with current Citrix Support instructions, then test legitimate SAML sign-ins.'
-        else
-            status "$SAML_WARNING_LEVEL" 'WARNING: The named SAML workaround policy exists but lacks one or more selected expression/action markers. Its name alone does not establish protection; compare the actual policy with Citrix Support instructions.'
-        fi
-    else
-        status "$SAML_WARNING_LEVEL" 'WARNING: pol_samlauth_prefixlist_block is missing from saved configuration. If SAML is used, verify and implement the current approved Citrix Support workaround, including its required bindings. Another policy name or unsaved mitigation must be checked manually; no change was made by this script.'
-    fi
-    SAML_WORKAROUND_BINDINGS=$(awk '
-    {line=tolower($0)}
-    line ~ /^[ \t]*bind (vpn|authentication) vserver / && line ~ /-type[ \t]+aaa_request([ \t]|$)/ && line !~ /-state[ \t]+disabled([ \t]|$)/ {
-        for(i=1;i<NF;i++) if(tolower($i)=="-policy" || tolower($i)=="-policyname") {
-            name=$(i+1); gsub(/"/,"",name); if(name=="pol_samlauth_prefixlist_block") n++
-        }
-    }
-    END{print n+0}' "$CONFIG")
-    printf 'Named Gateway/AAA AAA_REQUEST binding count: %s\n' "$SAML_WORKAROUND_BINDINGS"
-    if [ "$SAML_WORKAROUND_PRESENT" = YES ] && [ "$SAML_WORKAROUND_BINDINGS" -eq 0 ]; then
-        status "$SAML_WARNING_LEVEL" 'WARNING: The workaround policy exists, but no enabled named AAA_REQUEST binding was found on a Gateway/AAA vServer. Creating a policy or binding it globally alone does not establish request-path coverage. Verify every relevant SAML frontend and bind according to current Citrix Support instructions.'
-    elif [ "$SAML_WORKAROUND_PRESENT" = YES ] && [ "$SAML_WORKAROUND_BINDINGS" -gt 0 ]; then
-        status OK 'The named workaround policy and at least one Gateway/AAA AAA_REQUEST binding are present in saved configuration. This confirms presence only; expression correctness, priority and complete live SAML flow coverage still require validation.'
-    fi
-    # Standard whitespace-delimited object names. Quoted names need manual review.
     awk '
-    BEGIN {IGNORECASE=0}
-    { line=tolower($0) }
-    line ~ /^[ \t]*add (vpn|authentication) vserver / {kind=$2; name=$4; keys[kind SUBSEP name]=1}
-    line ~ /^[ \t]*bind (vpn|authentication) vserver / && line ~ /-type[ \t]+aaa_request([ \t]|$)/ && line !~ /-state[ \t]+disabled([ \t]|$)/ {
-        for(i=1;i<NF;i++) if(tolower($i)=="-policy" || tolower($i)=="-policyname") {
-            policy=$(i+1); gsub(/"/,"",policy); if(policy=="pol_samlauth_prefixlist_block") bound[$2 SUBSEP $4]=1
+    function tokens(text, fields,    i,c,nextc,quoted,value,n,active,k) {
+        for(k in fields) delete fields[k]
+        n=0; value=""; quoted=0; active=0
+        for(i=1;i<=length(text);i++) {
+            c=substr(text,i,1)
+            if(c=="\\" && quoted && i<length(text)) {
+                nextc=substr(text,i+1,1)
+                if(nextc=="\"" || nextc=="\\") {value=value nextc; i++; active=1; continue}
+            }
+            if(c=="\"") {quoted=!quoted; active=1; continue}
+            if(c ~ /[ \t\r]/ && !quoted) {
+                if(active) {fields[++n]=value; value=""; active=0}
+            } else {value=value c; active=1}
+        }
+        if(active) fields[++n]=value
+        return n
+    }
+    function known(name) {return name=="pol_samlauth_prefixlist_block" || name=="pol_saml_prefix_v5c"}
+    function result(level,message) {printf "%s\t%s\n",level,message}
+    {
+        n=tokens($0,t)
+        if(n<3 || t[1] ~ /^#/) next
+        verb=tolower(t[1]); kind=tolower(t[2]); object=tolower(t[3])
+        if(verb=="add" && kind=="authentication" && object=="samlaction") saml++
+        if(verb=="add" && kind=="authentication" && object=="samlidpprofile") other++
+        if((verb=="add" || verb=="set") && kind=="vpn" && object=="sessionaction")
+            for(i=5;i<n;i++) if(tolower(t[i])=="-samlsso" && tolower(t[i+1])=="enabled") other++
+        if(verb=="add" && kind=="responder" && object=="policy" && known(t[4])) {
+            name=t[4]; definitions[name]=1; expression=tolower(t[5])
+            shape=(index(expression,"/cgi/samlauth") && index(expression,"prefixlist") && index(expression,"b64decode") && toupper(t[6])=="DROP")
+            if(name=="pol_saml_prefix_v5c")
+                shape=shape && index(expression,"/saml/login") && index(expression,"typecast_nvlist_t") && index(expression,"name_count") && index(expression,"samlresponse") && index(expression,"samlrequest") && index(expression,".gt(1)") && index(expression,"regex_match")
+            valid[name]=shape
+        }
+        if(verb=="add" && (kind=="vpn" || kind=="authentication") && object=="vserver") {
+            key=kind SUBSEP t[4]; servers[key]=kind " vServer " t[4]
+        }
+        if(verb=="bind" && (kind=="vpn" || kind=="authentication") && object=="vserver") {
+            policy=""; type=""; disabled=0
+            for(i=5;i<n;i++) {
+                option=tolower(t[i])
+                if(option=="-policy" || option=="-policyname") policy=t[i+1]
+                if(option=="-type") type=tolower(t[i+1])
+                if(option=="-state" && tolower(t[i+1])=="disabled") disabled=1
+            }
+            if(known(policy) && type=="aaa_request" && !disabled) bindings[kind SUBSEP t[4] SUBSEP policy]=1
         }
     }
-    END {for(k in keys) {split(k,a,SUBSEP); if (a[2] ~ /"/) print "[CHECK] Quoted vServer name requires manual SAML binding review: " a[1] " " a[2]; else if(bound[k]) print "[CHECK] Named AAA_REQUEST binding found for " a[1] " vServer " a[2] "; validate priority, expression, flow and live configuration."; else print "[CHECK] No named AAA_REQUEST workaround binding found for " a[1] " vServer " a[2] "; determine whether this vServer handles SAML and needs the approved workaround."}}
-    ' "$CONFIG"
-    status CHECK 'This is saved-config inventory only. Other policy names, disabled objects, authentication profiles, frontend AAA mappings and unsaved changes require live review. A global binding alone is not counted as Gateway/AAA request coverage.'
-    fi
+    END {
+        result("INFO","Saved SAML action count: " (saml+0))
+        count=0; for(name in definitions) count++
+        if(!saml && !other && !count) {
+            result("OK","No selected SAML configuration or recognized workaround policy found; this SAML workaround check is not applicable in the scanned saved configuration.")
+            exit
+        }
+        warning=(saml || other)?"ACTION":"CHECK"
+        if(!count) result(warning,"WARNING: No recognized SAML workaround policy is defined in saved configuration. Accepted names: pol_saml_prefix_v5c and pol_samlauth_prefixlist_block. Verify the approved mitigation and save the configuration.")
+        for(name in definitions) {
+            if(valid[name]) result("INFO",name " has the selected request-path, decoding and DROP structure. The confidential expression is not printed.")
+            else result(warning,"WARNING: " name " is defined but does not contain the expected selected expression/action markers. Its name alone is insufficient.")
+        }
+        total=0; covered=0; missing=0
+        for(key in servers) {
+            total++; ok=0; matched=""
+            for(name in definitions) if(valid[name] && bindings[key SUBSEP name]) {ok=1; matched=name; break}
+            if(ok) {
+                covered++
+                result("OK",servers[key] ": " matched " is defined with recognized structure and an enabled AAA_REQUEST binding in saved configuration.")
+            } else {
+                missing++
+                result(warning,"WARNING: " servers[key] " has no enabled AAA_REQUEST binding to a recognized policy with the selected structure. Check the required frontend binding.")
+            }
+        }
+        if(total && !missing) result("OK","Recognized SAML workaround coverage found for all " total " saved Authentication/VPN vServers.")
+        else if(!total) result("CHECK","No Authentication/VPN vServers were found; frontend binding coverage cannot be established.")
+        else result(warning,"SAML workaround coverage incomplete: " covered " of " total " saved Authentication/VPN vServers have a recognized enabled AAA_REQUEST binding.")
+        result("INFO","Scope: saved configuration only; selected structure is not exact expression validation. Verify current Support instructions, priorities, effective live flow and legitimate sign-ins. Global bindings are not counted as AAA_REQUEST coverage.")
+    }
+    ' "$CONFIG" | while IFS="$(printf '\t')" read -r SAML_LEVEL SAML_MESSAGE; do
+        if [ "$SAML_LEVEL" = INFO ]; then printf '%s\n' "$SAML_MESSAGE"; else status "$SAML_LEVEL" "$SAML_MESSAGE"; fi
+    done
 else
     status CHECK 'Saved configuration unreadable; SAML workaround inventory unavailable.'
 fi
@@ -1005,7 +1060,7 @@ if [ -r /etc/crontab ]; then
     CRON_LINES=$(grep -v '^[[:space:]]*#' /etc/crontab 2>/dev/null | grep -v '^[[:space:]]*$')
     if [ -z "$CRON_LINES" ]; then
         status OK '/etc/crontab is readable and contains no active entries.'
-    elif [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; then
+    elif reference_build_supported; then
         CRON_UNRECOGNIZED=''
         while IFS= read -r CRON_LINE; do
             CRON_NORMALIZED=$(printf '%s\n' "$CRON_LINE" | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')
@@ -1240,13 +1295,13 @@ if [ -e /bin/sh ]; then
     if command -v sha256 >/dev/null 2>&1; then
         SHA_OUTPUT=$(sha256 /bin/sh 2>&1)
         printf '%s\n' "$SHA_OUTPUT"
-        SHELL_HASH=$(printf '%s\n' "$SHA_OUTPUT" | sed -nE 's/.*([[:xdigit:]]{64}).*/\1/p' | head -1 | tr 'A-F' 'a-f')
+        SHELL_HASH=$(printf '%s\n' "$SHA_OUTPUT" | sha256_from_stream)
     elif command -v sha256sum >/dev/null 2>&1; then
         SHA_OUTPUT=$(sha256sum /bin/sh 2>&1)
         printf '%s\n' "$SHA_OUTPUT"
-        SHELL_HASH=$(printf '%s\n' "$SHA_OUTPUT" | awk '{print tolower($1)}')
+        SHELL_HASH=$(printf '%s\n' "$SHA_OUTPUT" | sha256_from_stream)
     fi
-    if [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; then
+    if reference_build_supported; then
         if [ "$SHELL_HASH" = '2c1310d7c4d7dfb1ef47b137be1eb572cc743cc609898ae38320963cc0578665' ]; then
             status OK '/bin/sh SHA-256 matches the internal reference recorded for NetScaler 14.1-73.37; this is not a vendor-published checksum.'
         elif [ -n "$SHELL_HASH" ]; then
@@ -1257,7 +1312,7 @@ if [ -e /bin/sh ]; then
     fi
     ls -ld /bin /bin/sh 2>&1
     SHELL_META=$(ls -ln /bin/sh 2>/dev/null | awk 'NR==1{print $1 ":" $3 ":" $4 ":" $5}')
-    if { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; } && [ "$SHELL_META" = '-r-xr-xr-x:0:0:165368' ]; then
+    if { reference_build_supported; } && [ "$SHELL_META" = '-r-xr-xr-x:0:0:165368' ]; then
         status OK '/bin/sh mode, numeric owner/group, and size match the internal clean-sample reference for 14.1-73.37; timestamps are host-specific and are not compared. This is not a vendor-published baseline.'
     else
         status CHECK "Compare /bin/sh mode, owner, group, size, timestamp, and hash with a trusted same-build reference; observed metadata: ${SHELL_META:-unavailable}. The internal reference is from one clean 14.1-73.37 appliance, not a vendor-published universal baseline."
@@ -1372,7 +1427,7 @@ RECENT_SUID_EOF
                     /var/configd_devno) _expected='5b76771117eacc288a42de079a719402e26528e997cfa82241c4d7a842eba5d2' ;;
                 esac
                 _observed=$(sha256_of "$f")
-                if { [ "$CURRENT_INPUT" = '14.1-73.37' ] || [ "$CURRENT_INPUT" = '14.1-73.37.nc' ]; } && [ -n "$_observed" ] && [ "$_observed" = "$_expected" ]; then
+                if { reference_build_supported; } && [ -n "$_observed" ] && [ "$_observed" = "$_expected" ]; then
                     status OK "$f is newer than installns_state but matches the internal 14.1-73.37 reference; recency alone is not suspicious. Reference is from one clean appliance, not Citrix."
                 else
                     ls -ldn "$f" 2>&1
@@ -1408,9 +1463,9 @@ if [ -f "$CUSTOMSNMPD_FILE" ]; then
                 status CHECK '/var/python/bin/customsnmpd differs from the operator-supplied trusted same-build SHA-256 reference. Preserve it and verify the baseline source and approved changes.'
                 printf 'Trusted reference: %s\n' "$DEYDA_CUSTOMSNMPD_REFERENCE_SHA256"
             fi
-        elif { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; } && [ "$CUSTOMSNMPD_HASH" = '1dd0887ff21b18b0eb78a336e76d4dc3bb6f4fc645e9d864414a2958cb1637fe' ]; then
+        elif { reference_build_supported; } && [ "$CUSTOMSNMPD_HASH" = '1dd0887ff21b18b0eb78a336e76d4dc3bb6f4fc645e9d864414a2958cb1637fe' ]; then
             status OK '/var/python/bin/customsnmpd matches the internal clean-appliance 14.1-73.37 SHA-256 reference; this is not a Citrix-published checksum.'
-        elif { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; }; then
+        elif { reference_build_supported; }; then
             status CHECK '/var/python/bin/customsnmpd differs from the internal one-appliance 14.1-73.37 reference. Compare edition, approved changes, and another trusted same-build node.'
             printf 'Internal clean reference: %s\n' '1dd0887ff21b18b0eb78a336e76d4dc3bb6f4fc645e9d864414a2958cb1637fe'
         else
@@ -1422,7 +1477,7 @@ if [ -f "$CUSTOMSNMPD_FILE" ]; then
 else
     status OK 'No /var/python/bin/customsnmpd file found.'
 fi
-if [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; then
+if reference_build_supported; then
     PYTHON_REFERENCE_NAMES='fixup_pubsub_v1_keywords.py CreateCluster.py MyFirstNitroApplication.py get_config.py jp.py rm_config.py set_config.py stat_config.py'
     PYTHON_REFERENCE_COUNT=0
     PYTHON_REFERENCE_MISMATCHES=0
@@ -1471,7 +1526,7 @@ if [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73
     fi
 fi
 subsection 'configd state-file metadata baseline'
-if { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; }; then
+if { reference_build_supported; }; then
     if [ -f /var/configd_devno ]; then
         CONFIGD_DEVNO_META=$(ls -ln /var/configd_devno 2>/dev/null | awk 'NR==1{print $1 ":" $3 ":" $4 ":" $5}')
         if [ "$CONFIGD_DEVNO_META" = '-rwxr-Sr--:0:0:129' ]; then
@@ -1633,7 +1688,7 @@ if [ -n "$STAGING_FILES" ]; then
             if [ -n "$ACTUAL_HASH" ]; then
                 printf 'SHA-256 observed:  %s\n' "$ACTUAL_HASH"
                 printf 'SHA-256 reference: %s\n' "$EXPECTED_HASH"
-                if { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; } && [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ]; then
+                if { reference_build_supported; } && [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ]; then
                     status OK "$f matches the internal single-appliance 14.1-73.37 SHA-256 reference."
                     STAGING_REFERENCE_MATCHES=$((STAGING_REFERENCE_MATCHES + 1))
                 else
@@ -1995,7 +2050,7 @@ if [ -d "$LANGUAGE_DIR" ]; then
                 LANGUAGE_HASH_UNAVAILABLE=1
             fi
             [ -n "$LANGUAGE_HASH" ] || LANGUAGE_HASH_UNAVAILABLE=1
-            if [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; then
+            if reference_build_supported; then
                 LANGUAGE_EXPECTED_HASH=''
                 case "${f##*/}" in
                     strings.de.js) LANGUAGE_EXPECTED_HASH='60a9b62d59f1e025b9d1b413ec7c926dbe02134d82e8dea902fcb087c2d81879' ;;
@@ -2028,7 +2083,7 @@ if [ -d "$LANGUAGE_DIR" ]; then
         if [ "$LANGUAGE_PATTERN_HITS" -eq 0 ]; then
             status OK 'No selected network/request-related patterns found in strings.*.js files.'
         fi
-        if [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; then
+        if reference_build_supported; then
             if [ "$LANGUAGE_BASELINE_COUNT" -eq 12 ] && [ "$LANGUAGE_HASH_UNAVAILABLE" -eq 0 ] && [ -z "$LANGUAGE_BASELINE_MISMATCHES" ]; then
                 status OK 'All 12 strings.*.js files, filenames, and SHA-256 hashes match the internal clean-sample reference for NetScaler 14.1-73.37. This is an internal single-appliance reference, not a Citrix-published checksum set or a universal baseline.'
             else
@@ -2038,7 +2093,7 @@ if [ -d "$LANGUAGE_DIR" ]; then
         fi
     else
         status OK 'No strings.*.js language files found in the LogonPoint/custom directory.'
-        if [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; then
+        if reference_build_supported; then
             status CHECK 'The internal 14.1-73.37 reference contains 12 strings.*.js files, but none were found here.'
         fi
     fi
@@ -2047,7 +2102,7 @@ else
 fi
 
 printf '\n--- Additional LogonPoint customization baseline files ---\n'
-if [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; then
+if reference_build_supported; then
     CUSTOM_ASSET_EXPECTED_COUNT=15
     CUSTOM_ASSET_OBSERVED_COUNT=0
     CUSTOM_ASSET_BASELINE_MISMATCHES=''
