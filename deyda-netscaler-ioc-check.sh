@@ -2,7 +2,24 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.50
+# Version: 9.61
+# Sample-specific checks below additionally use the operator-supplied 380d56
+# analysis screenshot and follow-up description (2026-10-02), not independently verified. No partial hash
+# is used. Paths/ports alone are CHECK; matching behavior requires investigation.
+# New operator-reported lead (2026-10-02): pyrlnk.cc and its subdomains as
+# attempted payload delivery destinations; independently unverified, time-sensitive.
+# Changes: tighten real nsaaad lifecycle matching; exclude LDAP username payloads
+# and monitoring command echoes; bound reboot keywords to avoid powerbi noise.
+# Explicit upstream firewall blocking reminder for 213.209.159.55;
+# exclude authentication payload text from nsaaad crash classification;
+# broaden restart-limit patterns and add bounded pyrlnk.cc log counts;
+# align result groups with their own headings; initialize install marker
+# before core checks; deduplicate CVE messages and baseline context; saved SAML
+# configurations; authentication-service crash triage; SAML workaround inventory;
+# tagged User-Agent payloads; multi-signal login injection; unusual HTTP responses;
+# open-file and /flash privileged-file inventories. No mitigation is applied.
+# Additional leads: operator-supplied Gotham advisory/checker package (2026-10-02).
+# Its observations are scoped to inspected systems, not universal patch guarantees.
 #
 # Publisher
 #   Deyda Consulting GmbH
@@ -179,6 +196,22 @@ esac
 
 # Preserve terminal streams, save a plain-text report, then display it with colored statuses.
 exec 3>&1 4>&2
+SCAN_STARTED=$(date +%s)
+
+progress() {
+    _progress_now=$(date +%s)
+    printf '  [%s elapsed] %s\n' "$(format_duration "$((_progress_now - SCAN_STARTED))")" "$1" >&3
+}
+
+# Preserve raw report bytes for evidence. Only the terminal rendering is sanitized;
+# remove attacker-controlled ANSI/OSC/control sequences before adding status colors.
+safe_display() {
+    if command -v perl >/dev/null 2>&1; then
+        perl -pe 's/[\x00-\x08\x0b-\x1f\x7f]/./g' "$@"
+    else
+        LC_ALL=C tr -d '\000-\010\013-\037\177' < "$1"
+    fi
+}
 
 format_duration() {
     _duration_seconds=$1
@@ -196,7 +229,7 @@ LOG_EST_BYTES=0
 if [ "$RUNNING_ON_ADC" = YES ]; then
     # These non-overlapping globs cover local text-log families searched below.
     for _log_file in /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* \
-        /var/log/messages* /var/log/sh.log* /var/log/bash.log* /var/log/audit.log* \
+        /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/sh.log* /var/log/bash.log* /var/log/audit.log* \
         /var/log/named* /var/log/dns* /var/log/boot.log; do
         [ -f "$_log_file" ] && [ -r "$_log_file" ] || continue
         _log_size=$(ls -lnL "$_log_file" 2>/dev/null | awk 'NR==1 && $1 ~ /^-/ {print $5}')
@@ -229,7 +262,7 @@ fi
 
 exec > "$OUT" 2>&1
 
-section() { printf '\n===== %s =====\n' "$1"; }
+section() { progress "$1"; printf '\n===== %s =====\n' "$1"; }
 subsection() { printf '\n--- %s ---\n' "$1"; }
 status() { printf '\n[%s] %s\n' "$1" "$2"; }
 sha256_of() {
@@ -241,6 +274,7 @@ sha256_of() {
     fi
 }
 check_1417337_reference() {
+    REFERENCE_MATCH=UNKNOWN
     _ref_path=$1
     _ref_hash=$2
     [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ] || return 0
@@ -252,6 +286,7 @@ check_1417337_reference() {
     if [ -z "$_actual_hash" ]; then
         status CHECK "Could not calculate SHA-256 for $_ref_path against the internal 14.1-73.37 sample."
     elif [ "$_actual_hash" = "$_ref_hash" ]; then
+        REFERENCE_MATCH=YES
         status OK "$_ref_path SHA-256 matches the internal 14.1-73.37 reference from one clean appliance; this is not a Citrix-published checksum."
     else
         status CHECK "$_ref_path SHA-256 differs from the internal one-appliance 14.1-73.37 reference; compare edition, configuration, and a trusted peer before treating it as anomalous."
@@ -309,7 +344,7 @@ check_nslog_nextfile_state() {
 FW_PATCHED=UNKNOWN
 
 printf 'Deyda Consulting NetScaler IOC and CVE triage report\n'
-printf 'Host: %s\nTime: %s\nScript version: 9.50\n\n' "$HOST" "$NOW"
+printf 'Host: %s\nTime: %s\nScript version: 9.61\n\n' "$HOST" "$NOW"
 printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n\n'
 printf 'Related articles\n  DE: https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
 printf '  EN: https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/\n\n'
@@ -487,9 +522,7 @@ if [ -r "$CONFIG" ]; then
 
     subsection 'CVE-2026-88773: HTTP configuration enabled'
     scan_config 'HTTP or SSL LB/CS/VPN/AAA virtual servers' '^[[:space:]]*add (lb|cs|vpn|authentication) vserver .* (HTTP|SSL)([[:space:]]|$)' ACTION OK
-    if [ "$FW_PATCHED" = YES ]; then
-        status OK 'HTTP/SSL vServers are present in the saved config, but the entered build meets the fixed threshold; no CVE-driven config change is indicated.'
-    else
+    if [ "$FW_PATCHED" != YES ]; then
         status CHECK 'HTTP/SSL vServers can be relevant to this CVE on an unverified or below-threshold build. Confirm active state in the running configuration.'
     fi
 
@@ -509,9 +542,7 @@ if [ -r "$CONFIG" ]; then
 
     subsection 'CVE-2026-88775: Gateway or AAA virtual server'
     scan_config 'VPN or authentication virtual servers' '^[[:space:]]*add (vpn|authentication) vserver ' ACTION OK
-    if [ "$FW_PATCHED" = YES ]; then
-        status OK 'Gateway/AAA vServers are present, but the entered build meets the fixed threshold; no CVE-driven config change is indicated.'
-    else
+    if [ "$FW_PATCHED" != YES ]; then
         status CHECK 'Confirm whether matching Gateway/AAA vServers are active if the build is unverified or below threshold.'
     fi
 
@@ -626,11 +657,94 @@ else
     status CHECK 'Saved configuration is unreadable; administrative-account and EPA configuration inventory could not run.'
 fi
 
+
+subsection 'SAML request workaround: saved policy and binding inventory'
+# Inventory only. A name match cannot verify the vendor workaround or live coverage.
+if [ -r "$CONFIG" ]; then
+    SAML_ACTIONS=$(grep -Ei '^[[:space:]]*add[[:space:]]+authentication[[:space:]]+samlAction[[:space:]]' "$CONFIG" 2>/dev/null | wc -l | tr -d ' ')
+    printf 'Saved SAML action count: %s\n' "$SAML_ACTIONS"
+    SAML_OTHER_CONFIG=$(grep -Ei '^[[:space:]]*(add[[:space:]]+authentication[[:space:]]+samlIdPProfile[[:space:]]|(add|set)[[:space:]]+vpn[[:space:]]+sessionAction[[:space:]].*-samlSSO[[:space:]]+ENABLED)' "$CONFIG" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$SAML_ACTIONS" -eq 0 ] && [ "$SAML_OTHER_CONFIG" -eq 0 ] && ! grep -Eiq '^[[:space:]]*add[[:space:]]+responder[[:space:]]+policy[[:space:]]+pol_samlauth_prefixlist_block[[:space:]]' "$CONFIG"; then
+        status OK 'No SAML authentication actions, selected SAML IdP/SSO settings, or named workaround policy found in saved configuration; the SAML workaround warning is not applicable in this scanned scope. Unsaved live changes are outside coverage.'
+    else
+    SAML_WARNING_LEVEL=CHECK
+    if [ "$SAML_ACTIONS" -gt 0 ]; then SAML_WARNING_LEVEL=ACTION; fi
+    SAML_WORKAROUND_PRESENT=NO
+    if grep -Eiq '^[[:space:]]*add[[:space:]]+responder[[:space:]]+policy[[:space:]]+pol_samlauth_prefixlist_block[[:space:]]' "$CONFIG"; then
+        SAML_WORKAROUND_PRESENT=YES
+        SAML_POLICY_SHAPE=$(grep -Ei '^[[:space:]]*add[[:space:]]+responder[[:space:]]+policy[[:space:]]+pol_samlauth_prefixlist_block[[:space:]]' "$CONFIG" |
+            grep -Ei '/cgi/samlauth' | grep -Ei 'PrefixList' | grep -Ei 'B64DECODE' | grep -Ei '[[:space:]]DROP([[:space:]]|$)' | wc -l | tr -d ' ')
+        if [ "$SAML_POLICY_SHAPE" -gt 0 ]; then
+            status CHECK 'The named SAML workaround policy includes selected path/PrefixList/decode/DROP markers. This is not an exact expression validation: compare the full expression and action with current Citrix Support instructions, then test legitimate SAML sign-ins.'
+        else
+            status "$SAML_WARNING_LEVEL" 'WARNING: The named SAML workaround policy exists but lacks one or more selected expression/action markers. Its name alone does not establish protection; compare the actual policy with Citrix Support instructions.'
+        fi
+    else
+        status "$SAML_WARNING_LEVEL" 'WARNING: pol_samlauth_prefixlist_block is missing from saved configuration. If SAML is used, verify and implement the current approved Citrix Support workaround, including its required bindings. Another policy name or unsaved mitigation must be checked manually; no change was made by this script.'
+    fi
+    SAML_WORKAROUND_BINDINGS=$(awk '
+    {line=tolower($0)}
+    line ~ /^[ \t]*bind (vpn|authentication) vserver / && line ~ /-type[ \t]+aaa_request([ \t]|$)/ && line !~ /-state[ \t]+disabled([ \t]|$)/ {
+        for(i=1;i<NF;i++) if(tolower($i)=="-policy" || tolower($i)=="-policyname") {
+            name=$(i+1); gsub(/"/,"",name); if(name=="pol_samlauth_prefixlist_block") n++
+        }
+    }
+    END{print n+0}' "$CONFIG")
+    printf 'Named Gateway/AAA AAA_REQUEST binding count: %s\n' "$SAML_WORKAROUND_BINDINGS"
+    if [ "$SAML_WORKAROUND_PRESENT" = YES ] && [ "$SAML_WORKAROUND_BINDINGS" -eq 0 ]; then
+        status "$SAML_WARNING_LEVEL" 'WARNING: The workaround policy exists, but no enabled named AAA_REQUEST binding was found on a Gateway/AAA vServer. Creating a policy or binding it globally alone does not establish request-path coverage. Verify every relevant SAML frontend and bind according to current Citrix Support instructions.'
+    elif [ "$SAML_WORKAROUND_PRESENT" = YES ] && [ "$SAML_WORKAROUND_BINDINGS" -gt 0 ]; then
+        status OK 'The named workaround policy and at least one Gateway/AAA AAA_REQUEST binding are present in saved configuration. This confirms presence only; expression correctness, priority and complete live SAML flow coverage still require validation.'
+    fi
+    # Standard whitespace-delimited object names. Quoted names need manual review.
+    awk '
+    BEGIN {IGNORECASE=0}
+    { line=tolower($0) }
+    line ~ /^[ \t]*add (vpn|authentication) vserver / {kind=$2; name=$4; keys[kind SUBSEP name]=1}
+    line ~ /^[ \t]*bind (vpn|authentication) vserver / && line ~ /-type[ \t]+aaa_request([ \t]|$)/ && line !~ /-state[ \t]+disabled([ \t]|$)/ {
+        for(i=1;i<NF;i++) if(tolower($i)=="-policy" || tolower($i)=="-policyname") {
+            policy=$(i+1); gsub(/"/,"",policy); if(policy=="pol_samlauth_prefixlist_block") bound[$2 SUBSEP $4]=1
+        }
+    }
+    END {for(k in keys) {split(k,a,SUBSEP); if (a[2] ~ /"/) print "[CHECK] Quoted vServer name requires manual SAML binding review: " a[1] " " a[2]; else if(bound[k]) print "[CHECK] Named AAA_REQUEST binding found for " a[1] " vServer " a[2] "; validate priority, expression, flow and live configuration."; else print "[CHECK] No named AAA_REQUEST workaround binding found for " a[1] " vServer " a[2] "; determine whether this vServer handles SAML and needs the approved workaround."}}
+    ' "$CONFIG"
+    status CHECK 'This is saved-config inventory only. Other policy names, disabled objects, authentication profiles, frontend AAA mappings and unsaved changes require live review. A global binding alone is not counted as Gateway/AAA request coverage.'
+    fi
+else
+    status CHECK 'Saved configuration unreadable; SAML workaround inventory unavailable.'
+fi
+
 if [ "$RUNNING_ON_ADC" = YES ]; then
 section '3. Host integrity and persistence'
 subsection 'Purpose and follow-up'
 printf '%s\n' 'Purpose: review reboot/core history, install timing, startup/persistence locations, user-owned processes, shell permissions, and selected SUID/SGID files.'
 printf '%s\n' 'For each [CHECK]: compare path, owner, mode, hash, and timestamp with a trusted appliance on the same build; correlate with installns_state, change records, and HA peer evidence. Preserve unexpected files before changing them.'
+printf '\n--- Firmware installation directory / possible review window ---\n'
+if [ -d /var/nsinstall ]; then
+    ls -lt /var/nsinstall 2>/dev/null | head -8
+    INSTALL_STATE_FILE=/var/nsinstall/installns_state
+    INSTALL_EPOCH=''
+    if [ -r "$INSTALL_STATE_FILE" ]; then
+        if command -v perl >/dev/null 2>&1; then
+            INSTALL_EPOCH=$(perl -e '@s=stat($ARGV[0]); print $s[9] if @s' "$INSTALL_STATE_FILE" 2>/dev/null)
+        elif stat -f %m "$INSTALL_STATE_FILE" >/dev/null 2>&1; then
+            INSTALL_EPOCH=$(stat -f %m "$INSTALL_STATE_FILE" 2>/dev/null)
+        elif stat -c %Y "$INSTALL_STATE_FILE" >/dev/null 2>&1; then
+            INSTALL_EPOCH=$(stat -c %Y "$INSTALL_STATE_FILE" 2>/dev/null)
+        fi
+    fi
+    if [ -n "$INSTALL_EPOCH" ]; then
+        INSTALL_TIME=$(date -r "$INSTALL_EPOCH" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null)
+        [ -n "$INSTALL_TIME" ] || INSTALL_TIME=$(perl -MPOSIX -e 'print strftime("%Y-%m-%d %H:%M:%S %Z", localtime($ARGV[0]))' "$INSTALL_EPOCH" 2>/dev/null)
+        printf 'Install-time marker: %s\nFile: %s\n' "${INSTALL_TIME:-epoch $INSTALL_EPOCH (date formatting unavailable)}" "$INSTALL_STATE_FILE"
+        status CHECK 'The marker is the file modification time, not independent proof of a completed firmware installation; verify it against change records and appliance version/boot history.'
+    else
+        status CHECK "$INSTALL_STATE_FILE is absent, unreadable, or its modification time could not be read; no install time was inferred."
+    fi
+else
+    status CHECK '/var/nsinstall is unavailable; no install-time marker could be read.'
+fi
+
 subsection 'Recent reboot / shutdown history'
 if command -v last >/dev/null 2>&1; then
     last -n 80 2>&1 | head -80
@@ -665,6 +779,7 @@ else
     status CHECK 'Core/crash recency could not be compared with the install marker; the recent-14-day check above is the only automated time window.'
 fi
 
+
 printf '\n--- Possible temporary callhome artifacts ---\n'
 CALLHOME_FILES=$(find /var/tmp -type f -name 'callhome_tmps*' -print 2>/dev/null | head -50)
 if [ -n "$CALLHOME_FILES" ]; then
@@ -672,32 +787,6 @@ if [ -n "$CALLHOME_FILES" ]; then
     echo "$CALLHOME_FILES"
 else
     status OK 'No callhome_tmps* files found under /var/tmp.'
-fi
-
-printf '\n--- Firmware installation directory / possible review window ---\n'
-if [ -d /var/nsinstall ]; then
-    ls -lt /var/nsinstall 2>/dev/null | head -8
-    INSTALL_STATE_FILE=/var/nsinstall/installns_state
-    INSTALL_EPOCH=''
-    if [ -r "$INSTALL_STATE_FILE" ]; then
-        if command -v perl >/dev/null 2>&1; then
-            INSTALL_EPOCH=$(perl -e '@s=stat($ARGV[0]); print $s[9] if @s' "$INSTALL_STATE_FILE" 2>/dev/null)
-        elif stat -f %m "$INSTALL_STATE_FILE" >/dev/null 2>&1; then
-            INSTALL_EPOCH=$(stat -f %m "$INSTALL_STATE_FILE" 2>/dev/null)
-        elif stat -c %Y "$INSTALL_STATE_FILE" >/dev/null 2>&1; then
-            INSTALL_EPOCH=$(stat -c %Y "$INSTALL_STATE_FILE" 2>/dev/null)
-        fi
-    fi
-    if [ -n "$INSTALL_EPOCH" ]; then
-        INSTALL_TIME=$(date -r "$INSTALL_EPOCH" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null)
-        [ -n "$INSTALL_TIME" ] || INSTALL_TIME=$(perl -MPOSIX -e 'print strftime("%Y-%m-%d %H:%M:%S %Z", localtime($ARGV[0]))' "$INSTALL_EPOCH" 2>/dev/null)
-        printf 'Install-time marker: %s\nFile: %s\n' "${INSTALL_TIME:-epoch $INSTALL_EPOCH (date formatting unavailable)}" "$INSTALL_STATE_FILE"
-        status CHECK 'The marker is the file modification time, not independent proof of a completed firmware installation; verify it against change records and appliance version/boot history.'
-    else
-        status CHECK "$INSTALL_STATE_FILE is absent, unreadable, or its modification time could not be read; no install time was inferred."
-    fi
-else
-    status CHECK '/var/nsinstall is unavailable; no install-time marker could be read.'
 fi
 
 printf '\n--- Security-relevant files modified since the install marker ---\n'
@@ -724,6 +813,17 @@ else
     status CHECK 'No readable installns_state marker is available; the post-install file-change search could not run.'
 fi
 
+subsection 'Reported persistence account in saved configuration'
+PERSISTENCE_ACCOUNT_CONFIG=''
+for f in /nsconfig/ns.conf /flash/nsconfig/ns.conf /nsconfig/ns.conf.default; do
+    [ -r "$f" ] || continue
+    if grep -E -i -q '^[[:space:]]*add[[:space:]]+system[[:space:]]+user[[:space:]]+sec_monitor([[:space:]]|$)' "$f" 2>/dev/null; then PERSISTENCE_ACCOUNT_CONFIG="$f"; fi
+done
+if [ -n "$PERSISTENCE_ACCOUNT_CONFIG" ]; then
+    status CHECK 'The account name sec_monitor appears in a saved configuration. This name was reported in public incident research but may be locally legitimate; verify its owner, creation time, group bindings, and approval without exposing credential fields.'
+else
+    status OK 'No saved-config system-user entry named sec_monitor found in the checked configuration files. This does not cover transient/live-only accounts or other names.'
+fi
 subsection 'Administrative persistence payloads and temporary configuration exports'
 for f in /var/tmp/c1.txt /var/tmp/c2.txt /var/tmp/labels.txt; do
     if [ -e "$f" ]; then
@@ -759,6 +859,142 @@ if [ "$ACCESS_PAYLOAD_HITS" -eq 0 ]; then
 fi
 if [ "$ACCESS_PAYLOAD_COUNT" -gt 500 ]; then
     status CHECK 'Administrative-payload file search reached its 500-file limit; this partial scan does not cover all files in the selected directories.'
+fi
+
+subsection 'Targeted Perl implant and payload staging checks'
+progress 'Host integrity: targeted Perl implant and payload staging checks'
+NSMON_PATH_FOUND=0
+for f in /var/tmp/.nsmon /var/tmp/.nsmon/nsmon.pl /var/tmp/.nsmon/.cfg /var/tmp/.nsmon/.state; do
+    [ -e "$f" ] || continue
+    NSMON_PATH_FOUND=1
+    ls -ldn "$f" 2>/dev/null
+    if [ -f "$f" ]; then printf 'SHA-256: %s\n' "$(sha256_of "$f")"; fi
+done
+if [ "$NSMON_PATH_FOUND" -eq 1 ]; then
+    status CHECK 'nsmon-associated paths exist. Preserve them and compare content, owner, and origin; filenames alone do not prove an implant ran.'
+else
+    status OK 'No selected /var/tmp/.nsmon paths found.'
+fi
+NSMON_PS=$(ps auxww 2>/dev/null)
+if [ -z "$NSMON_PS" ]; then
+    status CHECK 'Process inventory unavailable for the targeted nsmon check.'
+else
+    NSMON_RUNNING=$(printf '%s\n' "$NSMON_PS" | awk '/nsmon[.]pl|\/var\/tmp\/[.]nsmon\// && !/awk|grep|deyda-netscaler-ioc-check/ {print}')
+    if [ -n "$NSMON_RUNNING" ]; then
+        status ACTION 'A process command line refers to nsmon.pl or the .nsmon implant path. Preserve process/socket evidence and verify authorization; normal nsmonitor names are excluded:'
+        printf '%s\n' "$NSMON_RUNNING" | head -20
+    else
+        status OK 'No selected nsmon.pl/.nsmon process command line found in the current snapshot.'
+    fi
+fi
+NSMON_CRON=$(grep -nE 'nsmon[.]pl|/var/tmp/[.]nsmon/' /etc/crontab /nsconfig/crontab /flash/nsconfig/crontab /var/cron/tabs/* 2>/dev/null)
+if [ -n "$NSMON_CRON" ]; then
+    status ACTION 'Cron content refers to an nsmon-associated script/path. Preserve the tab and referenced file, and verify the scheduled command against approved administration:'
+    printf '%s\n' "$NSMON_CRON" | head -30
+else
+    status OK 'No nsmon-associated script/path reference found in readable system or spool crontab files. General cron coverage is reported below.'
+fi
+if command -v sockstat >/dev/null 2>&1; then
+    NSMON_SOCKET_SNAPSHOT=$(sockstat -4 -l 2>/dev/null)
+    if [ -n "$NSMON_SOCKET_SNAPSHOT" ]; then
+        NSMON_LISTENERS=$(printf '%s\n' "$NSMON_SOCKET_SNAPSHOT" | awk '$2 ~ /^perl/ && $6 ~ /:41[0-9][0-9][0-9]$/ {print}')
+        if [ -n "$NSMON_LISTENERS" ]; then
+            status CHECK 'Perl is listening on TCP 41000-41999, a reported implant port range. The port alone is not proof; correlate PID, executable, command line, cron, and .nsmon files:'
+            printf '%s\n' "$NSMON_LISTENERS"
+        else
+            status OK 'No Perl TCP listener in the selected 41000-41999 range found in the IPv4 snapshot.'
+        fi
+    else
+        status CHECK 'sockstat returned no usable listener inventory; targeted Perl-listener coverage is unavailable.'
+    fi
+else
+    status CHECK 'sockstat is unavailable; the targeted Perl-listener check could not run.'
+fi
+for f in /v /tmp/v /var/tmp/v; do
+    [ -f "$f" ] || continue
+    status CHECK "Payload-associated generic path $f exists. Name alone is insufficient; preserve and inspect content and related download/execution logs."
+    ls -ln "$f" 2>/dev/null
+    printf 'SHA-256: %s\n' "$(sha256_of "$f")"
+done
+
+subsection 'Reported .slap/.ux persistence and tunnel indicators'
+progress 'Host integrity: reported .slap/.ux persistence and tunnel indicators'
+printf '%s\n' 'Source: operator-supplied 380d56 sample-analysis screenshot and follow-up description; independently unverified. No incomplete hash is used. Names/ports are leads, not automatic proof of compromise.'
+SLAP_ARTIFACTS_FOUND=0
+for f in /nsconfig/.slap /flash/nsconfig/.slap /nsconfig/.slap/agent.pl /nsconfig/.slap/bridge.pl /nsconfig/.slap/boot.sh /flash/nsconfig/.slap/agent.pl /flash/nsconfig/.slap/bridge.pl /flash/nsconfig/.slap/boot.sh /var/tmp/.ux /var/tmp/.ux/slapshot.py /var/tmp/.ux/whipd.py /var/tmp/.ux/whippid.py /etc/httpd.conf.slap.bak; do
+    [ -e "$f" ] || continue
+    SLAP_ARTIFACTS_FOUND=1
+    status CHECK "Sample-associated path $f exists. Preserve and validate content, origin, metadata, and matching persistence/socket evidence. Name alone is insufficient."
+    ls -ldn "$f" 2>/dev/null
+    if [ -f "$f" ] && [ -r "$f" ]; then
+        printf 'SHA-256 observed: %s\n' "$(sha256_of "$f")"
+        # Require multiple behavior markers in the SAME file. Do not print cookies,
+        # tokens, private keys or full source; no discovered code is ever executed.
+        if grep -qiE 'X[-_]Cmd|HTTP_X_CMD' "$f" &&
+           grep -qiE 'b64decode|decode_base64|base64_decode' "$f" &&
+           grep -qiE 'subprocess|os[.]system|shell_exec|passthru|exec[[:space:]]*\(' "$f"; then
+            status ACTION "Combined command-header, Base64-decoder and execution-code markers found in $f. This is stronger than a filename match; preserve for offline analysis. It does not establish when the file ran."
+        fi
+    fi
+done
+[ "$SLAP_ARTIFACTS_FOUND" -eq 1 ] || status OK 'No selected .slap/.ux persistence/tunnel paths or httpd.conf.slap.bak found.'
+SLAP_STAGING_FILES=$(find /var/tmp -maxdepth 1 \( -name '.s2loot' -o -name '.slap-*' \) -print 2>/dev/null | head -50)
+if [ -n "$SLAP_STAGING_FILES" ]; then
+    status CHECK 'Reported .s2loot staging directory or .slap-* artifact found under /var/tmp. Preserve metadata and inspect offline; filenames alone do not establish that data was uploaded. Contents may contain configuration secrets and are not printed:'
+    while IFS= read -r f; do
+        ls -ldn "$f" 2>/dev/null
+        [ -f "$f" ] && printf 'SHA-256: %s\n' "$(sha256_of "$f")"
+    done <<EOF_SLAP_STAGING
+$SLAP_STAGING_FILES
+EOF_SLAP_STAGING
+else
+    status OK 'No selected /var/tmp/.s2loot or /var/tmp/.slap-* path found. Deleted staging artifacts are outside filesystem coverage.'
+fi
+SLAP_BACKUP_FILES=$(find /nsconfig/.slap /flash/nsconfig/.slap -type f -print 2>/dev/null | head -50)
+if [ -n "$SLAP_BACKUP_FILES" ]; then
+    status CHECK 'Files exist in reported persistent .slap backup directories. A saved webshell can be restored by boot/cron even after a served copy is removed. Preserve and compare; only metadata/hashes are printed (maximum 50 files):'
+    while IFS= read -r f; do
+        ls -ln "$f" 2>/dev/null
+        printf 'SHA-256: %s\n' "$(sha256_of "$f")"
+    done <<EOF_SLAP_BACKUPS
+$SLAP_BACKUP_FILES
+EOF_SLAP_BACKUPS
+fi
+SLAP_PERSISTENCE=$(grep -nE '/(flash/)?nsconfig/[.]slap/|/var/tmp/[.]ux/(slapshot|whipd|whippid)[.]py|httpd[.]conf[.]slap[.]bak' \
+    /nsconfig/rc.netscaler /flash/nsconfig/rc.netscaler /nsconfig/nsafter.sh /etc/monitrc /etc/crontab /nsconfig/crontab /flash/nsconfig/crontab /var/cron/tabs/* 2>/dev/null | head -40)
+if [ -n "$SLAP_PERSISTENCE" ]; then
+    status ACTION 'Startup/monitoring/cron content refers to sample-associated hidden payload paths. Preserve the configuration and referenced files; verify authorization and correlate execution events:'
+    printf '%s\n' "$SLAP_PERSISTENCE"
+else
+    status OK 'No selected hidden .slap/.ux payload-path reference found in readable candidate startup/monitoring/cron files. General coverage is reported below.'
+fi
+SLAP_PROCESS_SNAPSHOT=$(ps auxww 2>/dev/null)
+if [ -n "$SLAP_PROCESS_SNAPSHOT" ]; then
+    SLAP_PROCESSES=$(printf '%s\n' "$SLAP_PROCESS_SNAPSHOT" | awk '/\/(flash\/)?nsconfig\/[.]slap\/|\/var\/tmp\/[.]ux\/(slapshot|whipd|whippid)[.]py/ && !/awk|grep|deyda-netscaler-ioc-check/ {print}')
+    if [ -n "$SLAP_PROCESSES" ]; then
+        status ACTION 'Current process command line refers to a sample-associated hidden payload path. Preserve PID/executable/socket evidence and investigate; command-line identity alone does not authenticate the binary:'
+        printf '%s\n' "$SLAP_PROCESSES" | head -20
+    else
+        status OK 'No selected .slap/.ux payload path found in the current process command lines.'
+    fi
+else
+    status CHECK 'Process inventory unavailable for the reported .slap/.ux tunnel checks.'
+fi
+if command -v sockstat >/dev/null 2>&1; then
+    SLAP_SOCKETS=$(sockstat -4 -l 2>/dev/null)
+    if [ -n "$SLAP_SOCKETS" ]; then
+        SLAP_PORTS=$(printf '%s\n' "$SLAP_SOCKETS" | awk '$5 == "tcp4" && $6 ~ /:(9909|9910)$/ {print}')
+        if [ -n "$SLAP_PORTS" ]; then
+            status CHECK 'TCP listener on sample-reported port 9909 or 9910 found. Ports may be legitimate; correlate owner/PID, bind address, executable and .slap/.ux files:'
+            printf '%s\n' "$SLAP_PORTS"
+        else
+            status OK 'No IPv4 TCP listener on selected sample-reported ports 9909/9910 found in the current snapshot.'
+        fi
+    else
+        status CHECK 'No usable IPv4 listener snapshot returned for the 9909/9910 check.'
+    fi
+else
+    status CHECK 'sockstat unavailable; sample-reported tunnel ports were not assessed.'
 fi
 
 subsection 'Cron and startup persistence'
@@ -856,7 +1092,7 @@ RCN_PRIMARY_HASH=''
 for f in /nsconfig/rc.netscaler /nsconfig/nsafter.sh /flash/nsconfig/rc.netscaler /etc/monitrc; do
     if [ -e "$f" ]; then
         PERSIST_FILES_FOUND=$((PERSIST_FILES_FOUND + 1))
-        printf '\n--- %s ---\n' "$f"
+        printf '\n    File: %s\n' "$f"
         ls -la "$f" 2>&1
         case "$f" in
             /nsconfig/rc.netscaler)
@@ -895,6 +1131,34 @@ if [ "$PERSIST_FILES_FOUND" -eq 0 ]; then
     status OK 'None of the listed startup/monitoring persistence files exists.'
 else
     status CHECK "$PERSIST_FILES_FOUND listed startup/monitoring file(s) exist ($PERSIST_READABLE readable); existence is inventory, not evidence of compromise. Compare content, owner, mode, and timestamps with the same-build baseline."
+fi
+
+printf '\n--- Python references in rc.netscaler ---\n'
+if [ -r /flash/nsconfig/rc.netscaler ]; then
+    RCN_PYTHON=$(grep -E -i -n 'python' /flash/nsconfig/rc.netscaler 2>/dev/null)
+    if [ -n "$RCN_PYTHON" ]; then status CHECK 'Python reference(s) found in rc.netscaler; compare with the approved startup configuration:'; echo "$RCN_PYTHON"; else status OK 'No Python references found in rc.netscaler.'; fi
+else
+    status CHECK '/flash/nsconfig/rc.netscaler is absent or unreadable; this persistence check could not run.'
+fi
+
+printf '\n--- Additional startup/configuration obfuscation indicators ---\n'
+CONFIG_IOC_FILES_FOUND=0
+CONFIG_IOC_HITS=''
+for f in /flash/nsconfig/rc.netscaler /nsconfig/ns.conf /etc/rc /etc/rc.conf.defaults; do
+    [ -r "$f" ] || continue
+    CONFIG_IOC_FILES_FOUND=$((CONFIG_IOC_FILES_FOUND + 1))
+    FILE_HITS=$(grep -E -i -n 'python3[[:space:]]+-c|base64[.](b64|b85)decode|zlib[.]decompress|apachectl[[:space:]]+graceful|php_flag[[:space:]]+engine[[:space:]]+off|fnoc[.]dptth|php[.]xedni|relacsten|hs/pmt/rav/|tnioPnogoL|gifnocsn' "$f" 2>/dev/null)
+    if [ -n "$FILE_HITS" ]; then CONFIG_IOC_HITS="${CONFIG_IOC_HITS}${CONFIG_IOC_HITS:+
+--- $f ---
+}$FILE_HITS"; fi
+done
+if [ -n "$CONFIG_IOC_HITS" ]; then
+    status CHECK 'Legacy NetScaler compromise-hunting strings found in startup/configuration files; compare with the same-build baseline. Matches are clues, not proof of compromise:'
+    printf '%s\n' "$CONFIG_IOC_HITS" | head -80
+elif [ "$CONFIG_IOC_FILES_FOUND" -eq 0 ]; then
+    status CHECK 'No readable candidate startup/configuration files were available for this targeted string check.'
+else
+    status OK "No selected Python one-liners, decoder, zlib, PHP activation, or legacy obfuscation strings found in $CONFIG_IOC_FILES_FOUND candidate startup/configuration file(s)."
 fi
 
 printf '\n--- Processes running as nobody other than httpd ---\n'
@@ -949,7 +1213,7 @@ else
     [ -n "$HA_PROCESS" ] && printf '%s\n' "$HA_PROCESS"
 fi
 
-HA_LOG_HITS=$(zgrep -E -i -n 'nsfsyncd|(^|[^[:alnum:]_])HA[[:space:]_-]+(sync|synchronization|state|fail|error)|(^|[^[:alnum:]_])(sync|synchronization)[[:space:]_-]+(HA|peer)' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -60)
+HA_LOG_HITS=$(zgrep -E -i -n 'nsfsyncd|(^|[^[:alnum:]_])HA[[:space:]_-]+(sync|synchronization|state|fail|error)|(^|[^[:alnum:]_])(sync|synchronization)[[:space:]_-]+(HA|peer)' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | tail -60)
 if [ "$HA_CONFIG_STATE" = YES ]; then
     if [ -n "$HA_LOG_HITS" ]; then
         status CHECK 'HA/synchronization-related log lines found; distinguish routine state changes from failures and compare both nodes:'
@@ -966,40 +1230,12 @@ else
     status CHECK 'HA log coverage cannot be interpreted because the saved configuration was unavailable.'
 fi
 
-printf '\n--- Python references in rc.netscaler ---\n'
-if [ -r /flash/nsconfig/rc.netscaler ]; then
-    RCN_PYTHON=$(grep -E -i -n 'python' /flash/nsconfig/rc.netscaler 2>/dev/null)
-    if [ -n "$RCN_PYTHON" ]; then status CHECK 'Python reference(s) found in rc.netscaler; compare with the approved startup configuration:'; echo "$RCN_PYTHON"; else status OK 'No Python references found in rc.netscaler.'; fi
-else
-    status CHECK '/flash/nsconfig/rc.netscaler is absent or unreadable; this persistence check could not run.'
-fi
-
-printf '\n--- Additional startup/configuration obfuscation indicators ---\n'
-CONFIG_IOC_FILES_FOUND=0
-CONFIG_IOC_HITS=''
-for f in /flash/nsconfig/rc.netscaler /nsconfig/ns.conf /etc/rc /etc/rc.conf.defaults; do
-    [ -r "$f" ] || continue
-    CONFIG_IOC_FILES_FOUND=$((CONFIG_IOC_FILES_FOUND + 1))
-    FILE_HITS=$(grep -E -i -n 'python3[[:space:]]+-c|base64[.](b64|b85)decode|zlib[.]decompress|apachectl[[:space:]]+graceful|php_flag[[:space:]]+engine[[:space:]]+off|fnoc[.]dptth|php[.]xedni|relacsten|hs/pmt/rav/|tnioPnogoL|gifnocsn' "$f" 2>/dev/null)
-    if [ -n "$FILE_HITS" ]; then CONFIG_IOC_HITS="${CONFIG_IOC_HITS}${CONFIG_IOC_HITS:+
---- $f ---
-}$FILE_HITS"; fi
-done
-if [ -n "$CONFIG_IOC_HITS" ]; then
-    status CHECK 'Legacy NetScaler compromise-hunting strings found in startup/configuration files; compare with the same-build baseline. Matches are clues, not proof of compromise:'
-    printf '%s\n' "$CONFIG_IOC_HITS" | head -80
-elif [ "$CONFIG_IOC_FILES_FOUND" -eq 0 ]; then
-    status CHECK 'No readable candidate startup/configuration files were available for this targeted string check.'
-else
-    status OK "No selected Python one-liners, decoder, zlib, PHP activation, or legacy obfuscation strings found in $CONFIG_IOC_FILES_FOUND candidate startup/configuration file(s)."
-fi
-
 subsection 'Shell binaries and privilege-escalation artifacts'
 if [ -e /bin/sh ]; then
     ls -l /bin/sh 2>&1
     ls -ln /bin/sh 2>&1
     if command -v file >/dev/null 2>&1; then file /bin/sh 2>&1; else status CHECK 'file utility is unavailable; compare the SHA-256 hash and metadata with a trusted appliance on the same build.'; fi
-    if command -v stat >/dev/null 2>&1; then stat /bin/sh 2>&1; else status CHECK 'stat utility is unavailable; use ls/hash output and compare against a known-good appliance.'; fi
+    if command -v stat >/dev/null 2>&1; then stat /bin/sh 2>&1; else printf 'Metadata source: ls/hash (stat unavailable).\n'; fi
     SHELL_HASH=''
     if command -v sha256 >/dev/null 2>&1; then
         SHA_OUTPUT=$(sha256 /bin/sh 2>&1)
@@ -1033,11 +1269,52 @@ fi
 printf '\nSetuid/setgid mode check:\n'
 SHELL_MODE=$(ls -l /bin/sh 2>/dev/null | awk 'NR==1{print $1}')
 case "$SHELL_MODE" in
-    *s*) status ACTION "/bin/sh has a setuid/setgid permission marker ($SHELL_MODE); preserve evidence and compare with a trusted baseline." ;;
+    *[sS]*) status ACTION "/bin/sh has a setuid/setgid permission marker ($SHELL_MODE); preserve evidence and compare with a trusted baseline." ;;
     '') status CHECK 'Could not read /bin/sh mode.' ;;
     *) status OK "/bin/sh has no setuid/setgid permission marker ($SHELL_MODE); still compare owner, mode, timestamp, and hash with a same-build baseline." ;;
 esac
 
+
+
+subsection 'Privileged-file inventory under /flash'
+if [ -d /flash ] && [ -r /flash ]; then
+    FLASH_PRIVILEGED=$(find /flash -type f -user root \( -perm -4000 -o -perm -2000 \) -print 2>/dev/null | head -100)
+    if [ -n "$FLASH_PRIVILEGED" ]; then
+        status CHECK 'Root-owned SUID/SGID files found under /flash (up to 100). No universal clean baseline is configured here; compare path, contents, owner, mode and hash with an approved same-build peer:'
+        while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            ls -ldn "$f" 2>&1
+            if command -v sha256 >/dev/null 2>&1; then sha256 "$f"; elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$f"; fi
+            case "${f##*/}" in sh|bash|csh|tcsh|ksh|zsh)
+                status ACTION "A shell-named file under /flash has privileged mode bits: $f. Preserve and investigate; the name alone does not identify its contents." ;;
+            esac
+        done <<EOF_FLASH_PRIVILEGED
+$FLASH_PRIVILEGED
+EOF_FLASH_PRIVILEGED
+    else
+        status OK 'No root-owned SUID/SGID files returned by the /flash inventory. Filesystem traversal errors are not assessed by this result.'
+    fi
+else
+    status CHECK '/flash absent or unreadable; privileged-file inventory unavailable.'
+fi
+
+subsection 'Packet Engine open web and callhome files'
+if command -v lsof >/dev/null 2>&1; then
+    PPE_OPEN_FILES=$(lsof -nP -c NSPPE -c nsppe 2>/dev/null)
+    if [ -n "$PPE_OPEN_FILES" ]; then
+        PPE_OPEN_MATCHES=$(printf '%s\n' "$PPE_OPEN_FILES" | grep -Ei '/var/netscaler/|callhome' | head -30)
+        if [ -n "$PPE_OPEN_MATCHES" ]; then
+            status CHECK 'NSPPE open-file inventory includes web/callhome paths. This can be legitimate; correlate process identity, open descriptor, path and nearby events rather than treating an open file as command execution:'
+            printf '%s\n' "$PPE_OPEN_MATCHES"
+        else
+            status OK 'No selected web/callhome path found in the available NSPPE lsof snapshot.'
+        fi
+    else
+        status CHECK 'lsof returned no usable NSPPE process inventory; open-file coverage could not be established.'
+    fi
+else
+    status CHECK 'lsof unavailable; NSPPE open web/callhome files were not assessed. Use an approved offline/support collection if needed.'
+fi
 
 printf '\n--- SUID/SGID persistence indicators under /var ---\n'
 TMP_SETUID_SHELL=/var/tmp/sh
@@ -1115,6 +1392,97 @@ else
 fi
 
 
+subsection 'Vendor Python files and customsnmpd integrity baseline'
+CUSTOMSNMPD_FILE=/var/python/bin/customsnmpd
+if [ -f "$CUSTOMSNMPD_FILE" ]; then
+    CUSTOMSNMPD_HASH=$(sha256_of "$CUSTOMSNMPD_FILE")
+    if [ "$CUSTOMSNMPD_HASH" = 'e9fe43968c6c0955300e3bc4d7fb0b05a18570b4733aaf4f5c6f7f09be5a242c' ]; then
+        status ACTION 'The /var/python/bin/customsnmpd SHA-256 matches a sample reported in public incident research. Preserve the file and investigate the appliance and connected systems.'
+        printf 'SHA-256: %s  %s\n' "$CUSTOMSNMPD_HASH" "$CUSTOMSNMPD_FILE"
+    elif [ -n "$CUSTOMSNMPD_HASH" ]; then
+        printf 'SHA-256: %s  %s\n' "$CUSTOMSNMPD_HASH" "$CUSTOMSNMPD_FILE"
+        if printf '%s' "${DEYDA_CUSTOMSNMPD_REFERENCE_SHA256-}" | grep -E -i -q '^[0-9a-f]{64}$'; then
+            if [ "$(printf '%s' "$DEYDA_CUSTOMSNMPD_REFERENCE_SHA256" | tr 'A-F' 'a-f')" = "$CUSTOMSNMPD_HASH" ]; then
+                status OK '/var/python/bin/customsnmpd matches the operator-supplied trusted same-build SHA-256 reference. This is a local reference, not a vendor checksum.'
+            else
+                status CHECK '/var/python/bin/customsnmpd differs from the operator-supplied trusted same-build SHA-256 reference. Preserve it and verify the baseline source and approved changes.'
+                printf 'Trusted reference: %s\n' "$DEYDA_CUSTOMSNMPD_REFERENCE_SHA256"
+            fi
+        elif { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; } && [ "$CUSTOMSNMPD_HASH" = '1dd0887ff21b18b0eb78a336e76d4dc3bb6f4fc645e9d864414a2958cb1637fe' ]; then
+            status OK '/var/python/bin/customsnmpd matches the internal clean-appliance 14.1-73.37 SHA-256 reference; this is not a Citrix-published checksum.'
+        elif { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; }; then
+            status CHECK '/var/python/bin/customsnmpd differs from the internal one-appliance 14.1-73.37 reference. Compare edition, approved changes, and another trusted same-build node.'
+            printf 'Internal clean reference: %s\n' '1dd0887ff21b18b0eb78a336e76d4dc3bb6f4fc645e9d864414a2958cb1637fe'
+        else
+            status CHECK '/var/python/bin/customsnmpd does not match the selected public malicious-sample hash, but no valid trusted same-build hash was supplied; integrity remains unverified.'
+        fi
+    else
+        status CHECK 'Could not calculate SHA-256 for /var/python/bin/customsnmpd.'
+    fi
+else
+    status OK 'No /var/python/bin/customsnmpd file found.'
+fi
+if [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; then
+    PYTHON_REFERENCE_NAMES='fixup_pubsub_v1_keywords.py CreateCluster.py MyFirstNitroApplication.py get_config.py jp.py rm_config.py set_config.py stat_config.py'
+    PYTHON_REFERENCE_COUNT=0
+    PYTHON_REFERENCE_MISMATCHES=0
+    for name in $PYTHON_REFERENCE_NAMES; do
+        PYTHON_REFERENCE_COUNT=$((PYTHON_REFERENCE_COUNT + 1))
+        f="/var/python/bin/$name"
+        case "$name" in
+            fixup_pubsub_v1_keywords.py) PYTHON_EXPECTED='c1f44da36acb747f43906abf2c2cdde86f436473c631f603ed7aa0386a996170' ;;
+            CreateCluster.py) PYTHON_EXPECTED='d425f646c717e85e3d799b21eb4bc7032997e8f91afa45a183dd63db6e17e2bf' ;;
+            MyFirstNitroApplication.py) PYTHON_EXPECTED='edf3a5c3ca3621ecd1c4690f57e044ea066ac4c16b3f19914c567e2543c3bdfb' ;;
+            get_config.py) PYTHON_EXPECTED='b681ae3666300014287c2bf7ff286792dc40934cf0ae504325ccfc80b4beb5d9' ;;
+            jp.py) PYTHON_EXPECTED='3e473aaa397c21c6d35219a218da7a627e24079714e211228a7c522f5b01b306' ;;
+            rm_config.py) PYTHON_EXPECTED='597311c15a0570933688320c7f79dd51992ad0503d04e01a75f319d31d524209' ;;
+            set_config.py) PYTHON_EXPECTED='61df56aef3b63bae9436a449afc8c13a02ff202a411357f3d819ac8f0c685971' ;;
+            stat_config.py) PYTHON_EXPECTED='c03a8b059878d685fabd3c3d166965e46cbf9163f6ec9c88cb11eda9d46e2b58' ;;
+        esac
+        if [ ! -f "$f" ]; then
+            status CHECK "$f is absent but exists in the internal clean 14.1-73.37 reference; verify whether the component is expected on this appliance."
+            PYTHON_REFERENCE_MISMATCHES=$((PYTHON_REFERENCE_MISMATCHES + 1))
+            continue
+        fi
+        PYTHON_OBSERVED=$(sha256_of "$f")
+        if [ -n "$PYTHON_OBSERVED" ] && [ "$PYTHON_OBSERVED" = "$PYTHON_EXPECTED" ]; then
+            status OK "$f matches the internal clean 14.1-73.37 SHA-256 reference. This is not a Citrix-published checksum."
+        else
+            status CHECK "$f differs from the internal clean 14.1-73.37 reference or could not be hashed; validate approved changes and compare with another trusted same-build appliance."
+            printf 'Observed: %s\nExpected: %s\n' "${PYTHON_OBSERVED:-unavailable}" "$PYTHON_EXPECTED"
+            PYTHON_REFERENCE_MISMATCHES=$((PYTHON_REFERENCE_MISMATCHES + 1))
+        fi
+    done
+    UNKNOWN_PYTHON_FILES=''
+    for f in /var/python/bin/*.py; do
+        [ -f "$f" ] || continue
+        case "${f##*/}" in
+            fixup_pubsub_v1_keywords.py|CreateCluster.py|MyFirstNitroApplication.py|get_config.py|jp.py|rm_config.py|set_config.py|stat_config.py) ;;
+            *) UNKNOWN_PYTHON_FILES="${UNKNOWN_PYTHON_FILES}${UNKNOWN_PYTHON_FILES:+
+}$f" ;;
+        esac
+    done
+    if [ -n "$UNKNOWN_PYTHON_FILES" ]; then
+        status CHECK 'Additional Python files exist in /var/python/bin outside the supplied clean-reference set; review each against the installed build and approved changes:'
+        printf '%s\n' "$UNKNOWN_PYTHON_FILES"
+        printf '%s\n' "$UNKNOWN_PYTHON_FILES" | while IFS= read -r f; do ls -ln "$f" 2>/dev/null; printf 'SHA-256: %s\n' "$(sha256_of "$f")"; done
+    elif [ "$PYTHON_REFERENCE_MISMATCHES" -eq 0 ]; then
+        status OK "All $PYTHON_REFERENCE_COUNT referenced Python files under /var/python/bin match the internal clean 14.1-73.37 hashes; no additional .py files were found."
+    fi
+fi
+subsection 'configd state-file metadata baseline'
+if { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; }; then
+    if [ -f /var/configd_devno ]; then
+        CONFIGD_DEVNO_META=$(ls -ln /var/configd_devno 2>/dev/null | awk 'NR==1{print $1 ":" $3 ":" $4 ":" $5}')
+        if [ "$CONFIGD_DEVNO_META" = '-rwxr-Sr--:0:0:129' ]; then
+            status OK '/var/configd_devno mode, numeric owner/group, and size match the internal clean 14.1-73.37 sample.'
+        else
+            status CHECK "/var/configd_devno metadata differs from the internal clean sample (-rwxr-Sr--:0:0:129); observed: ${CONFIGD_DEVNO_META:-unavailable}. Compare with another trusted same-build appliance."
+        fi
+    else
+        status CHECK '/var/configd_devno is absent on this appliance, but was present on the internal 14.1-73.37 reference; verify whether it is expected here and compare with a trusted peer.'
+    fi
+fi
 section '4. Web configuration and served-file integrity'
 subsection 'Purpose and follow-up'
 printf '%s\n' 'Purpose: inspect httpd.conf indicators, web-facing files, known webshell/payload markers, custom language files, and recent file changes.'
@@ -1125,13 +1493,22 @@ FOUND_HTTPD=0
 for f in /etc/httpd.conf /nsconfig/httpd.conf /netscaler/httpd.conf; do
     if [ -e "$f" ]; then
         FOUND_HTTPD=1
-        echo "--- $f ---"
+        printf '\n    Log/file: %s\n' "$f"
         ls -l "$f" 2>&1
+        REFERENCE_MATCH=UNKNOWN
         case "$f" in
             /etc/httpd.conf) check_1417337_reference "$f" '3f5c9e7dae71498e524dbf41168fe81fc7864551c36b8f26e5a695ba1af17918' ;;
         esac
-        if command -v stat >/dev/null 2>&1; then stat "$f" 2>&1; else status CHECK 'stat utility is unavailable; use the displayed ls metadata and compare against a known-good baseline.'; fi
-        if find "$f" -mtime -14 -print 2>/dev/null | grep -q .; then status CHECK 'Modification time is within 14 days; compare with approved changes and a known-good baseline.'; else status OK 'Modification time is not within the last 14 days.'; fi
+        if command -v stat >/dev/null 2>&1; then stat "$f" 2>&1; else printf 'Metadata source: ls/hash (stat unavailable).\n'; fi
+        if find "$f" -mtime -14 -print 2>/dev/null | grep -q .; then
+            if [ "$REFERENCE_MATCH" = YES ]; then
+                printf 'Timestamp context: modified within 14 days; current contents match the internal reference. Time alone is not a content-integrity finding.\n'
+            else
+                status CHECK 'Modification time is within 14 days and no matching content baseline was established; compare with approved changes and a trusted peer.'
+            fi
+        else
+            printf 'Timestamp context: not modified within 14 days; file age alone does not establish integrity.\n'
+        fi
         if [ -r "$f" ]; then
             hits=$(grep -E -i -n 'b64decode|base64|LogonPoint/custom|/bin/sh|/\.ctxs|receiver[.]min|^[[:space:]]*(Alias|AliasMatch)[[:space:]].*(receiver|\.ctxs)|^[[:space:]]*(php_flag|php_admin_flag)[[:space:]]+engine[[:space:]]+on|^[[:space:]]*php_engine[[:space:]]+on|^[[:space:]]*(AddHandler|SetHandler)[[:space:]].*php' "$f" 2>/dev/null)
             MANDIANT_HTTPD_HITS=$(grep -E -i -n '^[[:space:]]*(AddType|AddHandler|SetHandler)[[:space:]].*application/x-httpd-php.*[.](deb|sig|rpm|tgz|html)([[:space:]]|$)|^[[:space:]]*AliasMatch[[:space:]].*/vpn/(media|theme|images)/.*(/vpn/scripts/linux|/gui/vpn/scripts/linux|/ns_gui/vpn/scripts/linux)|^[[:space:]]*Alias(Match)?[[:space:]].*LogonUISimple[.]html[.]style[.]min[.]css.*[.]local_journal' "$f" 2>/dev/null)
@@ -1140,7 +1517,7 @@ for f in /etc/httpd.conf /nsconfig/httpd.conf /netscaler/httpd.conf; do
         else
             status CHECK "$f exists but is not readable; indicator search could not be performed."
         fi
-        status CHECK 'File metadata is shown, but change detection requires comparison with a known-good baseline or File Integrity Monitoring.'
+        if [ "$REFERENCE_MATCH" != YES ]; then status CHECK 'No matching content baseline was established for this file; compare with a trusted same-build peer or File Integrity Monitoring.'; fi
     fi
 done
 [ "$FOUND_HTTPD" -eq 1 ] || status CHECK 'No known httpd.conf path found; verify the correct path for this ADC build.'
@@ -1148,14 +1525,59 @@ done
 printf '\n--- NetScaler webshell aliases and PHP configuration indicators ---\n'
 HTTPD_CANDIDATES_FOUND=0
 for f in /etc/httpd.conf /nsconfig/httpd.conf /netscaler/httpd.conf; do [ -r "$f" ] && HTTPD_CANDIDATES_FOUND=1; done
-RECEIVER_ALIAS_HITS=$(grep -nE -i 'receiver[.]min([.][a-f0-9]+)?[.]css|Alias(Match)?[[:space:]].*/[.]ctxs([[:space:]]|$)|LogonUISimple[.]html[.]style[.]min[.]css|[.]local_journal' /etc/httpd.conf /nsconfig/httpd.conf /netscaler/httpd.conf 2>/dev/null)
+RECEIVER_ALIAS_HITS=$(grep -nE -i 'receiver([.]v2)?[.]min([.][a-f0-9]+)?[.]css|Alias(Match)?[[:space:]].*/[.]ctxs([[:space:]]|$)|LogonUISimple[.]html[.]style[.]min[.]css|[.]local_journal' /etc/httpd.conf /nsconfig/httpd.conf /netscaler/httpd.conf 2>/dev/null)
 if [ -n "$RECEIVER_ALIAS_HITS" ]; then
     status ACTION 'NetScaler webshell alias indicator found in httpd.conf; preserve the file and investigate the referenced target and timestamps:'
     printf '%s\n' "$RECEIVER_ALIAS_HITS"
 elif [ "$HTTPD_CANDIDATES_FOUND" -eq 0 ]; then
     status CHECK 'No readable candidate httpd.conf file found; the webshell-alias check could not run.'
 else
-    status OK 'No selected receiver.min.css, .ctxs, or LogonUISimple/.local_journal alias patterns found in candidate httpd.conf files.'
+    status OK 'No selected receiver.min.css/receiver.v2.min.<hex>.css, .ctxs, or LogonUISimple/.local_journal alias patterns found in candidate httpd.conf files.'
+fi
+subsection 'Reported receiver variants and PHP handling of .deb files'
+SLAP_WEB_FOUND=0
+for f in /var/netscaler/logon/LogonPoint/custom/.slap.receiver /var/netscaler/logon/LogonPoint/custom/.ctxs.receiver /var/netscaler/logon/LogonPoint/custom/receiver.deb; do
+    [ -f "$f" ] || continue
+    SLAP_WEB_FOUND=1
+    status CHECK "Reported receiver artifact $f exists. Preserve metadata/hash and inspect content; filename alone is not proof. A fake HTTP 404 does not establish harmlessness."
+    ls -ln "$f" 2>/dev/null
+    printf 'SHA-256 observed: %s\n' "$(sha256_of "$f")"
+    if [ -r "$f" ] && grep -qiE '<\?[[:space:]]*php' "$f" &&
+       grep -qiE 'CsrfToken|HTTP_X_CMD|X-Cmd' "$f" &&
+       grep -qiE 'eval[[:space:]]*\(|shell_exec|passthru|system[[:space:]]*\(|proc_open' "$f"; then
+        status ACTION "PHP plus command/cookie interface and execution-code markers found in $f. Preserve and investigate as a strong webshell-content lead; execution is not established by this content match."
+    fi
+done
+[ "$SLAP_WEB_FOUND" -eq 1 ] || status OK 'No selected .slap.receiver/.ctxs.receiver/receiver.deb file found in LogonPoint/custom.'
+COOKIE_COMMAND_CANDIDATES=$(find /var/netscaler/logon/LogonPoint/custom /var/vpn /nsconfig/.slap /flash/nsconfig/.slap -type f -size -2048k \
+    ! -name 'deyda-netscaler-ioc-check*.sh' ! -name 'deyda-netscaler-ioc-check*.txt' \
+    -exec grep -lF 'CsrfToken2' {} + 2>/dev/null | head -30)
+COOKIE_COMMAND_FOUND=0
+while IFS= read -r f; do
+    [ -r "$f" ] || continue
+    if grep -qiE '<\?[[:space:]]*php' "$f" &&
+       grep -qF '$_COOKIE' "$f" &&
+       grep -qiE 'shell_exec|passthru|proc_open|system[[:space:]]*\(|eval[[:space:]]*\(' "$f"; then
+        COOKIE_COMMAND_FOUND=1
+        status ACTION "PHP cookie-command webshell-content pattern found in $f: CsrfToken2, cookie access and execution code coexist. Preserve for offline analysis; this does not establish execution. Cookie/token values and source content are omitted."
+        ls -ln "$f" 2>/dev/null
+        printf 'SHA-256: %s\n' "$(sha256_of "$f")"
+    fi
+done <<EOF_COOKIE_COMMAND
+$COOKIE_COMMAND_CANDIDATES
+EOF_COOKIE_COMMAND
+if [ "$COOKIE_COMMAND_FOUND" -eq 0 ]; then
+    status OK 'No combined CsrfToken2/PHP/cookie/command-execution content pattern found in readable candidate files below 2 MiB in selected web and .slap backup paths. Other names/paths/formats remain outside coverage.'
+fi
+printf '%s\n' 'Coverage: ordinary HTTP access logs normally omit Cookie and X-Cmd values. A missing token in those logs or an HTTP 404 response does not rule out cookie-command execution.'
+DEB_PHP_HANDLERS=$(grep -nE -i '^[[:space:]]*(AddType|AddHandler)[[:space:]]+[^#]*php[^#]*[[:space:]][.]deb([[:space:]]|$)' /etc/httpd.conf /nsconfig/httpd.conf /netscaler/httpd.conf 2>/dev/null)
+if [ -n "$DEB_PHP_HANDLERS" ]; then
+    status ACTION 'Active-looking Apache directive associates .deb with PHP. Preserve configuration and review directive scope, Files/FilesMatch blocks and mapped files against a trusted baseline:'
+    printf '%s\n' "$DEB_PHP_HANDLERS"
+elif [ "$HTTPD_CANDIDATES_FOUND" -eq 1 ]; then
+    status OK 'No selected active-looking AddType/AddHandler PHP-to-.deb directive found. Other extensions and scoped SetHandler constructs are covered only by the broader configuration checks.'
+else
+    status CHECK 'No readable httpd.conf candidate for the PHP-to-.deb directive check.'
 fi
 WEB_CUSTOM_DIRS_FOUND=0
 for d in /var/netscaler/logon/LogonPoint/custom /var/vpn /var/netscaler; do [ -d "$d" ] && WEB_CUSTOM_DIRS_FOUND=1; done
@@ -1251,11 +1673,37 @@ fi
 subsection 'Additional publicly reported persistence and staging artifacts'
 PITSCALER_ARTIFACTS=$( { find /var/netscaler /var/vpn /var/python /tmp -type f \( -name '.local_journal' -o -name 'xua.html' -o -name 'update_result_*.tgz' -o -name 'customsnmpd' -o -name 'nsg64.deb' -o -name '1.py' \) -print 2>/dev/null; find /var/tmp/.nsmon -type f \( -name '.cfg' -o -name '.state' \) -print 2>/dev/null; } | head -100)
 if [ -n "$PITSCALER_ARTIFACTS" ]; then
-    status CHECK 'Files matching names reported in public incident research were found. Names alone are not proof; preserve unexpected files and validate owner, timestamps, content, and same-build hashes:'
-    printf '%s\n' "$PITSCALER_ARTIFACTS"
-    printf '%s\n' "$PITSCALER_ARTIFACTS" | while IFS= read -r f; do [ -f "$f" ] && ls -ln "$f" 2>/dev/null; done
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        if [ "$f" = /var/python/bin/customsnmpd ]; then
+            printf '\nInventory: %s — hash classification is reported under Host integrity / Vendor Python files and customsnmpd integrity baseline.\n' "$f"
+        else
+            status CHECK "Reported artifact name found: $f. A name alone is not proof; verify content, owner, timestamp and same-build hash."
+            ls -ln "$f" 2>/dev/null
+        fi
+    done <<EOF_REPORTED_ARTIFACTS
+$PITSCALER_ARTIFACTS
+EOF_REPORTED_ARTIFACTS
 else
     status OK 'No selected .local_journal, xua.html, update_result_*.tgz, customsnmpd, .nsmon state, nsg64.deb, or 1.py artifact names found in the searched directories.'
+fi
+progress 'Web and payload integrity: Platypus bootstrap content'
+# Find by content, not token/hash; no token or file content is printed.
+# Quoted find -exec avoids shell evaluation and xargs splitting of spaced paths.
+PLATYPUS_BOOTSTRAPS=$(find /tmp /var/tmp /netscaler.local /var/core -type f -size -1024k \
+    ! -name 'deyda-netscaler-ioc-check*.txt' ! -name 'deyda-netscaler-ioc-check*.sh' \
+    -exec grep -lE 'Platypus agent bootstrap|PLATYPUS_INGRESS_CA|AGENT_TOKEN[[:space:]]*=[[:space:]]*.[pP][lL][tT]_' {} + 2>/dev/null | head -30)
+if [ -n "$PLATYPUS_BOOTSTRAPS" ]; then
+    status ACTION 'Distinctive Platypus-bootstrap content matched in selected files below 1 MiB. This indicates a staged script, not proof of execution. Preserve and inspect offline; enrollment token values are omitted:'
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        ls -ln "$f" 2>/dev/null
+        printf 'SHA-256: %s\n' "$(sha256_of "$f")"
+    done <<EOF_BOOTSTRAPS
+$PLATYPUS_BOOTSTRAPS
+EOF_BOOTSTRAPS
+else
+    status OK 'No selected Platypus-bootstrap content found in readable candidate files below 1 MiB in /tmp, /var/tmp, /netscaler.local, or /var/core. Other paths and larger files are outside this check.'
 fi
 PLATYPUS_CACHE_DIR=/var/core/.ns-cache
 if [ -d "$PLATYPUS_CACHE_DIR" ]; then
@@ -1298,39 +1746,7 @@ EOF_PLATYPUS_FILES
 else
     status OK 'No ns_*.pl files found under /netscaler.local. This only covers the scanned path.'
 fi
-PERSISTENCE_ACCOUNT_CONFIG=''
-for f in /nsconfig/ns.conf /flash/nsconfig/ns.conf /nsconfig/ns.conf.default; do
-    [ -r "$f" ] || continue
-    if grep -E -i -q '^[[:space:]]*add[[:space:]]+system[[:space:]]+user[[:space:]]+sec_monitor([[:space:]]|$)' "$f" 2>/dev/null; then PERSISTENCE_ACCOUNT_CONFIG="$f"; fi
-done
-if [ -n "$PERSISTENCE_ACCOUNT_CONFIG" ]; then
-    status CHECK 'The account name sec_monitor appears in a saved configuration. This name was reported in public incident research but may be locally legitimate; verify its owner, creation time, group bindings, and approval without exposing credential fields.'
-else
-    status OK 'No saved-config system-user entry named sec_monitor found in the checked configuration files. This does not cover transient/live-only accounts or other names.'
-fi
-UX_HEADER_LOG_HITS=$(zgrep -E -i -n 'HTTP_NSC_(LDAP|CLIENTTYPE)|HTTP_X_UX(_[0-9]+)?|/vpn/media/[^[:space:]]+[.]ico|/vpn/scripts/(linux|vista|mac)/[^[:space:]]+[.](sig|deb|php)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -40)
-if [ -n "$UX_HEADER_LOG_HITS" ]; then
-    status CHECK 'HTTP logs contain reported webshell/tunneler header names or VPN staging-path requests. Logs may not record request headers; correlate timestamps and inspect response status, size, duration, and corresponding error-log entries:'
-    printf '%s\n' "$UX_HEADER_LOG_HITS"
-else
-    status OK 'No selected WHIPSHOT/SLAPSHOT header names or reported VPN staging-path requests found in available HTTP logs; coverage depends on retained logs and log format.'
-fi
-PITSCALER_HTTP_HITS=$(zgrep -E -i -n 'ns-88771-poc|/vpn/media/[^[:space:]]+[.]ico|PD9[A-Za-z0-9+/=]{12,}|NSC_TASS|CsrfToken' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -40)
-if [ -n "$PITSCALER_HTTP_HITS" ]; then
-    status CHECK 'HTTP logs contain additional public-research markers (test strings, staging paths, base64-PHP prefix, or cookie names). These are triage clues; cookie names alone and ns-88771-poc can be benign/authorized tests. Do not expose cookie values; correlate method, URI, response, and timestamps with other evidence:'
-    printf '%s\n' "$PITSCALER_HTTP_HITS" | awk '
-        BEGIN { IGNORECASE=1 }
-        /ns-88771-poc/ { test++ }
-        /\/vpn\/media\/[^ ]+[.]ico/ { media++ }
-        /PD9[A-Za-z0-9+\/=]{12,}/ { payload++ }
-        /NSC_TASS/ { tass++ }
-        /CsrfToken/ { csrf++ }
-        END { printf "Matching log lines by marker (values omitted): ns-88771-poc=%d; /vpn/media/*.ico=%d; base64-PHP prefix=%d; NSC_TASS=%d; CsrfToken=%d\n", test, media, payload, tass, csrf }
-    '
-else
-    status OK 'No additional selected public-research HTTP markers found in retained HTTP logs; header/body logging and retention limit coverage.'
-fi
-
+subsection 'PHP and webshell content in customization trees'
 MISPLACED_PHP=$(grep -rlE '<\?[[:space:]]*php|passthru[[:space:]]*\(|NSC_TASS|CsrfToken' /var/netscaler/logon/LogonPoint/custom /var/vpn 2>/dev/null)
 if [ -n "$MISPLACED_PHP" ]; then
     status ACTION 'PHP/webshell-like code found in Gateway customization paths where it is unexpected; inspect contents and preserve evidence:'
@@ -1351,13 +1767,7 @@ else
     status OK 'No ns.conf/.F1.key/.F2.key copies found in the selected web-facing and temporary paths.'
 fi
 
-HTTPD_RELOAD_LOGS=$(zgrep -E -i -n 'apachectl[[:space:]]+graceful|httpd[^[:cntrl:]]*(SIGHUP|SIGUSR1)|graceful[^[:cntrl:]]*(restart|reload)' /var/log/httperror* /var/log/messages* /var/log/ns.log* 2>/dev/null | tail -40)
-if [ -n "$HTTPD_RELOAD_LOGS" ]; then
-    status CHECK 'HTTPD graceful-reload or signal references found in retained logs; correlate with httpd.conf and web-file changes:'
-    printf '%s\n' "$HTTPD_RELOAD_LOGS"
-else
-    status OK 'No selected HTTPD graceful-reload/signal references found in the searched logs.'
-fi
+subsection 'Known webshell hashes in selected file trees'
 KNOWN_WEBSHELL_HASHES='6f5a2a452a7901323abd21879c6cecccb47c06aeeaccb1b467212f3b11e4b1e7
 ed082f744f035035900f67edf438f2f7d0528ac501234f63d476d65273cdb9a1
 5ea5ea61e9062822bee3f66ef5ff47c217178d9e31936ad6daf10c5dfae44d12
@@ -1388,95 +1798,7 @@ if command -v sha256 >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1; th
 else
     status CHECK 'No SHA-256 utility is available; the selected public webshell hash checks could not run.'
 fi
-CUSTOMSNMPD_FILE=/var/python/bin/customsnmpd
-if [ -f "$CUSTOMSNMPD_FILE" ]; then
-    CUSTOMSNMPD_HASH=$(sha256_of "$CUSTOMSNMPD_FILE")
-    if [ "$CUSTOMSNMPD_HASH" = 'e9fe43968c6c0955300e3bc4d7fb0b05a18570b4733aaf4f5c6f7f09be5a242c' ]; then
-        status ACTION 'The /var/python/bin/customsnmpd SHA-256 matches a sample reported in public incident research. Preserve the file and investigate the appliance and connected systems.'
-        printf 'SHA-256: %s  %s\n' "$CUSTOMSNMPD_HASH" "$CUSTOMSNMPD_FILE"
-    elif [ -n "$CUSTOMSNMPD_HASH" ]; then
-        printf 'SHA-256: %s  %s\n' "$CUSTOMSNMPD_HASH" "$CUSTOMSNMPD_FILE"
-        if printf '%s' "${DEYDA_CUSTOMSNMPD_REFERENCE_SHA256-}" | grep -E -i -q '^[0-9a-f]{64}$'; then
-            if [ "$(printf '%s' "$DEYDA_CUSTOMSNMPD_REFERENCE_SHA256" | tr 'A-F' 'a-f')" = "$CUSTOMSNMPD_HASH" ]; then
-                status OK '/var/python/bin/customsnmpd matches the operator-supplied trusted same-build SHA-256 reference. This is a local reference, not a vendor checksum.'
-            else
-                status CHECK '/var/python/bin/customsnmpd differs from the operator-supplied trusted same-build SHA-256 reference. Preserve it and verify the baseline source and approved changes.'
-                printf 'Trusted reference: %s\n' "$DEYDA_CUSTOMSNMPD_REFERENCE_SHA256"
-            fi
-        elif { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; } && [ "$CUSTOMSNMPD_HASH" = '1dd0887ff21b18b0eb78a336e76d4dc3bb6f4fc645e9d864414a2958cb1637fe' ]; then
-            status OK '/var/python/bin/customsnmpd matches the internal clean-appliance 14.1-73.37 SHA-256 reference; this is not a Citrix-published checksum.'
-        elif { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; }; then
-            status CHECK '/var/python/bin/customsnmpd differs from the internal one-appliance 14.1-73.37 reference. Compare edition, approved changes, and another trusted same-build node.'
-            printf 'Internal clean reference: %s\n' '1dd0887ff21b18b0eb78a336e76d4dc3bb6f4fc645e9d864414a2958cb1637fe'
-        else
-            status CHECK '/var/python/bin/customsnmpd does not match the selected public malicious-sample hash, but no valid trusted same-build hash was supplied; integrity remains unverified.'
-        fi
-    else
-        status CHECK 'Could not calculate SHA-256 for /var/python/bin/customsnmpd.'
-    fi
-else
-    status OK 'No /var/python/bin/customsnmpd file found.'
-fi
-if [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; then
-    PYTHON_REFERENCE_NAMES='fixup_pubsub_v1_keywords.py CreateCluster.py MyFirstNitroApplication.py get_config.py jp.py rm_config.py set_config.py stat_config.py'
-    PYTHON_REFERENCE_COUNT=0
-    PYTHON_REFERENCE_MISMATCHES=0
-    for name in $PYTHON_REFERENCE_NAMES; do
-        PYTHON_REFERENCE_COUNT=$((PYTHON_REFERENCE_COUNT + 1))
-        f="/var/python/bin/$name"
-        case "$name" in
-            fixup_pubsub_v1_keywords.py) PYTHON_EXPECTED='c1f44da36acb747f43906abf2c2cdde86f436473c631f603ed7aa0386a996170' ;;
-            CreateCluster.py) PYTHON_EXPECTED='d425f646c717e85e3d799b21eb4bc7032997e8f91afa45a183dd63db6e17e2bf' ;;
-            MyFirstNitroApplication.py) PYTHON_EXPECTED='edf3a5c3ca3621ecd1c4690f57e044ea066ac4c16b3f19914c567e2543c3bdfb' ;;
-            get_config.py) PYTHON_EXPECTED='b681ae3666300014287c2bf7ff286792dc40934cf0ae504325ccfc80b4beb5d9' ;;
-            jp.py) PYTHON_EXPECTED='3e473aaa397c21c6d35219a218da7a627e24079714e211228a7c522f5b01b306' ;;
-            rm_config.py) PYTHON_EXPECTED='597311c15a0570933688320c7f79dd51992ad0503d04e01a75f319d31d524209' ;;
-            set_config.py) PYTHON_EXPECTED='61df56aef3b63bae9436a449afc8c13a02ff202a411357f3d819ac8f0c685971' ;;
-            stat_config.py) PYTHON_EXPECTED='c03a8b059878d685fabd3c3d166965e46cbf9163f6ec9c88cb11eda9d46e2b58' ;;
-        esac
-        if [ ! -f "$f" ]; then
-            status CHECK "$f is absent but exists in the internal clean 14.1-73.37 reference; verify whether the component is expected on this appliance."
-            PYTHON_REFERENCE_MISMATCHES=$((PYTHON_REFERENCE_MISMATCHES + 1))
-            continue
-        fi
-        PYTHON_OBSERVED=$(sha256_of "$f")
-        if [ -n "$PYTHON_OBSERVED" ] && [ "$PYTHON_OBSERVED" = "$PYTHON_EXPECTED" ]; then
-            status OK "$f matches the internal clean 14.1-73.37 SHA-256 reference. This is not a Citrix-published checksum."
-        else
-            status CHECK "$f differs from the internal clean 14.1-73.37 reference or could not be hashed; validate approved changes and compare with another trusted same-build appliance."
-            printf 'Observed: %s\nExpected: %s\n' "${PYTHON_OBSERVED:-unavailable}" "$PYTHON_EXPECTED"
-            PYTHON_REFERENCE_MISMATCHES=$((PYTHON_REFERENCE_MISMATCHES + 1))
-        fi
-    done
-    UNKNOWN_PYTHON_FILES=''
-    for f in /var/python/bin/*.py; do
-        [ -f "$f" ] || continue
-        case "${f##*/}" in
-            fixup_pubsub_v1_keywords.py|CreateCluster.py|MyFirstNitroApplication.py|get_config.py|jp.py|rm_config.py|set_config.py|stat_config.py) ;;
-            *) UNKNOWN_PYTHON_FILES="${UNKNOWN_PYTHON_FILES}${UNKNOWN_PYTHON_FILES:+
-}$f" ;;
-        esac
-    done
-    if [ -n "$UNKNOWN_PYTHON_FILES" ]; then
-        status CHECK 'Additional Python files exist in /var/python/bin outside the supplied clean-reference set; review each against the installed build and approved changes:'
-        printf '%s\n' "$UNKNOWN_PYTHON_FILES"
-        printf '%s\n' "$UNKNOWN_PYTHON_FILES" | while IFS= read -r f; do ls -ln "$f" 2>/dev/null; printf 'SHA-256: %s\n' "$(sha256_of "$f")"; done
-    elif [ "$PYTHON_REFERENCE_MISMATCHES" -eq 0 ]; then
-        status OK "All $PYTHON_REFERENCE_COUNT referenced Python files under /var/python/bin match the internal clean 14.1-73.37 hashes; no additional .py files were found."
-    fi
-fi
-if { [ "${CURRENT_INPUT-}" = '14.1-73.37.nc' ] || [ "${CURRENT_INPUT-}" = '14.1-73.37' ]; }; then
-    if [ -f /var/configd_devno ]; then
-        CONFIGD_DEVNO_META=$(ls -ln /var/configd_devno 2>/dev/null | awk 'NR==1{print $1 ":" $3 ":" $4 ":" $5}')
-        if [ "$CONFIGD_DEVNO_META" = '-rwxr-Sr--:0:0:129' ]; then
-            status OK '/var/configd_devno mode, numeric owner/group, and size match the internal clean 14.1-73.37 sample.'
-        else
-            status CHECK "/var/configd_devno metadata differs from the internal clean sample (-rwxr-Sr--:0:0:129); observed: ${CONFIGD_DEVNO_META:-unavailable}. Compare with another trusted same-build appliance."
-        fi
-    else
-        status CHECK '/var/configd_devno was absent on the internal 14.1-73.37 reference; verify whether it is expected to exist on this appliance and compare with a trusted peer.'
-    fi
-fi
+subsection 'Hidden .ctxs files and content indicators'
 CTX_RECEIVER_FILES=$(find /var/netscaler/logon /netscaler/ns_gui /var/vpn -type f -name '.ctxs*' -print 2>/dev/null)
 if [ -n "$CTX_RECEIVER_FILES" ]; then
     status ACTION 'Hidden .ctxs* file found in a web-facing path; investigate as a possible webshell and preserve evidence:'
@@ -1780,7 +2102,7 @@ printf '\n--- Log retention and pre-patch coverage ---\n'
 printf 'The checks below only cover files currently available on this appliance. File timestamps are a retention clue, not proof that logs are complete or contain every event.\n'
 printf 'Public incident-response reporting places CVE-2026-88771 exploitation as early as 2026-09-05. If the appliance was internet-facing and below the fixed build then, include that period in the investigation where retained logs permit.\n'
 LOG_FILES_LIST=''
-for pattern in /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages*; do
+for pattern in /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log*; do
     for f in $pattern; do
         [ -f "$f" ] && [ -r "$f" ] && LOG_FILES_LIST="${LOG_FILES_LIST}${LOG_FILES_LIST:+
 }$f"
@@ -1805,26 +2127,62 @@ else
     status CHECK 'No readable candidate HTTP/system logs found; log-based IOC checks have no usable retention coverage.'
 fi
 printf '\nLocal log source inventory (rotation/retention context):\n'
-for pattern in /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages* /var/log/sh.log* /var/log/bash.log*; do
+for pattern in /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/sh.log* /var/log/bash.log*; do
     for f in $pattern; do [ -f "$f" ] && ls -l "$f" 2>/dev/null; done
 done
 status CHECK 'This script cannot query remote syslog, NetScaler Console, SIEM, AppFlow, Web Logging, firewall, or Active Directory event stores. Check those independently, document time ranges/timezones/retention, and correlate relevant events such as Windows 4624/4625.'
 status CHECK 'File modification times only estimate log retention. Inspect timestamps inside rotated logs and identify gaps, early rotation, truncation, and clock/timezone/NTP discrepancies before treating a no-hit result as meaningful.'
-printf '\nRecent reboot-related system log lines (available logs only):\n'
+subsection 'Reboot-related system log records'
 FOUND_REBOOT_LOG=0
 for f in /var/log/messages /var/log/ns.log /var/log/boot.log; do
     if [ -r "$f" ]; then
         FOUND_REBOOT_LOG=1
-        echo "--- $f ---"
-        matches=$(grep -E -i -n 'reboot|shutdown|power|cold.?start|warm.?start|boot(ed|ing)?' "$f" 2>/dev/null | tail -100)
+        printf '\n    Log/file: %s\n' "$f"
+        matches=$(grep -E -i -n '(^|[^[:alnum:]_])(reboot(ing|ed)?|shutdown|cold[ ._-]?start|warm[ ._-]?start|boot(ed|ing)?|power[[:space:]]+(off|failure|loss|cycle))([^[:alnum:]_]|$)' "$f" 2>/dev/null |
+            grep -Eiv 'CMD_EXECUTED|CLI CMD|nsprofmon_mgmt[.]pl:' | tail -100)
         if [ -n "$matches" ]; then echo "$matches"; else status OK 'No reboot-related keywords found in this log.'; fi
     fi
 done
 [ "$FOUND_REBOOT_LOG" -eq 1 ] || status CHECK 'No readable candidate system logs were found at the paths checked.'
 
+subsection 'Authentication service (nsaaad) crashes and restart-limit events'
+NSAAAD_LOG_COVERAGE=0
+for f in /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log*; do
+    [ -f "$f" ] && [ -r "$f" ] && NSAAAD_LOG_COVERAGE=1
+done
+NSAAAD_EVENTS=$(zgrep -hEi '(^|[[:space:]:])proc[[:space:]]+nsaaad[[:space:]][^[:cntrl:]]*(SIGNALED|EXITED)|(^|[[:space:]:])nsaaad([[:space:]]+[0-9]+|[[:space:]]*\([0-9]+\))?[[:space:]]+(unexpectedly died|has had its maximum number of restarts)|Pitboss declaring system failure|All monitored processes have exited' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null |
+    grep -Eiv 'nsprofmon_mgmt[.]pl:|process_kernel_socket:[^[:cntrl:]]*call to authenticate user|cascade_auth:|start_ldap_auth:|receive_ldap_user_search_event:|AAAD API:|AAAD RESP:|LOGIN_FAILED|AAA LOGIN REQ|aaad_authenticate_req|Could not match login claims|CMD_EXECUTED|CLI CMD' | tail -30)
+if [ -n "$NSAAAD_EVENTS" ]; then
+    status CHECK 'Authentication-service exit or general monitored-process restart-limit events found. These are availability/triage clues, not proof of payload installation. Correlate appliance time and timezone with SAML requests, reboot history and change records:'
+    printf '%s\n' "$NSAAAD_EVENTS"
+elif [ "$NSAAAD_LOG_COVERAGE" -eq 0 ]; then
+    status CHECK 'No readable candidate system logs; authentication-service crash coverage unavailable.'
+else
+    status OK 'No selected nsaaad exit/restart-limit event patterns found in retained system logs. Other message formats and rotated-away history are outside coverage.'
+fi
+NSAAAD_CORE_DIRS=0
+for d in /var/core /var/crash; do [ -d "$d" ] && [ -r "$d" ] && NSAAAD_CORE_DIRS=$((NSAAAD_CORE_DIRS + 1)); done
+NSAAAD_CORES=$(find /var/core /var/crash -type f -iname '*nsaaad*' -print 2>/dev/null | head -40)
+if [ -n "$NSAAAD_CORES" ]; then
+    status CHECK 'nsaaad-named core/crash files found (all retained ages, at most 40 shown). Preserve for offline analysis and correlate with request/event timestamps; do not trigger a new core dump automatically:'
+    printf '%s\n' "$NSAAAD_CORES"
+elif [ "$NSAAAD_CORE_DIRS" -eq 0 ]; then
+    status CHECK 'No readable core/crash directory; nsaaad core inventory unavailable.'
+else
+    status OK 'No nsaaad-named files returned from the retained core/crash inventory.'
+fi
+
+subsection 'HTTPD reload and signal events'
+HTTPD_RELOAD_LOGS=$(zgrep -E -i -n 'apachectl[[:space:]]+graceful|httpd[^[:cntrl:]]*(SIGHUP|SIGUSR1)|graceful[^[:cntrl:]]*(restart|reload)' /var/log/httperror* /var/log/messages* /var/log/ns.log* 2>/dev/null | tail -40)
+if [ -n "$HTTPD_RELOAD_LOGS" ]; then
+    status CHECK 'HTTPD graceful-reload or signal references found in retained logs; correlate with httpd.conf and web-file changes:'
+    printf '%s\n' "$HTTPD_RELOAD_LOGS"
+else
+    status OK 'No selected HTTPD graceful-reload/signal references found in the searched logs.'
+fi
 subsection 'CVE-2026-88772 DTLS and NSPPE event correlation'
-DTLS_EVENT_LINES=$(zgrep -E -i -n 'SSL_HANDSHAKE_FAILURE.*DTLSv1[.]0.*Handshake failure-Internal Error' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -30)
-NSPPE_EVENT_LINES=$(zgrep -E -i -n 'orphan rings|pitboss[^[:cntrl:]]*NOT restarting NSPPE|NSPPE[^[:cntrl:]]*(exit|crash|signal|terminated)' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -50)
+DTLS_EVENT_LINES=$(zgrep -E -i -n 'SSL_HANDSHAKE_FAILURE.*DTLSv1[.]0.*Handshake failure-Internal Error' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | tail -30)
+NSPPE_EVENT_LINES=$(zgrep -E -i -n 'orphan rings|pitboss[^[:cntrl:]]*NOT restarting NSPPE|NSPPE[^[:cntrl:]]*(exit|crash|signal|terminated)' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | tail -50)
 if [ -n "$DTLS_EVENT_LINES" ]; then
     printf '%s\n' "$DTLS_EVENT_LINES"
     DTLS_EVENT_FOUND=1
@@ -1890,24 +2248,82 @@ elif [ "$HTTP_IOC_LOGS_FOUND" -eq 0 ]; then
 else
     status OK 'No INDEX: base64 token found in available HTTP access/error logs. This covers retained files and the searched format only.'
 fi
+
+subsection 'Tagged Base64 User-Agent candidates (including K: payloads)'
+# Only inspect the User-Agent field of conventional combined Apache logs.
+# Decode into inert text, bound size and replace control characters; never eval.
+if [ "$HTTP_IOC_LOGS_FOUND" -eq 0 ]; then
+    status CHECK 'No readable candidate HTTP logs; tagged User-Agent coverage unavailable.'
+elif ! command -v perl >/dev/null 2>&1; then
+    status CHECK 'Perl unavailable; tagged User-Agent parsing/decoding did not run.'
+else
+    TAGGED_UA_RESULTS=$(zgrep -hE '"[A-Za-z]{1,8}:[A-Za-z0-9+/]{40,}={0,2}#?"[[:space:]]*$' /var/log/httpaccess* 2>/dev/null |
+        perl -MMIME::Base64 -ne '
+        @q=split(/"/,$_); next unless @q>=7;
+        $u=$q[-2]; next unless $u =~ /^([A-Za-z]{1,8}):([A-Za-z0-9+\/]{40,}={0,2})#?$/;
+        ($tag,$b)=($1,$2); next if length($b)>8192 || length($b)%4;
+        next if $seen{$u}++; next if ++$count>20;
+        $v=decode_base64($b);
+        $strong=($v =~ /(?:curl|wget|base64|b64decode|httpd[.]conf|[.]ctxs|[.]slap)/i && $v =~ /(?:\|\s*(?:sh|bash)|;|`|\$\(|chmod\s+6[0-7]{3})/);
+        $v =~ s/[^\x20-\x7e]/./g;
+        print ($strong ? "[ACTION]" : "[CHECK]")," Tagged UA candidate (",$tag,"): ",substr($v,0,240),"\n";
+        ')
+    if [ -n "$TAGGED_UA_RESULTS" ]; then
+        printf '%s\n' "$TAGGED_UA_RESULTS"
+        status CHECK 'Decoded tagged User-Agent previews are inert text. ACTION requires both selected command/artifact markers and shell syntax, and indicates an attempt requiring investigation, not execution. At most 20 distinct candidates; correlate timestamps in original logs locally.'
+    else
+        status OK 'No tagged Base64 User-Agent candidate returned in the selected combined access-log format. Custom formats and URL-safe/shorter tokens are outside coverage.'
+    fi
+fi
+
+subsection 'Whole-User-Agent Base64 candidates'
+progress 'Attack logs: whole-User-Agent Base64 candidates'
+# Common/combined Apache layout only: the last quoted field must be a Base64
+# token, >=40 characters. Bound decoding at 8192 encoded bytes, never execute it.
+UA_ACCESS_LOGS_FOUND=0
+for f in /var/log/httpaccess*; do [ -f "$f" ] && [ -r "$f" ] && UA_ACCESS_LOGS_FOUND=1; done
+UA_BASE64_CANDIDATES=$(zgrep -hE '"[A-Za-z0-9+/]{40,}={0,2}"[[:space:]]*$' /var/log/httpaccess* 2>/dev/null |
+    awk -F '"' 'NF >= 7 {candidate=$(NF-1); if (candidate ~ /^[A-Za-z0-9+\/]+={0,2}$/ && length(candidate)>=40 && length(candidate)<=8192 && length(candidate)%4==0) print candidate}' |
+    sort -u | head -20)
+if [ -n "$UA_BASE64_CANDIDATES" ]; then
+    status CHECK 'Whole-User-Agent Base64 candidate(s) found in common/combined HTTP access logs. Encoding alone is not an exploit indicator. Correlate the original timestamp, source, request, and decoded text; at most 20 unique candidates are shown as inert text:'
+    if command -v perl >/dev/null 2>&1; then
+        while IFS= read -r encoded; do
+            [ -n "$encoded" ] || continue
+            decoded=$(printf '%s' "$encoded" | perl -MMIME::Base64 -ne 'print decode_base64($_)' 2>/dev/null | LC_ALL=C tr -c '[:print:]' '.' | cut -c1-240)
+            printf '  Encoded prefix: %.32s...\n  Decoded preview: %s\n' "$encoded" "$decoded"
+        done <<EOF_UA_BASE64
+$UA_BASE64_CANDIDATES
+EOF_UA_BASE64
+    else
+        status CHECK 'Perl Base64 decoding is unavailable; inspect matching User-Agent fields offline. No payload was executed.'
+    fi
+elif [ "$UA_ACCESS_LOGS_FOUND" -eq 0 ]; then
+    status CHECK 'No readable HTTP access logs available; whole-User-Agent Base64 coverage is unavailable.'
+else
+    status OK 'No whole-User-Agent Base64 candidate matched the selected common/combined access-log format. Custom formats, shorter blobs, URL-safe Base64, and error-log-only content are outside coverage.'
+fi
+
+subsection 'Authentication reconnaissance markers'
 SYS_IOC_LOGS_FOUND=0
-for f in /var/log/ns.log* /var/log/messages*; do [ -f "$f" ] && [ -r "$f" ] && SYS_IOC_LOGS_FOUND=1; done
+for f in /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log*; do [ -f "$f" ] && [ -r "$f" ] && SYS_IOC_LOGS_FOUND=1; done
 # CERT-EU describes the authentication-log marker followed by shell syntax as
 # the second part of the chain. Do not infer that a background helper executed it.
-SCANNER_PROBE_HITS=$(zgrep -E -i -c 'scanner-probe' /var/log/ns.log* /var/log/messages* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | awk -F: '{n+=$NF} END{print n+0}')
+SCANNER_PROBE_HITS=$(zgrep -E -i -c 'scanner-probe' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | awk -F: '{n+=$NF} END{print n+0}')
 if [ "$SCANNER_PROBE_HITS" -gt 0 ]; then
     status CHECK "The string scanner-probe occurs in retained candidate logs ($SCANNER_PROBE_HITS matching line(s)). TENEX observed it as reconnaissance before crafted log injections; by itself it may be an authorized scanner or unrelated login. Review timestamps and nearby username/PPE records locally."
 else
     status OK 'No scanner-probe string found in the retained candidate authentication/system logs. Coverage depends on log format and retention.'
 fi
-PITBOSS_LINES=$(zgrep -hE -i 'pitboss PPE (missed too many heartbeats|unexpectedly died)[[:space:]]?NSPPE(-[0-9]+)?[^[:cntrl:]]*(;|%3[bB]|`|%60|\$\(|\$\{IFS\}|%24%7BIFS%7D)' /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -40)
+subsection 'PPE/pitboss log injection and two-stage correlation'
+PITBOSS_LINES=$(zgrep -hE -i 'pitboss PPE (missed too many heartbeats|unexpectedly died)[[:space:]]?NSPPE(-[0-9]+)?[^[:cntrl:]]*(;|%3[bB]|`|%60|\$\(|\$\{IFS\}|%24%7BIFS%7D)' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | tail -40)
 if [ -n "$PITBOSS_LINES" ]; then
     status ACTION 'System/authentication-log line matches a publicly reported PPE trigger (missed heartbeats or unexpectedly died) followed by shell syntax. This records an exploit attempt; it does not prove the line was later processed or that a command ran. Preserve and correlate it:'
     printf '%s\n' "$PITBOSS_LINES"
 elif [ "$SYS_IOC_LOGS_FOUND" -eq 0 ]; then
-    status CHECK 'No readable ns.log/messages files found; the authentication-trigger check has no coverage.'
+    status CHECK 'No readable ns.log/messages/notice/nsvpn files found; the authentication-trigger check has no coverage.'
 else
-    status OK 'No selected PPE-trigger (missed heartbeats or unexpectedly died) plus shell-syntax pattern found in retained ns.log/messages files.'
+    status OK 'No selected PPE-trigger (missed heartbeats or unexpectedly died) plus shell-syntax pattern found in retained ns.log/messages/notice/nsvpn files.'
 fi
 if [ -n "$PITBOSS_LINES" ] && [ -n "$INDEX_LINES" ]; then
     status ACTION 'Both selected stages of the publicly described log chain are present. Raise incident priority and correlate timestamps with httpd.conf changes, webshell/payload artifacts, and system events. Available log matches cannot confirm whether the background helper processed the trigger or whether a command executed.'
@@ -1917,9 +2333,52 @@ elif [ -n "$INDEX_LINES" ]; then
     status CHECK 'An INDEX: token was found without the selected authentication trigger. Review decoded text and correlate its timestamp with authentication logs and resulting files.'
 fi
 
-printf '\n--- Additional public exploit-path, webshell-staging, and callback indicators ---\n'
+
+subsection 'Multi-signal authentication-log injection without a PPE trigger'
+# Require authentication context and multiple independent execution-chain clues.
+# Audit/scanner command echoes are excluded. Counts avoid exposing usernames/secrets.
+LOGIN_CHAIN_COUNT=$(zgrep -hEi 'LOGIN_FAILED|AAA LOGIN REQ|aaad_authenticate_req|Could not match login claims|AAAD API: sending login req|AAAD RESP: received resp' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null |
+    grep -Eiv 'CMD_EXECUTED|CLI CMD|deyda-netscaler|netscaler-ioc-check' |
+    grep -Ei '(\$\{?IFS\}?|%24(%7[bB])?IFS|base64[^[:cntrl:]]*(-d|--decode)|b64decode)' |
+    grep -Ei '(/var/log/htt|%2[fF]var%2[fF]log%2[fF]htt|\|[[:space:]]*(sh|bash)|%7[cC][[:space:]]*(sh|bash))' | wc -l | tr -d ' ')
+if [ "$LOGIN_CHAIN_COUNT" -gt 0 ]; then
+    status ACTION "$LOGIN_CHAIN_COUNT retained authentication line(s) combine IFS/Base64 decoding with an HTTP-log read or shell pipeline. These are exploit-like attempt records, even without pitboss text; preserve and correlate original timestamps, commands and file artifacts. No execution is established by this count."
+elif [ "$SYS_IOC_LOGS_FOUND" -eq 0 ]; then
+    status CHECK 'No readable candidate authentication/system logs; multi-signal login-chain coverage unavailable.'
+else
+    status OK 'No selected multi-signal login injection pattern found in retained authentication/system logs. Single signals and other encodings remain outside this heuristic.'
+fi
+
+# HTTP/source coverage for the dedicated request checks below.
 RECON_LOGS_FOUND=0
 for f in /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn*; do [ -f "$f" ] && [ -r "$f" ] && RECON_LOGS_FOUND=1; done
+
+subsection 'Unusual HTTP response and diagnostic-path requests'
+# Parse request, status and bytes as separate fields; a 404 alone is harmless.
+if [ "$RECON_LOGS_FOUND" -eq 0 ]; then
+    status CHECK 'No readable candidate HTTP logs; unusual-response/diagnostic-path coverage unavailable.'
+elif ! command -v perl >/dev/null 2>&1; then
+    status CHECK 'Perl unavailable; structured unusual-response parsing did not run.'
+else
+    HTTP_RESPONSE_LEADS=$(zgrep -hE '"[A-Z]+[[:space:]]' /var/log/httpaccess* 2>/dev/null |
+        perl -ne '
+        @q=split(/"/,$_); next unless @q>=3;
+        ($method,$uri)=split(/\s+/,$q[1]); next unless defined $uri;
+        next unless $q[2] =~ /^\s*(\d{3})\s+(\d+|-)(?:\s|$)/;
+        ($code,$bytes)=($1,$2);
+        if ($uri =~ m{^/nsconmsg(?:[/?]|$)}i) {$diag++}
+        if ($uri =~ /\.(?:deb|sig|ico)(?:[?]|$)/i && ($code==404 || $code==202) && $bytes ne "-" && $bytes>=1000) {$large++}
+        END {print "Diagnostic /nsconmsg requests: ",0+$diag,"\nPackage/icon requests with 404/202 and >=1000 response bytes: ",0+$large,"\n"}
+        ')
+    printf '%s\n' "$HTTP_RESPONSE_LEADS"
+    if printf '%s\n' "$HTTP_RESPONSE_LEADS" | grep -Eq ': [1-9][0-9]*$'; then
+        status CHECK 'Selected diagnostic-path or unusual package/icon response leads found. Status and byte count do not prove exfiltration or a webshell. Review original source/time/path, intended resource and response content where retained; avoid fetching suspect endpoints.'
+    else
+        status OK 'No selected diagnostic-path or unusual package/icon response lead returned from conventional access-log records. Unknown byte sizes/custom formats are outside coverage.'
+    fi
+fi
+
+subsection 'Reconnaissance: nsepa.deb and vp_probe_nonexist'
 NSEPA_PROBES=$(zgrep -E -i -n 'nsepa[.]deb' /var/log/httpaccess* 2>/dev/null | grep -E '"[[:space:]]*206[[:space:]]+1([[:space:]]|$)' | tail -20)
 VP_PROBE_HITS=$(zgrep -E -i -n 'vp_probe_nonexist' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -20)
 if [ -n "$NSEPA_PROBES" ]; then
@@ -1938,6 +2397,7 @@ elif [ "$RECON_LOGS_FOUND" -eq 0 ]; then
 else
     status OK 'No vp_probe_nonexist marker found in available HTTP access/error logs. This is limited to retained logs and the selected format.'
 fi
+subsection 'Authentication endpoint requests and payload combinations'
 EXPLOIT_PATH_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html|/logon/LogonPoint/Authentication/GetUserName)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -40)
 if [ -n "$EXPLOIT_PATH_HITS" ]; then
     status CHECK 'Requests to endpoints observed in public honeypot/research reporting found. These are legitimate NetScaler paths; the requests alone are not IOCs. Review any logged username/body/User-Agent for shell metacharacters or payloads and correlate with auth/system logs:'
@@ -1950,6 +2410,7 @@ if [ -n "$AUTH_POISON_HTTP_HITS" ]; then
     status ACTION 'A logged exploit-path request also contains a public log-poisoning trigger or shell/download marker. Review the full request and correlate with ns.log/messages and file artifacts; this indicates an attempt, not automatically successful execution:'
     printf '%s\n' "$AUTH_POISON_HTTP_HITS"
 fi
+subsection 'VPN icon requests combined with encoded PHP markers'
 ICO_STAGE_HITS=$(zgrep -E -i -n '/vpn/media/[^[:space:]]+[.]ico[^[:cntrl:]]*PD9[A-Za-z0-9+/=]{12,}|PD9[A-Za-z0-9+/=]{12,}[^[:cntrl:]]*/vpn/media/[^[:space:]]+[.]ico' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -30)
 if [ -n "$ICO_STAGE_HITS" ]; then
     status ACTION 'HTTP log line combines a /vpn/media/*.ico request with a User-Agent-like base64 PHP prefix (PD9). Treat as a targeted exploitation lead and correlate with log injection and resulting files:'
@@ -1957,7 +2418,105 @@ if [ -n "$ICO_STAGE_HITS" ]; then
 else
     status OK 'No selected /vpn/media/*.ico plus base64-PHP (PD9...) pattern found in available HTTP logs.'
 fi
-PUBLIC_CALLBACK_HITS=$(zgrep -E -i -n 'instances[.]httpworkbench[.]com|httpworkbench[.]com|entretiensol[.]com|gsocket[.]io|31[.]56[.]197[.]72|64[.]94[.]85[.]67|139[.]180[.]152[.]138|77[.]83[.]199[.]39|104[.]248[.]244[.]66|23[.]27[.]143[.]20|62[.]133[.]62[.]80|45[.]141[.]21[.]130|199[.]233[.]217[.]13|130[.]94[.]20[.]222' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* /var/log/ns.log* /var/log/messages* 2>/dev/null | tail -40)
+subsection 'Webshell/tunneler HTTP markers and staging-path requests'
+UX_HEADER_LOG_HITS=$(zgrep -E -i -n 'HTTP_NSC_(LDAP|CLIENTTYPE)|HTTP_X_UX(_[0-9]+)?|/vpn/media/[^[:space:]]+[.]ico|/vpn/scripts/(linux|vista|mac)/[^[:space:]]+[.](sig|deb|php)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -40)
+if [ -n "$UX_HEADER_LOG_HITS" ]; then
+    status CHECK 'HTTP logs contain reported webshell/tunneler header names or VPN staging-path requests. Logs may not record request headers; correlate timestamps and inspect response status, size, duration, and corresponding error-log entries:'
+    printf '%s\n' "$UX_HEADER_LOG_HITS"
+else
+    status OK 'No selected WHIPSHOT/SLAPSHOT header names or reported VPN staging-path requests found in available HTTP logs; coverage depends on retained logs and log format.'
+fi
+PITSCALER_HTTP_HITS=$(zgrep -E -i -n 'ns-88771-poc|/vpn/media/[^[:space:]]+[.]ico|PD9[A-Za-z0-9+/=]{12,}|NSC_TASS|CsrfToken' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -40)
+if [ -n "$PITSCALER_HTTP_HITS" ]; then
+    status CHECK 'HTTP logs contain additional public-research markers (test strings, staging paths, base64-PHP prefix, or cookie names). These are triage clues; cookie names alone and ns-88771-poc can be benign/authorized tests. Do not expose cookie values; correlate method, URI, response, and timestamps with other evidence:'
+    printf '%s\n' "$PITSCALER_HTTP_HITS" | awk '
+        BEGIN { IGNORECASE=1 }
+        /ns-88771-poc/ { test++ }
+        /\/vpn\/media\/[^ ]+[.]ico/ { media++ }
+        /PD9[A-Za-z0-9+\/=]{12,}/ { payload++ }
+        /NSC_TASS/ { tass++ }
+        /CsrfToken/ { csrf++ }
+        END { printf "Matching log lines by marker (values omitted): ns-88771-poc=%d; /vpn/media/*.ico=%d; base64-PHP prefix=%d; NSC_TASS=%d; CsrfToken=%d\n", test, media, payload, tass, csrf }
+    '
+else
+    status OK 'No additional selected public-research HTTP markers found in retained HTTP logs; header/body logging and retention limit coverage.'
+fi
+
+subsection 'Bootstrap and downloader log markers'
+BOOTSTRAP_LOG_COUNTS=$(zgrep -hE '/api/v1/install/|PLATYPUS_INGRESS_CA|AGENT_TOKEN|plt_[[:alnum:]]{12,}[.]|fetch([^[:cntrl:]]{0,40})-qo[[:space:]]+/v([[:space:]]|$)|:443/t/[[:xdigit:]]{6}' \
+    /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/sh.log* /var/log/bash.log* 2>/dev/null |
+    awk '{total++; if (/\/api\/v1\/install\//) bootstrap++; if (/PLATYPUS_INGRESS_CA|AGENT_TOKEN|plt_/) token++; if (/fetch|:443\/t\//) download++} END {printf "%d %d %d %d", total, bootstrap, token, download}')
+BOOTSTRAP_TOTAL=$(printf '%s\n' "$BOOTSTRAP_LOG_COUNTS" | awk '{print $1}')
+BOOTSTRAP_ENDPOINT=$(printf '%s\n' "$BOOTSTRAP_LOG_COUNTS" | awk '{print $2}')
+BOOTSTRAP_TOKEN=$(printf '%s\n' "$BOOTSTRAP_LOG_COUNTS" | awk '{print $3}')
+BOOTSTRAP_DOWNLOAD=$(printf '%s\n' "$BOOTSTRAP_LOG_COUNTS" | awk '{print $4}')
+if [ "${BOOTSTRAP_TOTAL:-0}" -gt 0 ]; then
+    status CHECK "Bootstrap/downloader markers occur in retained logs: total=${BOOTSTRAP_TOTAL:-0}, install-endpoint=${BOOTSTRAP_ENDPOINT:-0}, token/CA=${BOOTSTRAP_TOKEN:-0}, downloader=${BOOTSTRAP_DOWNLOAD:-0}. Counts overlap. Token values and raw matching lines are withheld; review original logs locally and correlate with staged files/processes before concluding execution."
+else
+    status OK 'No selected bootstrap/downloader log marker found in readable retained candidate logs; review the general log-coverage result.'
+fi
+
+subsection 'Reported receiver/tunnel requests and exfiltration destination'
+# HTTP headers are not normally retained in common access logs. Look only in
+# existing retained text; do not claim a clean X-Cmd result if no header was seen.
+SLAP_REQUEST_HITS=$(zgrep -hE -i '[.]slap[.]receiver|receiver[.]deb|receiver[.]v2[.]min([.][[:xdigit:]]+)?[.]css|httpd[.]conf[.]slap[.]bak|/(flash/)?nsconfig/[.]slap/|/var/tmp/[.]ux/(slapshot|whipd|whippid)[.]py' \
+    /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/sh.log* /var/log/bash.log* 2>/dev/null | head -40)
+if [ -n "$SLAP_REQUEST_HITS" ]; then
+    status CHECK 'Retained logs refer to paths from the supplied sample analysis. Requests may be probes; correlate timestamps and files. A 404 response does not rule out the described webshell behavior:'
+    SLAP_REQUEST_COUNT=$(printf '%s\n' "$SLAP_REQUEST_HITS" | awk 'NF{n++} END{print n+0}')
+    printf 'Displayed sample count: %s (capped at 40); raw lines withheld to protect cookies, commands, and configuration values. Review original logs locally.\n' "$SLAP_REQUEST_COUNT"
+else
+    status OK 'No selected sample-associated receiver/tunnel path pattern found in readable retained candidate logs; this does not cover unlogged headers or removed logs.'
+fi
+SLAP_XCMD_COUNT=$(zgrep -hiE -c 'X-Cmd|HTTP_X_CMD' /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | awk '{n+=$0} END{print n+0}')
+if [ "$SLAP_XCMD_COUNT" -gt 0 ]; then
+    status CHECK "X-Cmd/HTTP_X_CMD marker found in retained logs ($SLAP_XCMD_COUNT line(s)). Values are omitted; inspect original records locally and correlate with decoded-command code, process and socket evidence."
+else
+    status CHECK 'No X-Cmd marker found in retained candidate logs. Standard access logs normally omit request headers, so this is not header-level coverage; inspect authorized captures/proxy/WAF telemetry.'
+fi
+SLAP_LOOT_CHAIN_COUNT=$(zgrep -hE -c '213[.]209[.]159[.]55:443/t/380d56/|/var/tmp/[.]s2loot|/var/tmp/[.]slap-|curl[^[:cntrl:]]*(-T|--upload-file|-X[[:space:]]*PUT|--request[[:space:]]*PUT)[^[:cntrl:]]*(nsconfig|ns_sys_backup|380d56)' \
+    /var/log/sh.log* /var/log/bash.log* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | awk '{n+=$0} END{print n+0}')
+if [ "$SLAP_LOOT_CHAIN_COUNT" -gt 0 ]; then
+    status CHECK "Reported staging/upload-chain marker found in retained logs ($SLAP_LOOT_CHAIN_COUNT line(s)). Preserve original evidence and correlate curl result, egress and staged archive; a logged command/path does not prove transfer completion. Raw values are withheld."
+else
+    status OK 'No selected staging/upload-chain marker found in readable retained shell/system logs. Removed logs and absent command auditing limit coverage.'
+fi
+SLAP_DESTINATION_COUNT=$(zgrep -hE -c '(^|[^0-9.])213[.]209[.]159[.]55([^0-9.]|$)' /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/sh.log* /var/log/bash.log* 2>/dev/null | awk '{n+=$0} END{print n+0}')
+if [ "$SLAP_DESTINATION_COUNT" -gt 0 ]; then
+    status CHECK "Sample-reported destination 213[.]209[.]159[.]55 occurs in retained logs ($SLAP_DESTINATION_COUNT line(s)). A string reference does not prove a connection/upload. Correlate with outbound firewall records for port 443 and /t/380d56/loot_ paths; payload and query values are omitted."
+else
+    status OK 'No selected sample-reported destination IP string found in readable retained candidate logs. Actual outbound transfer history requires external telemetry.'
+fi
+if command -v sockstat >/dev/null 2>&1; then
+    SLAP_CONNECTIONS=$(sockstat -4 -c 2>/dev/null | awk '$5 == "tcp4" && $7 ~ /^213[.]209[.]159[.]55:443$/ {print}')
+    if [ -n "$SLAP_CONNECTIONS" ]; then
+        status ACTION 'A current IPv4 socket points to the sample-reported destination 213[.]209[.]159[.]55:443. Preserve PID/socket evidence and investigate immediately; a connection alone does not establish what data was transferred:'
+        printf '%s\n' "$SLAP_CONNECTIONS"
+    fi
+fi
+printf '%s\n' 'Follow-up: inspect external egress records from NSIP/SNIP for configuration/key/backup transfers and internal tunneling, including /nsconfig, F1.key/F2.key, ns.conf saved copies, and /var/ns_sys_backup. Do not print archive or private-key contents. NSGW banner or HTTP 404 alone is insufficient. No active network probe is performed.'
+
+
+subsection 'Operator-reported payload delivery: pyrlnk.cc domains'
+# Domain boundaries exclude lookalikes such as evilpyrlnk.cc / pyrlnk.cc.example.
+# Count only, no attacker URLs/tokens or logged credential fields are printed.
+PYRLNK_LOG_COVERAGE=0
+for f in /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/sh.log* /var/log/bash.log* /var/log/named* /var/log/dns*; do
+    [ -f "$f" ] && [ -r "$f" ] && PYRLNK_LOG_COVERAGE=1
+done
+PYRLNK_DOMAIN_PATTERN='(^|[^[:alnum:]_.-])([[:alnum:]-]+[.])*pyrlnk[.]cc([^[:alnum:]_.-]|$)'
+PYRLNK_LOG_COUNT=$(zgrep -hiE -c "$PYRLNK_DOMAIN_PATTERN" /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/sh.log* /var/log/bash.log* /var/log/named* /var/log/dns* 2>/dev/null | awk '{n+=$0} END{print n+0}')
+if [ "$PYRLNK_LOG_COUNT" -gt 0 ]; then
+    status CHECK "Operator-reported payload-delivery domain pyrlnk[.]cc or a subdomain occurs in $PYRLNK_LOG_COUNT retained log line(s). The report is independently unverified; a logged download command is not proof of execution or transfer, and the destination is not the incoming attacker source. Preserve originals and correlate timestamps with nsaaad events, /v artifacts, DNS and outbound firewall telemetry. URL/token values are withheld."
+elif [ "$PYRLNK_LOG_COVERAGE" -eq 0 ]; then
+    status CHECK 'No readable candidate logs; pyrlnk.cc delivery-domain coverage unavailable.'
+else
+    status OK 'No pyrlnk.cc or subdomain reference found in retained candidate logs. Encoded destinations, removed records and external-only DNS/egress history are outside coverage.'
+fi
+printf '%s\n' 'Follow-up: validate the dated domain report with your security team; assess an egress block for the base domain/subdomains using approved DNS/proxy/firewall controls. Do not infer HTTPS merely from port 443. This script performs no DNS lookup, download or automatic blocking.'
+
+subsection 'Public callback destinations and DNS references'
+PUBLIC_CALLBACK_HITS=$(zgrep -E -i -n 'instances[.]httpworkbench[.]com|httpworkbench[.]com|entretiensol[.]com|gsocket[.]io|31[.]56[.]197[.]72|64[.]94[.]85[.]67|139[.]180[.]152[.]138|77[.]83[.]199[.]39|104[.]248[.]244[.]66|23[.]27[.]143[.]20|62[.]133[.]62[.]80|45[.]141[.]21[.]130|199[.]233[.]217[.]13|130[.]94[.]20[.]222' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | tail -40)
 if [ -n "$PUBLIC_CALLBACK_HITS" ]; then
     status CHECK 'References to selected public NetScaler campaign payload/callback indicators found in retained logs. IPs/domains are time-sensitive, may be reused or victim-specific, and must not be treated as a blocklist or attribution by themselves:'
     printf '%s\n' "$PUBLIC_CALLBACK_HITS"
@@ -1993,12 +2552,12 @@ elif [ "$HTTP_REQUEST_LOGS_FOUND" -eq 0 ]; then
 else
     status OK 'No selected POST/error-response plus authentication/script/package/VPN-media pattern found in available HTTP logs.'
 fi
-status CHECK 'This script does not parse every HTTP log format or calculate response size/duration. For suspected 404-based staging, compare raw access/error entries, response bytes and processing time manually.'
+printf '%s\n' 'Coverage: selected conventional access-log checks parse status and response bytes. This broader text search does not parse every log format or reconstruct response content/duration; review original records for suspected 404 staging.'
 
 subsection 'Administrative-account and EPA modification audit evidence'
 ACCESS_AUDIT_FOUND=0
 ACCESS_AUDIT_HITS=0
-for f in /var/log/ns.log* /var/log/messages* /var/log/sh.log* /var/log/bash.log* /var/log/audit.log*; do
+for f in /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/sh.log* /var/log/bash.log* /var/log/audit.log*; do
     [ -f "$f" ] && [ -r "$f" ] || continue
     ACCESS_AUDIT_FOUND=$((ACCESS_AUDIT_FOUND + 1))
     ACCESS_AUDIT_PATTERN='(add|set|rm)[[:space:]]+system[[:space:]]+user|bind[[:space:]]+system[[:space:]]+(user|group)|set[[:space:]]+authentication[[:space:]]+epaAction.*defaultEPAGroup|unbind[[:space:]]+(authentication[[:space:]]+(vserver|policylabel)|vpn[[:space:]]+vserver)|save[[:space:]]+ns[[:space:]]+config'
@@ -2082,6 +2641,11 @@ status CHECK 'Firewall, DNS, SMB/LDAP/Kerberos/RDP, traffic-volume, and internal
 section '6. Post-scan validation'
 subsection 'Purpose and follow-up'
 printf '%s\n' 'Purpose: complete vendor-supported integrity validation that this read-only helper does not perform.'
+subsection 'Firewall containment reminder: reported payload IP'
+status CHECK 'BLOCKING RECOMMENDATION: block 213.209.159.55 on upstream firewalls for inbound access to public NetScaler VIPs and outbound connections from the appliance (NSIP/SNIP, including TCP 443). Validate and document the rule with the security team; this script cannot inspect or confirm upstream firewall enforcement.'
+printf '%s\n' 'Context: the IP is a reported payload destination. The operator-provided community comment also describes it as an incoming attack source; that attribution is not independently verified here. An IP reference inside a crafted username does not identify the incoming request source.'
+printf '%s\n' 'Port 443 may carry plain HTTP in this reported activity. An IP block does not replace patching, the applicable SAML workaround or incident investigation; delivery infrastructure can change. No firewall/ADC configuration is modified by this script.'
+
 subsection 'File Integrity Monitoring'
 status CHECK 'Run the supported Citrix/NetScaler File Integrity Monitoring scan and compare results with a known-good baseline; this script does not run that scan.'
 else
@@ -2110,7 +2674,7 @@ OK_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^
 printf 'Finding-message counts: ACTION=%s, CHECK=%s, OK=%s. These counts are not a risk score.\n' "$ACTION_COUNT" "$CHECK_COUNT" "$OK_COUNT"
 if [ "$ACTION_COUNT" -gt 0 ]; then
     printf '%s\n' 'PRIORITY 1 — ACTION: preserve matching files and raw logs; record time/timezone; do not clean up or reboot before evidence is secured.'
-    printf '%s\n' 'Correlate each hit across HTTP access/error logs, ns.log/messages, file metadata, and approved change records. Escalate to incident response.'
+    printf '%s\n' 'Correlate each hit across HTTP access/error logs, ns.log/messages/notice/nsvpn, file metadata, and approved change records. Escalate to incident response.'
 else
     printf '%s\n' 'PRIORITY 1 — No selected high-priority pattern was reported. This does not exclude activity outside scanned paths, formats, or retention.'
 fi
@@ -2123,7 +2687,7 @@ printf '%s\n' 'PRIORITY 4 — Validation: run Citrix/NetScaler File Integrity Mo
 printf '\nCompleted. Plain-text report saved at: %s\n' "$OUT"
 exec 1>&3 2>&4 3>&- 4>&-
 if [ -t 1 ]; then
-    awk '{gsub(/\[OK\]/, "\033[32m[OK]\033[0m"); gsub(/\[ACTION\]/, "\033[31m[ACTION]\033[0m"); gsub(/\[CHECK\]/, "\033[93m[CHECK]\033[0m"); print}' "$OUT"
+    safe_display "$OUT" | awk '{gsub(/\[OK\]/, "\033[32m[OK]\033[0m"); gsub(/\[ACTION\]/, "\033[31m[ACTION]\033[0m"); gsub(/\[CHECK\]/, "\033[93m[CHECK]\033[0m"); print}'
 else
-    cat "$OUT"
+    safe_display "$OUT"
 fi
