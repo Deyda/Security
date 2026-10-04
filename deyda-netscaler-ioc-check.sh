@@ -2,21 +2,48 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.65
+# Version: 9.67
+#
+# GEIGER-derived additions (read-only), implementation by Patrick Wagner,
+# integrated into the Deyda checker with attribution:
+#   1. Execution traces: every injected command found in the authentication logs
+#      is correlated with the shell-audit logs (sh.log, bash.log, sh_command lines
+#      in notice.log), with other log lines naming the payload hosts, and with the
+#      files the payloads reference (metadata and SHA-256 only).
+#   2. Complete attempt summary instead of the last 40 lines: grouped by payload,
+#      first/last time, attempt count, client IPs from the same log line and
+#      time-correlated authentication requests from the HTTP access logs.
+#   3. Chronological output: multi-file matches are sorted by the timestamp inside
+#      each line (chrono_sort), so "tail" returns the newest lines. Rotated names
+#      sort as ns.log.1, ns.log.10, ns.log.2 and previously gave a random subset.
+#   4. Log coverage per family from the log content (oldest/newest entry, gaps),
+#      compared with the campaign start (GEIGER_CAMPAIGN_START) and the install marker.
+#   5. Self-exclusion by resolved script path instead of an assumed file name, so a
+#      renamed copy no longer reports itself; own shell-audit lines are not evidence.
+#   6. (GEIGER.2) SAML request workaround: on the CVE-2026-88779 fixed build missing
+#      workaround parts are reported as information instead of ACTION.
+#   7. (GEIGER.3) Execution-trace accuracy: standard configuration files (ns.conf, rc.netscaler,
+#      /etc/passwd, ...) are no payload markers; viewer commands with redirection or in-place
+#      edits (cat a>b, sed -i) count as writes; inbound requests from payload hosts are listed
+#      separately; unreadable log files turn "nothing found" into CHECK; own names match only
+#      as whole file names of at least 8 characters.
+#   The script version is printed from a single variable (SCRIPT_VERSION).
+#   Optional: GEIGER_CAMPAIGN_START=YYYY-MM-DD (default 2026-09-05).
+#
 # Sample-specific checks below additionally use the operator-supplied 380d56
 # analysis screenshot and follow-up description (2026-10-02), not independently verified. No partial hash
 # is used. Paths/ports alone are CHECK; matching behavior requires investigation.
-# New operator-reported lead (2026-10-02): pyrlnk.cc and its subdomains as
-# attempted payload delivery destinations; independently unverified, time-sensitive.
-# Changes: detect the SAML workaround by request-expression and DROP action rather
-# than policy name; verify its AAA_REQUEST bindings. Matching internal package
-# hashes now report identity matches independently of the reference build label.
+# New operator-reported lead (2026-10-02): pylrk.cc and its subdomains as
+# attempted payload delivery destinations; independently reported and time-sensitive. The earlier misspelling is not searched.
+# The SAML workaround is detected by request expression and DROP action, not policy
+# name; AAA_REQUEST bindings are checked. Exact internal package hash matches are
+# reported independent of the firmware label; GEIGER execution/log features are below.
 # Confidential vendor policy expressions are neither embedded nor printed.
 # Earlier changes: tighten real nsaaad lifecycle matching; exclude LDAP username payloads
 # and monitoring command echoes; bound reboot keywords to avoid powerbi noise.
 # Explicit upstream firewall blocking reminder for 213.209.159.55;
 # exclude authentication payload text from nsaaad crash classification;
-# broaden restart-limit patterns and add bounded pyrlnk.cc log counts;
+# broaden restart-limit patterns and add bounded pylrk.cc log counts;
 # align result groups with their own headings; initialize install marker
 # before core checks; deduplicate CVE messages and baseline context; saved SAML
 # configurations; authentication-service crash triage; SAML workaround inventory;
@@ -108,6 +135,13 @@
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 export PATH
 umask 077
+SCRIPT_VERSION='9.67'
+# GEIGER: identify this script by its resolved path, not by an assumed file name.
+GEIGER_SELF_PATH=$(realpath "$0" 2>/dev/null)
+[ -n "$GEIGER_SELF_PATH" ] || GEIGER_SELF_PATH=$(cd "$(dirname "$0")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename "$0")")
+GEIGER_SELF_BASE=${GEIGER_SELF_PATH##*/}
+GEIGER_CAMPAIGN_START=${GEIGER_CAMPAIGN_START:-2026-09-05}
+GEIGER_LOG_DIR=/var/log
 HOST=$(hostname 2>/dev/null || echo unknown-host)
 NOW=$(date '+%Y-%m-%d_%H%M%S' 2>/dev/null || echo unknown-time)
 OUT="/var/tmp/deyda-netscaler-ioc-check_${HOST}_${NOW}.txt"
@@ -248,6 +282,1146 @@ format_duration() {
     fi
 }
 
+# GEIGER: sort grep/zgrep matches by the timestamp inside each line. Rotated file
+# names sort as ns.log.1, ns.log.10, ns.log.2, so "tail" alone does not return the
+# newest lines. Without perl the input order is kept.
+GEIGER_CHRONO_PL='
+use strict;
+use warnings;
+use POSIX qw(mktime floor);
+# Embedded in a single-quoted shell string: never use an apostrophe here.
+# Sorts grep/zgrep output by the timestamp inside each line. Accepts plain lines
+# and "path:" or "path:lineno:" prefixes. Lines without a timestamp keep their
+# order and come first, so "tail" still returns the newest dated lines.
+my %MONTH = (Jan => 0, Feb => 1, Mar => 2, Apr => 3, May => 4, Jun => 5,
+             Jul => 6, Aug => 7, Sep => 8, Oct => 9, Nov => 10, Dec => 11);
+my $now = time;
+my (%anchor, @rows);
+my $sequence = 0;
+while (my $line = <STDIN>) {
+    $line =~ s/\r?\n\z//;
+    my ($path, $content) = (undef, $line);
+    if ($line =~ m{^(/[^:\s]*):(.*)\z}s) {
+        ($path, $content) = ($1, $2);
+        $content =~ s/^\d+://;
+    }
+    push @rows, [stamp($content, $path), $sequence++, $line];
+}
+print map { "$_->[2]\n" } sort { $a->[0] <=> $b->[0] || $a->[1] <=> $b->[1] } @rows;
+
+sub stamp {
+    my ($text, $path) = @_;
+    if ($text =~ /^([A-Z][a-z]{2})\s{1,2}(\d{1,2})\s(\d{2}):(\d{2}):(\d{2})\s/) {
+        my $mon = $MONTH{$1};
+        return -1 unless defined $mon;
+        # Syslog has no year: anchor on the file mtime (or now) and step back a year if needed.
+        my $ref = $now;
+        if (defined $path) {
+            $anchor{$path} = (stat $path)[9] unless exists $anchor{$path};
+            $ref = $anchor{$path} if defined $anchor{$path};
+        }
+        my $year = (localtime $ref)[5];
+        my $t = mktime($5, $4, $3, $2, $mon, $year, 0, 0, -1);
+        $t = mktime($5, $4, $3, $2, $mon, $year - 1, 0, 0, -1) if defined $t && $t > $ref + 2 * 86400;
+        return defined $t ? $t : -1;
+    }
+    if ($text =~ m{\[(\d{2})/([A-Z][a-z]{2})/(\d{4}):(\d{2}):(\d{2}):(\d{2})\s([+-])(\d{2})(\d{2})\]}) {
+        my $mon = $MONTH{$2};
+        return -1 unless defined $mon;
+        my ($y, $m, $d) = ($3, $mon + 1, $1);
+        $y -= 1 if $m <= 2;
+        my $era  = floor($y / 400);
+        my $yoe  = $y - $era * 400;
+        my $doy  = int((153 * ($m > 2 ? $m - 3 : $m + 9) + 2) / 5) + $d - 1;
+        my $days = $era * 146097 + $yoe * 365 + int($yoe / 4) - int($yoe / 100) + $doy - 719468;
+        return $days * 86400 + $4 * 3600 + $5 * 60 + $6 - ($8 * 3600 + $9 * 60) * ($7 eq "-" ? -1 : 1);
+    }
+    if ($text =~ /^\[[A-Z][a-z]{2}\s([A-Z][a-z]{2})\s{1,2}(\d{1,2})\s(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\s(\d{4})\]/) {
+        my $mon = $MONTH{$1};
+        return -1 unless defined $mon;
+        my $t = mktime($5, $4, $3, $2, $mon, $6 - 1900, 0, 0, -1);
+        return defined $t ? $t : -1;
+    }
+    return -1;
+}
+'
+chrono_sort() {
+    if command -v perl >/dev/null 2>&1; then
+        perl -e "$GEIGER_CHRONO_PL"
+    else
+        cat
+    fi
+}
+
+# GEIGER: read-only log analysis for points 1, 2 and 4 (attempt summary, source IPs,
+# execution traces, per-family coverage). The embedded program opens logs read-only,
+# starts gzip/sha256 only via list-form exec with fixed arguments and never evaluates
+# log content. Argument 1: coverage | injection.
+GEIGER_ANALYSIS_PL='
+use strict;
+use warnings;
+use POSIX qw(strftime mktime floor);
+
+# Embedded in deyda-netscaler-ioc-check.sh inside a single-quoted shell
+# string: this program must never contain an apostrophe character.
+# Arguments: mode logdir campaign-date install-epoch boot-epoch self-path report-path
+my ($MODE, $LOGDIR, $CAMPAIGN_TEXT, $INSTALL_ARG, $BOOT_ARG, $SELF_PATH, $REPORT_PATH) = @ARGV;
+$MODE        = "" unless defined $MODE;
+$LOGDIR      = "/var/log" unless defined $LOGDIR && length $LOGDIR;
+$SELF_PATH   = "" unless defined $SELF_PATH;
+$REPORT_PATH = "" unless defined $REPORT_PATH;
+my $INSTALL_EPOCH = defined $INSTALL_ARG && $INSTALL_ARG =~ /^\d+\z/ ? $INSTALL_ARG : undef;
+my $BOOT_EPOCH    = defined $BOOT_ARG    && $BOOT_ARG    =~ /^\d+\z/ ? $BOOT_ARG    : undef;
+eval { setpriority(0, 0, 10); 1 };    # lower our own CPU priority; failure is harmless
+
+my $CORRELATION_WINDOW = 5;            # seconds around an attempt for source-IP correlation
+my $GAP_THRESHOLD      = 24 * 3600;    # coverage gaps longer than this are reported
+my $MAX_LINE_BYTES     = 16384;        # longer log lines are truncated before matching
+my $MAX_HASH_BYTES     = 16 * 1024 * 1024;
+my $MAX_GROUPS         = 500;          # distinct payloads kept in memory
+my $MAX_FINDING_KEYS   = 2000;         # distinct lines kept per finding bucket
+my $MAX_CORRELATED     = 50000;        # HTTP requests kept for correlation
+my $MAX_IP_KEYS        = 100000;
+my $MAX_LIST           = 40;           # lines shown per finding
+my $MAX_TIMELINE       = 60;           # minute rows shown in the timeline
+
+my %MONTH = (Jan => 0, Feb => 1, Mar => 2, Apr => 3, May => 4, Jun => 5,
+             Jul => 6, Aug => 7, Sep => 8, Oct => 9, Nov => 10, Dec => 11);
+my %FAMILY_KIND = (
+    "ns.log" => "syslog", "nsvpn.log" => "syslog", "messages" => "syslog", "notice.log" => "syslog",
+    "auth.log" => "syslog", "sh.log" => "syslog", "bash.log" => "syslog",
+    "httpaccess.log" => "access", "httpaccess-vpn.log" => "access",
+    "httperror.log" => "error", "httperror-vpn.log" => "error",
+);
+my @FAMILY_ORDER       = qw(ns.log nsvpn.log messages notice.log auth.log sh.log bash.log
+                            httpaccess.log httpaccess-vpn.log httperror.log httperror-vpn.log);
+my @ATTEMPT_FAMILIES   = qw(ns.log nsvpn.log messages notice.log auth.log httperror.log httperror-vpn.log);
+my @ACCESS_FAMILIES    = qw(httpaccess.log httpaccess-vpn.log);
+my @SHELL_FAMILIES     = qw(sh.log bash.log);
+my @REFERENCE_FAMILIES = qw(ns.log nsvpn.log messages notice.log auth.log httperror.log httperror-vpn.log);
+
+# The injected value follows the pitboss text; a shell separator must come next.
+my $TRIGGER_RE      = qr/pitboss\s+PPE\s+(?:missed\s+too\s+many\s+heartbeats|unexpectedly\s+died)\s*NSPPE(?:-\d+)?/i;
+my $INJECT_START_RE = qr/^\s*(?:[;|&\x60]|\$\(|\$\{?IFS|%0a|%3b|%60|%7c|%26)/i;
+my $AUTH_PATH_RE    = qr{^/(?:nf/auth/|p/u/|cgi/(?:login|samlauth|authenticate)|saml/|oauth/|logon/LogonPoint/Authentication/)}i;
+my $IPV4_RE         = qr/\d{1,3}(?:\.\d{1,3}){3}/;
+
+# Read/search commands: a payload string in them is analysis, not execution.
+my %VIEWER_WORDS = map { $_ => 1 } qw(
+    grep egrep fgrep zgrep zegrep zfgrep bzgrep xzgrep rg ag ack less more most cat zcat bzcat xzcat
+    head tail view vi vim nano ee ls file stat strings hexdump xxd od wc sort uniq cut awk nawk gawk
+    sed find locate sha256 sha256sum md5 md5sum diff cmp nsconmsg
+);
+# Commands that can download, run or write; with a payload string they indicate execution.
+my %ACTION_WORDS = map { $_ => 1 } qw(
+    fetch curl wget ftp tftp nc ncat socat sh bash ksh csh tcsh zsh perl python python2 python3 php
+    ruby chmod chown chgrp cp mv rm tar gzip gunzip id whoami uname touch mkdir ln openssl base64
+    expr kill pkill nohup ssh scp echo printf dd tee
+);
+# Report helpers of this script: their logged command lines are our own output.
+my %OWN_OUTPUT_WORDS = map { $_ => 1 } qw(status section subsection progress);
+
+my $SELF_BASE   = basename_of($SELF_PATH);
+my $REPORT_BASE = basename_of($REPORT_PATH);
+# Own names count only as whole file names of at least 8 characters, so a short or
+# generic script name cannot hide unrelated shell-audit lines.
+my $OWN_RE      = join "|", "GEIGER_",
+                  map { "(?<![A-Za-z0-9._-])" . quotemeta($_) . "(?![A-Za-z0-9._-])" }
+                  grep { length >= 8 } ($SELF_BASE, $REPORT_BASE);
+my $TOOL_RE     = "deyda-netscaler-ioc-check|netscaler-ioc-check";
+
+my $GZIP        = find_tool("gzip");
+my $SHA256      = find_tool("sha256");
+my $SHA256SUM   = find_tool("sha256sum");
+my $HAVE_DIGEST = eval { require Digest::SHA; 1 } ? 1 : 0;
+
+my $CAMPAIGN_EPOCH = parse_local_date($CAMPAIGN_TEXT);
+
+my (%FILES, @SKIPPED);
+discover_files();
+
+if ($MODE eq "coverage") {
+    for my $family (@FAMILY_ORDER) {
+        read_log($_, undef, 1) for @{ $FILES{$family} || [] };
+    }
+    report_coverage();
+    exit 0;
+}
+if ($MODE ne "injection") {
+    status("CHECK", "GEIGER analysis was called with an unknown mode; nothing was evaluated.");
+    exit 0;
+}
+
+# ---------------------------------------------------------------- pass 1: attempts and events
+
+my (%GROUPS, %ATTEMPT_SECONDS, %NSAAAD_EVENTS, %REBOOT_EVENTS, %AUTH_REQUESTS_BY_IP, @CORRELATED);
+my ($GROUP_OVERFLOW, $CORRELATED_OVERFLOW) = (0, 0);
+for my $family (@ATTEMPT_FAMILIES) {
+    for my $file (@{ $FILES{$family} || [] }) {
+        read_log($file, sub { scan_attempt_line($file, @_) }, 1);
+    }
+}
+# Access logs after the syslog families: attempt times are known by then.
+for my $family (@ACCESS_FAMILIES) {
+    for my $file (@{ $FILES{$family} || [] }) {
+        read_log($file, sub { scan_access_line($file, @_) }, 1);
+    }
+}
+
+my @GROUP_LIST = sort {
+    (defined $a->{first} ? 0 : 1) <=> (defined $b->{first} ? 0 : 1)
+        || ($a->{first} || 0) <=> ($b->{first} || 0)
+        || $b->{lines} <=> $a->{lines}
+} values %GROUPS;
+my $group_number = 0;
+for my $group (@GROUP_LIST) {
+    $group->{id}     = "G" . ++$group_number;
+    $group->{order}  = $group_number;
+    $group->{tokens} = payload_tokens($group->{norm});
+}
+my %GROUP_ORDER = map { $_->{id} => $_->{order} } @GROUP_LIST;
+
+# Search rules for payload hosts, URL path segments and file paths.
+my (@TOKEN_RULES, @REFERENCE_RULES, %PATH_REFERENCES, %GROUP_WORDS);
+for my $group (@GROUP_LIST) {
+    my $tokens = $group->{tokens};
+    $GROUP_WORDS{ $group->{id} } = { map { $_ => 1 } command_words($group->{norm}) };
+    for my $path (@{ $tokens->{paths} }) {
+        next if generic_path($path);
+        push @TOKEN_RULES, { group => $group->{id}, token => $path,
+                             re => qr/(?<![A-Za-z0-9._\/~-])\Q$path\E(?![A-Za-z0-9._\/-])/ };
+        my $ref = $PATH_REFERENCES{$path} ||= { first => undef, groups => {}, mode => undef };
+        $ref->{groups}{ $group->{id} } = 1;
+        $ref->{first} = $group->{first}
+            if defined $group->{first} && (!defined $ref->{first} || $group->{first} < $ref->{first});
+        $ref->{mode} = $tokens->{modes}{$path} if defined $tokens->{modes}{$path};
+    }
+    for my $token (@{ $tokens->{hosts} }, @{ $tokens->{segments} }) {
+        next if length $token < 4 || $token =~ /^localhost(?::\d+)?\z/i;
+        my $rule = { group => $group->{id}, token => $token,
+                     re => qr/(?<![A-Za-z0-9.-])\Q$token\E(?![A-Za-z0-9-])/ };
+        push @TOKEN_RULES, $rule;
+        push @REFERENCE_RULES, $rule;
+    }
+}
+my $ANY_TOKEN_RE     = combine_rules(@TOKEN_RULES);
+my $ANY_REFERENCE_RE = combine_rules(@REFERENCE_RULES);
+
+# ---------------------------------------------------------------- pass 2: shell audit
+
+my %FINDINGS;
+my %SHELL_STATS = (lines => 0, own => 0, tool => 0);
+for my $family (@SHELL_FAMILIES) {
+    for my $file (@{ $FILES{$family} || [] }) {
+        read_log($file, sub { scan_shell_line($file, @_) }, 1);
+    }
+}
+for my $file (@{ $FILES{"notice.log"} || [] }) {
+    read_log($file, sub { scan_shell_line($file, @_) }, 0) unless $file->{error};
+}
+
+# ---------------------------------------------------------------- pass 3: other lines naming payload hosts
+
+if ($ANY_REFERENCE_RE) {
+    for my $family (@REFERENCE_FAMILIES) {
+        for my $file (@{ $FILES{$family} || [] }) {
+            read_log($file, sub { scan_reference_line($file, @_) }, 0) unless $file->{error};
+        }
+    }
+}
+
+my @SHELL_INTERVALS = shell_intervals();
+# Files that could not be read completely make every "nothing found" result incomplete.
+my @READ_ERRORS  = grep { $_->{error} } map { @{ $FILES{$_} || [] } } @FAMILY_ORDER;
+my $SHELL_ERRORS = grep { $_->{family} =~ /^(?:sh\.log|bash\.log|notice\.log)\z/ } @READ_ERRORS;
+my @ALL_SECONDS     = sort { $a <=> $b } keys %ATTEMPT_SECONDS;
+report_attempts();
+my @CANDIDATES = correlate_sources();
+report_sources();
+report_execution();
+report_chronology();
+exit 0;
+
+# ================================================================= reports
+
+sub report_coverage {
+    heading("GEIGER: per-family log coverage from log content");
+    out("Oldest and newest entries are read from the log lines; file modification times are not used.",
+        sprintf("Reference points: campaign start %s (GEIGER_CAMPAIGN_START); install marker %s.",
+                defined $CAMPAIGN_EPOCH ? fmt_time($CAMPAIGN_EPOCH) : "invalid date",
+                defined $INSTALL_EPOCH ? fmt_time($INSTALL_EPOCH) : "unknown"),
+        "",
+        sprintf("%-19s %5s %-19s %-19s %4s  %-8s %-8s", "family", "files", "oldest entry", "newest entry",
+                "gaps", "campaign", "install"));
+    my (@not_campaign, @not_install, @gap_lines, @errors);
+    for my $family (@FAMILY_ORDER) {
+        next unless $FILES{$family};
+        my $cov = family_coverage($family);
+        my $campaign = !defined $cov->{oldest} || !defined $CAMPAIGN_EPOCH ? "n/a"
+                     : $cov->{oldest} <= $CAMPAIGN_EPOCH ? "yes" : "NO";
+        my $install  = !defined $cov->{oldest} || !defined $INSTALL_EPOCH ? "n/a"
+                     : $cov->{oldest} <= $INSTALL_EPOCH ? "yes" : "NO";
+        out(sprintf("%-19s %5d %-19s %-19s %4d  %-8s %-8s", $family, $cov->{files}, fmt_time($cov->{oldest}),
+                    fmt_time($cov->{newest}), scalar @{ $cov->{gaps} }, $campaign, $install));
+        push @not_campaign, $family if $campaign eq "NO";
+        push @not_install,  $family if $install eq "NO";
+        push @gap_lines, map { sprintf "  %s: no entries from %s to %s", $family, fmt_time($_->[0]), fmt_time($_->[1]) }
+                             @{ $cov->{gaps} };
+        push @errors, map { sprintf "  %s: %s", show($_->{path}), $_->{error} } grep { $_->{error} } @{ $FILES{$family} };
+    }
+    out("", "Families without any file: " . (join(", ", grep { !$FILES{$_} } @FAMILY_ORDER) || "none"));
+    if (!%FILES) {
+        status("CHECK", "No supported log file was found in " . show($LOGDIR) . "; local log coverage is unavailable.");
+        return;
+    }
+    if (@not_campaign) {
+        status("CHECK", "These log families do not reach back to the campaign start, so local logs cannot rule out "
+            . "earlier attempts or execution: " . join(", ", @not_campaign) . ". Use remote syslog/SIEM for the missing period.");
+    } elsif (defined $CAMPAIGN_EPOCH) {
+        status("OK", "All present log families reach back to the campaign start.");
+    }
+    status("CHECK", "Not covering the install marker: " . join(", ", @not_install)
+        . ". The pre-update exposure window is not visible in these families.") if @not_install;
+    if (@gap_lines) {
+        status("CHECK", sprintf("Coverage gaps longer than %d hours (no entries; rotation, downtime or deletion):",
+                                $GAP_THRESHOLD / 3600));
+        out(limit_list(\@gap_lines, $MAX_LIST));
+    }
+    if (@errors) {
+        status("CHECK", "Some log files could not be read completely:");
+        out(@errors);
+    }
+    if (@SKIPPED) {
+        status("CHECK", "Skipped files (not regular or unsupported compression):");
+        out(map { "  " . show($_) } @SKIPPED);
+    }
+}
+
+sub report_attempts {
+    heading("GEIGER: injection attempts, complete and grouped by payload");
+    if (@READ_ERRORS) {
+        status("CHECK", scalar(@READ_ERRORS) . " log file(s) could not be read completely. All GEIGER results below "
+            . "are incomplete for these files; rerun the script and keep the files for offline analysis:");
+        out(map { "  " . show($_->{path}) . ": " . show($_->{error}) } @READ_ERRORS);
+    }
+    out("Every matching line is counted. Attempt seconds = distinct seconds per payload, because one attempt is",
+        "logged several times (nsaaad, RADIUS/LDAP, AAA). Payloads are shown as inert, defanged text.");
+    if (!@GROUP_LIST) {
+        status("OK", "No line with the pitboss/NSPPE trigger followed by a shell separator was found in the retained "
+            . "logs. The per-family coverage above limits this result.");
+        return;
+    }
+    my $lines = 0;
+    $lines += $_->{lines} for @GROUP_LIST;
+    status("ACTION", sprintf("%d payload variant(s), %d matching line(s), %d attempt second(s) between %s and %s. "
+        . "Each variant is listed below; execution is assessed in the execution-trace check.",
+        scalar @GROUP_LIST, $lines, scalar @ALL_SECONDS, fmt_time($ALL_SECONDS[0]), fmt_time($ALL_SECONDS[-1])));
+    for my $group (@GROUP_LIST) {
+        my $tokens  = $group->{tokens};
+        my @seconds = keys %{ $group->{seconds} };
+        my $inside  = grep { in_intervals($_, \@SHELL_INTERVALS) } @seconds;
+        out("", sprintf("%s  first %s  last %s", $group->{id}, fmt_time($group->{first}), fmt_time($group->{last})),
+            sprintf("    matching lines: %d   attempt seconds: %d   lines without timestamp: %d",
+                    $group->{lines}, scalar @seconds, $group->{unparsed}),
+            "    log families: " . join(", ", map { "$_=$group->{families}{$_}" } sort keys %{ $group->{families} }),
+            "    payload:      " . show($group->{raw}, 300),
+            "    normalized:   " . show($group->{norm}, 300));
+        out("    hosts:        " . join(", ", map { show_host($_) } @{ $tokens->{hosts} })) if @{ $tokens->{hosts} };
+        out("    paths:        " . join(", ", map { show($_) } @{ $tokens->{paths} })) if @{ $tokens->{paths} };
+        out("    client IPs in the same line: " . count_list($group->{clients})) if %{ $group->{clients} };
+        out("    vServer IPs:  " . count_list($group->{vservers})) if %{ $group->{vservers} };
+        out(sprintf("    shell-audit coverage: %d of %d attempt second(s) inside sh.log/bash.log coverage",
+                    $inside, scalar @seconds));
+    }
+    status("CHECK", "$GROUP_OVERFLOW further line(s) with new payloads were not grouped (limit $MAX_GROUPS).")
+        if $GROUP_OVERFLOW;
+    my %external;
+    for my $group (@GROUP_LIST) {
+        $external{$_} = 1 for grep { external_host($_) } @{ $group->{tokens}{hosts} };
+    }
+    out("", "External hosts named in payloads (defanged): " . (join(", ", map { show_host($_) } sort keys %external) || "none"));
+}
+
+sub report_sources {
+    heading("GEIGER: source IPs of the attempts");
+    if (!@GROUP_LIST) { out("No attempts, nothing to correlate."); return }
+    my %direct;
+    for my $group (@GROUP_LIST) {
+        for my $ip (keys %{ $group->{clients} }) {
+            $direct{$ip}{count} += $group->{clients}{$ip};
+            $direct{$ip}{groups}{ $group->{id} } = 1;
+        }
+    }
+    if (%direct) {
+        status("CHECK", "Client IPs logged in the same line as an attempt (AAA/HTTP records). The last Client_ip field "
+            . "of a line is used, because the user name itself is attacker-controlled:");
+        out(map { sprintf "  %-22s lines=%-6d payloads=%s", show($_), $direct{$_}{count},
+                      join(",", sort { $GROUP_ORDER{$a} <=> $GROUP_ORDER{$b} } keys %{ $direct{$_}{groups} }) }
+            sort { $direct{$b}{count} <=> $direct{$a}{count} || $a cmp $b } keys %direct);
+    }
+    if (@CANDIDATES) {
+        status("CHECK", sprintf("Time-correlated candidates: authentication requests in the HTTP access logs within "
+            . "+/-%d s of an attempt. Correlation, not proof: legitimate users can sign in at the same time. An "
+            . "address that matches many attempt seconds is a strong candidate.", $CORRELATION_WINDOW));
+        out(sprintf("  %-22s %-24s %s", "address", "matched attempt seconds", "auth requests in logs"));
+        my $last = $#CANDIDATES < 14 ? $#CANDIDATES : 14;
+        out(map { sprintf "  %-22s %-24s %d", show($_->[0]), "$_->[1] of " . scalar(@ALL_SECONDS), $_->[2] }
+            @CANDIDATES[0 .. $last]);
+        status("CHECK", "Correlation input was truncated at $MAX_CORRELATED requests.") if $CORRELATED_OVERFLOW;
+    }
+    if (!%direct && !@CANDIDATES) {
+        status("CHECK", "No source IP could be determined from local logs (no Client_ip field and no authentication "
+            . "request near the attempt times). Check firewall, WAF or NetScaler Console records.");
+    }
+}
+
+sub report_execution {
+    heading("GEIGER: execution traces of the injected commands");
+    out(sprintf("Shell-audit lines analysed: %d (own runs excluded: %d; other triage tools excluded: %d).",
+                $SHELL_STATS{lines}, $SHELL_STATS{own}, $SHELL_STATS{tool}),
+        "Shell-audit coverage: " . (@SHELL_INTERVALS
+            ? join("; ", map { fmt_time($_->[0]) . " to " . fmt_time($_->[1]) } @SHELL_INTERVALS) : "none"));
+    my $trace = 0;
+    if (findings("trigger")) {
+        $trace = 1;
+        status("ACTION", "A shell command contains the injection trigger itself: the injected user name reached a "
+            . "shell. Treat the appliance as compromised and preserve evidence:");
+        out(finding_lines("trigger"));
+    }
+    if (findings("token")) {
+        $trace = 1;
+        status("ACTION", "Shell commands run a download/exec/write command together with hosts, URL segments or "
+            . "paths from the payloads (matched tokens in brackets). Verify each line and preserve evidence:");
+        out(finding_lines("token"));
+    }
+    if (findings("mention")) {
+        status("CHECK", "Shell commands mention payload hosts or paths without a matching command word. Review them:");
+        out(finding_lines("mention"));
+    }
+    if (findings("viewer")) {
+        out("", "Note: payload strings also appear in read/search commands (grep, cat, ...). These are typically an "
+            . "administrator investigating and are not counted as execution:");
+        out(finding_lines("viewer"));
+    }
+    if (!$trace) {
+        if (!@SHELL_INTERVALS) {
+            status("CHECK", "No shell-audit log was readable; execution cannot be assessed with local logs.");
+        } elsif (@GROUP_LIST) {
+            my $outside = grep { !in_intervals($_, \@SHELL_INTERVALS) } @ALL_SECONDS;
+            status($SHELL_ERRORS ? "CHECK" : "OK",
+                sprintf("No trigger text and no payload command in %d shell-audit line(s).", $SHELL_STATS{lines})
+                . ($SHELL_ERRORS ? " Incomplete: $SHELL_ERRORS shell-audit file(s) could not be read (see above)." : ""));
+            status("CHECK", sprintf("%d of %d attempt second(s) lie outside the shell-audit coverage and cannot be "
+                . "assessed with local logs.", $outside, scalar @ALL_SECONDS)) if $outside;
+        } else {
+            status($SHELL_ERRORS ? "CHECK" : "OK", "No trigger text in the shell-audit logs."
+                . ($SHELL_ERRORS ? " Incomplete: $SHELL_ERRORS shell-audit file(s) could not be read (see above)." : ""));
+        }
+    }
+    out("", "Download/exec patterns in shell-audit logs, independent of the attempts (catches payloads whose",
+        "authentication lines have rotated away; local and private URLs are ignored):");
+    if (findings("generic")) {
+        status("CHECK", "Shell commands with a download from an external URL, a pipe into an interpreter, /dev/tcp or "
+            . "Base64 decoding. Compare with known administration and NetScaler scripts:");
+        out(finding_lines("generic"));
+    } elsif (@SHELL_INTERVALS) {
+        status($SHELL_ERRORS ? "CHECK" : "OK", "No such pattern in the shell-audit logs."
+            . ($SHELL_ERRORS ? " Incomplete: $SHELL_ERRORS shell-audit file(s) could not be read (see above)." : ""));
+    }
+    if ($ANY_REFERENCE_RE) {
+        if (findings("inbound")) {
+            status("CHECK", "Inbound requests from payload hosts (AAA logins, AppFW blocks and their SNMP traps), "
+                . "counted by event type. They confirm the attacker source and are not execution traces:");
+            out(finding_lines("inbound"));
+        }
+        if (findings("reference")) {
+            status("CHECK", "Other log lines mention a payload host outside the injected user names (for example "
+                . "fetch/curl errors, DNS or connection messages). Review them:");
+            out(finding_lines("reference"));
+        } else {
+            status(@READ_ERRORS ? "CHECK" : "OK", "No log line outside the injected user names and inbound requests "
+                . "mentions a payload host (no fetch/curl error, DNS or connection message)."
+                . (@READ_ERRORS ? " Incomplete: some log files could not be read (see above)." : ""));
+        }
+    }
+    if (%PATH_REFERENCES) {
+        out("", "Files named in the payloads (metadata only, contents are never printed). The ADC root filesystem and",
+            "/netscaler are rebuilt at boot, so a missing file there says nothing about the time before the last",
+            "boot. /var, /flash and /nsconfig persist.");
+        check_artifacts();
+    }
+}
+
+sub report_chronology {
+    heading("GEIGER: attempts, nsaaad deaths and pitboss reboots in time order");
+    my (%day, %minute);
+    for my $group (@GROUP_LIST) {
+        for my $t (keys %{ $group->{seconds} }) {
+            $day{ fmt_day($t) }{attempts}++;
+            $minute{ $t - $t % 60 }{attempts}{ $group->{id} }++;
+        }
+    }
+    for my $t (values %NSAAAD_EVENTS) { $day{ fmt_day($t) }{nsaaad}++; $minute{ $t - $t % 60 }{nsaaad}++ }
+    for my $t (keys %REBOOT_EVENTS)   { $day{ fmt_day($t) }{reboot}++; $minute{ $t - $t % 60 }{reboot}++ }
+    if (!%day) {
+        out("No attempts, nsaaad deaths or pitboss reboots in the retained logs.");
+        return;
+    }
+    out("Sorted by parsed timestamp and deduplicated across log families.", "",
+        sprintf("%-10s %9s %14s %8s", "date", "attempts", "nsaaad deaths", "reboots"));
+    out(map { sprintf "%-10s %9d %14d %8d", $_, $day{$_}{attempts} || 0, $day{$_}{nsaaad} || 0, $day{$_}{reboot} || 0 }
+        sort keys %day);
+    my @rows;
+    for my $start (sort { $a <=> $b } keys %minute) {
+        my $m = $minute{$start};
+        my @parts;
+        push @parts, "attempts " . join(" ", map { "$_=$m->{attempts}{$_}" }
+                                        sort { $GROUP_ORDER{$a} <=> $GROUP_ORDER{$b} } keys %{ $m->{attempts} })
+            if $m->{attempts};
+        push @parts, "nsaaad died=$m->{nsaaad}" if $m->{nsaaad};
+        push @parts, "REBOOT=$m->{reboot}"      if $m->{reboot};
+        push @rows, "  " . strftime("%Y-%m-%d %H:%M", localtime $start) . "  " . join("; ", @parts);
+    }
+    out("", "Per minute:", limit_list(\@rows, $MAX_TIMELINE));
+    status("CHECK", sprintf("%d reboot(s) initiated by pitboss after monitored processes exited. Repeated nsaaad deaths "
+        . "right after attempts indicate a denial-of-service effect; correlate with service outages.",
+        scalar keys %REBOOT_EVENTS)) if %REBOOT_EVENTS;
+}
+
+# ================================================================= helpers
+
+sub out     { print map { "$_\n" } @_ }
+sub heading { print "\n--- $_[0] ---\n" }
+sub status  { print "\n[$_[0]] $_[1]\n" }
+
+sub find_tool {
+    my ($name) = @_;
+    for my $dir (split /:/, defined $ENV{PATH} ? $ENV{PATH} : "") {
+        my $path = "$dir/$name";
+        return $path if -f $path && -x _;
+    }
+    return undef;
+}
+
+sub basename_of { my ($path) = @_; $path =~ s{.*/}{}; return $path }
+
+sub parse_local_date {
+    my ($text) = @_;
+    return undef unless defined $text && $text =~ /^(\d{4})-(\d{2})-(\d{2})\z/;
+    return undef if $2 < 1 || $2 > 12 || $3 < 1 || $3 > 31;
+    return mktime(0, 0, 0, $3, $2 - 1, $1 - 1900, 0, 0, -1);
+}
+
+sub days_from_civil {
+    my ($y, $m, $d) = @_;
+    $y -= 1 if $m <= 2;
+    my $era = floor($y / 400);
+    my $yoe = $y - $era * 400;
+    my $doy = int((153 * ($m > 2 ? $m - 3 : $m + 9) + 2) / 5) + $d - 1;
+    my $doe = $yoe * 365 + int($yoe / 4) - int($yoe / 100) + $doy;
+    return $era * 146097 + $doe - 719468;
+}
+
+# Syslog lines carry no year: use the year of the file mtime and step back one
+# year if the result would lie after that mtime.
+sub make_syslog_parser {
+    my ($anchor) = @_;
+    my %cache;
+    return sub {
+        my ($line) = @_;
+        return undef unless $line =~ /^([A-Z][a-z]{2})\s{1,2}(\d{1,2})\s(\d{2}):(\d{2}):(\d{2})\s/;
+        my $mon = $MONTH{$1};
+        return undef unless defined $mon;
+        my ($mday, $hh, $mm, $ss) = ($2, $3, $4, $5);
+        my $key = "$mon/$mday/$hh";
+        if (!exists $cache{$key}) {
+            my $year = (localtime $anchor)[5];
+            my $base = mktime(0, 0, $hh, $mday, $mon, $year, 0, 0, -1);
+            $base = mktime(0, 0, $hh, $mday, $mon, $year - 1, 0, 0, -1)
+                if defined $base && $base > $anchor + 2 * 86400;
+            $cache{$key} = $base;
+        }
+        return defined $cache{$key} ? $cache{$key} + $mm * 60 + $ss : undef;
+    };
+}
+
+sub parse_access_time {
+    my ($line) = @_;
+    return undef unless $line =~ m{\[(\d{2})/([A-Z][a-z]{2})/(\d{4}):(\d{2}):(\d{2}):(\d{2})\s([+-])(\d{2})(\d{2})\]};
+    my $mon = $MONTH{$2};
+    return undef unless defined $mon;
+    my $offset = ($8 * 3600 + $9 * 60) * ($7 eq "-" ? -1 : 1);
+    return days_from_civil($3, $mon + 1, $1) * 86400 + $4 * 3600 + $5 * 60 + $6 - $offset;
+}
+
+sub parse_error_time {
+    my ($line) = @_;
+    return undef unless $line =~ /^\[[A-Z][a-z]{2}\s([A-Z][a-z]{2})\s{1,2}(\d{1,2})\s(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\s(\d{4})\]/;
+    my $mon = $MONTH{$1};
+    return undef unless defined $mon;
+    return mktime($5, $4, $3, $2, $mon, $6 - 1900, 0, 0, -1);
+}
+
+sub fmt_time { my ($t) = @_; return defined $t ? strftime("%Y-%m-%d %H:%M:%S", localtime $t) : "n/a" }
+sub fmt_day  { my ($t) = @_; return strftime("%Y-%m-%d", localtime $t) }
+
+sub discover_files {
+    opendir(my $dh, $LOGDIR) or return;
+    for my $name (sort readdir $dh) {
+        for my $family (@FAMILY_ORDER) {
+            next unless $name =~ /^\Q$family\E(?:\.(\d+))?(\.gz|\.bz2|\.xz|\.zst)?\z/;
+            my ($index, $compression) = (defined $1 ? $1 : -1, defined $2 ? $2 : "");
+            my $path = "$LOGDIR/$name";
+            my @st = lstat $path;
+            if (!@st || !-f _) { push @SKIPPED, "$path (not a regular file)"; last }
+            if ($compression ne "" && $compression ne ".gz") { push @SKIPPED, "$path (unsupported compression)"; last }
+            push @{ $FILES{$family} }, { path => $path, family => $family, kind => $FAMILY_KIND{$family},
+                                         index => $index, gz => $compression eq ".gz" ? 1 : 0,
+                                         mtime => $st[9], lines => 0, unparsed => 0 };
+            last;
+        }
+    }
+    closedir $dh;
+    # Rotated files oldest first (highest rotation index), the live file last.
+    for my $family (keys %FILES) {
+        $FILES{$family} = [ sort { $b->{index} <=> $a->{index} || $a->{mtime} <=> $b->{mtime} } @{ $FILES{$family} } ];
+    }
+}
+
+sub read_log {
+    my ($file, $callback, $track) = @_;
+    my $fh;
+    if ($file->{gz}) {
+        if (!$GZIP) { $file->{error} ||= "gzip not found"; return 0 }
+        if (!open($fh, "-|", $GZIP, "-dc", $file->{path})) { $file->{error} ||= "cannot start gzip: $!"; return 0 }
+    } elsif (!open($fh, "<", $file->{path})) {
+        $file->{error} ||= "cannot open: $!";
+        return 0;
+    }
+    binmode $fh;
+    my $parser = $file->{kind} eq "syslog" ? make_syslog_parser($file->{mtime})
+               : $file->{kind} eq "access" ? \&parse_access_time : \&parse_error_time;
+    while (my $line = <$fh>) {
+        $line =~ s/\r?\n\z//;
+        $line = substr($line, 0, $MAX_LINE_BYTES) if length $line > $MAX_LINE_BYTES;
+        my $t = $parser->($line);
+        if ($track) {
+            $file->{lines}++;
+            if (defined $t) {
+                $file->{first} = $t if !defined $file->{first} || $t < $file->{first};
+                $file->{last}  = $t if !defined $file->{last}  || $t > $file->{last};
+            } else {
+                $file->{unparsed}++;
+            }
+        }
+        $callback->($line, $t) if $callback;
+    }
+    $file->{error} ||= "gzip reported an error (file truncated or corrupt)" if !close($fh) && $file->{gz};
+    return 1;
+}
+
+# ---------------------------------------------------------------- pass callbacks
+
+sub scan_attempt_line {
+    my ($file, $line, $t) = @_;
+    return if $file->{family} eq "notice.log" && $line =~ /_command="/;    # shell audit, pass 2
+    my $text    = $line;
+    my $payload = extract_payload($text);
+    if (!defined $payload && $file->{kind} ne "syslog" && $line =~ /%[0-9A-Fa-f]{2}/) {
+        $text    = url_decode($line);
+        $payload = extract_payload($text);
+    }
+    if (defined $payload) {
+        record_attempt($file, $text, $t, $payload, undef);
+        return;
+    }
+    return unless $file->{kind} eq "syslog" && defined $t;
+    return if $line =~ $TRIGGER_RE;
+    $NSAAAD_EVENTS{"$t:$1"} = $t if $line =~ /\bnsaaad\s*\((\d+)\)\s+unexpectedly died/i;
+    $REBOOT_EVENTS{$t} = 1       if $line =~ /All monitored processes have exited, rebooting/i;
+}
+
+sub scan_access_line {
+    my ($file, $line, $t) = @_;
+    my ($ip, $path) = $line =~ m{^(\S+)\s.*?"[A-Z]{3,10}\s+(\S+)};
+    $ip = undef unless defined $ip && valid_ipv4($ip);
+    my $text    = $line;
+    my $payload = extract_payload($text);
+    if (!defined $payload && $line =~ /%[0-9A-Fa-f]{2}/) {
+        $text    = url_decode($line);
+        $payload = extract_payload($text);
+    }
+    record_attempt($file, $text, $t, $payload, $ip) if defined $payload;
+    return unless defined $t && defined $ip && defined $path && $path =~ $AUTH_PATH_RE;
+    $AUTH_REQUESTS_BY_IP{$ip}++ if exists $AUTH_REQUESTS_BY_IP{$ip} || keys(%AUTH_REQUESTS_BY_IP) < $MAX_IP_KEYS;
+    for my $delta (-$CORRELATION_WINDOW .. $CORRELATION_WINDOW) {
+        next unless $ATTEMPT_SECONDS{ $t + $delta };
+        if (@CORRELATED < $MAX_CORRELATED) { push @CORRELATED, [$t, $ip] } else { $CORRELATED_OVERFLOW++ }
+        last;
+    }
+}
+
+sub scan_shell_line {
+    my ($file, $line, $t) = @_;
+    return if $file->{family} eq "notice.log" && $line !~ /_command="/;
+    if ($line =~ /$OWN_RE/)  { $SHELL_STATS{own}++;  return }
+    if ($line =~ /$TOOL_RE/) { $SHELL_STATS{tool}++; return }
+    my $command = normalize_command(shell_command_text($line));
+    my @words   = command_words($command);
+    my $first   = @words ? $words[0] : "";
+    if ($OWN_OUTPUT_WORDS{$first}) { $SHELL_STATS{own}++; return }
+    $SHELL_STATS{lines}++;
+    my $viewer  = viewer_command($command, $first);
+    my $trigger = defined extract_payload($command) ? 1 : 0;
+    my %hit;
+    if ($ANY_TOKEN_RE && $command =~ $ANY_TOKEN_RE) {
+        for my $rule (@TOKEN_RULES) {
+            $hit{ $rule->{group} }{ $rule->{token} } = 1 if $command =~ $rule->{re};
+        }
+    }
+    my $note = join "; ", map { "$_: " . join(" ", sort keys %{ $hit{$_} }) }
+                          sort { $GROUP_ORDER{$a} <=> $GROUP_ORDER{$b} } keys %hit;
+    if ($trigger) {
+        add_finding($viewer ? "viewer" : "trigger", $command, $t, $file, $note);
+        return;
+    }
+    if (%hit) {
+        my $runs = grep { my $w = $_; $ACTION_WORDS{$w} || grep { $GROUP_WORDS{$_}{$w} } keys %hit } @words;
+        add_finding($viewer ? "viewer" : $runs ? "token" : "mention", $command, $t, $file, $note);
+        return;
+    }
+    return if $viewer;
+    my $reason = generic_exec_reason($command);
+    add_finding("generic", $command, $t, $file, $reason) if defined $reason;
+}
+
+sub scan_reference_line {
+    my ($file, $line, $t) = @_;
+    return if $line =~ $TRIGGER_RE;
+    return if $file->{family} eq "notice.log" && $line =~ /_command="/;
+    return unless $line =~ $ANY_REFERENCE_RE;
+    return if $line =~ /$OWN_RE/ || $line =~ /$TOOL_RE/;
+    my %tokens;
+    for my $rule (@REFERENCE_RULES) { $tokens{ $rule->{token} } = 1 if $line =~ $rule->{re} }
+    my $tokens = join(" ", sort keys %tokens);
+    # Requests from a payload host (AAA logins, AppFW blocks and their SNMP traps) show
+    # inbound attacker activity, not an execution side effect: count them by event type.
+    my $inbound = grep { $line =~ /\b(?:Client_ip|client ip\s*:)\s*\Q$_\E(?![\d.])/i } keys %tokens;
+    if ($inbound || $line =~ /\bAPPFW\b|appfwLogMsg/) {
+        my $type = $line =~ /\bdefault\s+([A-Z][A-Z0-9_]*)\s+([A-Za-z][A-Za-z0-9_]*)/ ? "$1 $2" : "other";
+        add_finding("inbound", "$type from $tokens", $t, $file, undef);
+        return;
+    }
+    add_finding("reference", $line, $t, $file, $tokens);
+}
+
+# ---------------------------------------------------------------- payload handling
+
+sub extract_payload {
+    my ($text) = @_;
+    return undef unless $text =~ $TRIGGER_RE;
+    my $rest = substr($text, $+[0]);
+    return undef unless $rest =~ $INJECT_START_RE;
+    # The injected value ends where the logging code appends its own fields.
+    $rest =~ s/(?:,\s*vsid\s*:|\s+-\s+Client_ip\s|\s+\(client ip\s*:|\s+@\s+$IPV4_RE|\s+from server\s|\s+-\s+Failure_reason).*\z//s;
+    # Attackers close the command with a shell comment (";# X").
+    $rest =~ s/;?\s*#.*\z//s;
+    $rest =~ s/^[\s;]+//;
+    $rest =~ s/[\s;]+\z//;
+    return length $rest ? substr($rest, 0, 1024) : undef;
+}
+
+sub record_attempt {
+    my ($file, $text, $t, $payload, $direct_ip) = @_;
+    my $norm  = normalize_command($payload);
+    my $group = $GROUPS{$norm};
+    if (!$group) {
+        if (keys(%GROUPS) >= $MAX_GROUPS) { $GROUP_OVERFLOW++; return }
+        $group = $GROUPS{$norm} = { raw => $payload, norm => $norm, lines => 0, unparsed => 0,
+                                    seconds => {}, families => {}, clients => {}, vservers => {} };
+    }
+    $group->{lines}++;
+    $group->{families}{ $file->{family} }++;
+    if (defined $t) {
+        $group->{seconds}{$t} = 1;
+        $ATTEMPT_SECONDS{$t}  = 1;
+        $group->{first} = $t if !defined $group->{first} || $t < $group->{first};
+        $group->{last}  = $t if !defined $group->{last}  || $t > $group->{last};
+    } else {
+        $group->{unparsed}++;
+    }
+    # The user name is attacker-controlled; the logging code appends the real
+    # client and vServer fields after it, so the last occurrence counts.
+    my $client = $direct_ip;
+    if (!defined $client) {
+        my @found = ($text =~ /\bClient_ip\s+($IPV4_RE)\b/gi, $text =~ /\bclient ip\s*:\s*($IPV4_RE)\b/gi);
+        $client = $found[-1] if @found;
+    }
+    $group->{clients}{$client}++ if defined $client && valid_ipv4($client);
+    my @vservers = $text =~ /\bvserver ip\s*:\s*($IPV4_RE)\b/gi;
+    $group->{vservers}{ $vservers[-1] }++ if @vservers && valid_ipv4($vservers[-1]);
+}
+
+# Undo the usual evasion forms so that equivalent payloads group together and
+# their hosts/paths can be extracted. The result is only matched, never run.
+sub normalize_command {
+    my ($text) = @_;
+    my $n = $text;
+    $n =~ s/\$\{IFS\}|\$IFS(?![A-Za-z0-9_])/ /g;
+    $n =~ s/%([0-9A-Fa-f]{2})/chr(hex $1)/ge;
+    if ($n =~ /(?:^|[;\s])IFS=([^A-Za-z0-9\s:\/.\-])/) {
+        my $separator = $1;
+        $n =~ s/\Q$separator\E/ /g;
+    }
+    $n =~ s/\\(?=[A-Za-z\/])/ /g;
+    $n =~ s/\s+/ /g;
+    $n =~ s/^ | \z//g;
+    return $n;
+}
+
+sub payload_tokens {
+    my ($n) = @_;
+    my (%hosts, %segments, %paths, %modes);
+    while ($n =~ m{\b(?:https?|ftp|tftp)://([^\s/;|&\x60\x27"<>()?#\\]+)([^\s;|&\x60\x27"<>()\\]*)}gi) {
+        my ($hostport, $path) = ($1, $2);
+        $hostport =~ s/^[^@]*@//;
+        next unless length $hostport;
+        $hosts{ lc $hostport } = 1;
+        (my $host = $hostport) =~ s/:\d+\z//;
+        $hosts{ lc $host } = 1;
+        $path =~ s/[?#].*\z//;
+        $segments{$_} = 1 for grep { length >= 6 } split m{/}, $path;
+    }
+    (my $without_urls = $n) =~ s{\b(?:https?|ftp|tftp)://\S+}{ }gi;
+    while ($without_urls =~ m{(?<![A-Za-z0-9._/~-])(/[A-Za-z0-9._/-]*[A-Za-z0-9._-])}g) {
+        my $path = $1;
+        next if length $path > 255 || $path =~ m{(?:^|/)\.\.(?:/|\z)};
+        $paths{$path} = 1;
+    }
+    while ($without_urls =~ m{\bchmod\s+([0-7]{3,4})\s+(/[A-Za-z0-9._/-]+)}g) { $modes{$2} = $1 }
+    while ($without_urls =~ /(?<![\d.])($IPV4_RE)(?!\d|\.\d)/g) { $hosts{$1} = 1 if valid_ipv4($1) }
+    return { hosts => [sort keys %hosts], segments => [sort keys %segments],
+             paths => [sort keys %paths], modes => \%modes };
+}
+
+# Command names at command positions (line start and after ; | & backtick $( ).
+sub command_words {
+    my ($command) = @_;
+    my @words;
+    for my $segment (split /[;|&\x60\n]|\$\(/, $command) {
+        my $s = $segment;
+        $s =~ s/^[\s({!]+//;
+        1 while $s =~ s/^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|\S*)\s*//;
+        $s =~ s/^(?:nice|nohup|time|exec|command|env)\s+(?:-\S+\s+)*//;
+        my ($word) = $s =~ /^([^\s<>]+)/;
+        next unless defined $word;
+        $word =~ s{.*/}{};
+        push @words, lc $word if $word =~ /^[A-Za-z][A-Za-z0-9._+-]*\z/;
+    }
+    return @words;
+}
+
+sub generic_path {
+    my ($path) = @_;
+    return 1 if $path =~ m{^/(?:bin|sbin|usr|lib|libexec|dev|proc|rescue)(?:/|\z)};
+    return 1 if $path =~ m{^/(?:tmp|var|var/tmp|var/log|flash|nsconfig|netscaler|etc|root|home)/?\z};
+    # Standard configuration files: payloads read them, but boot scripts and administrators
+    # also touch them (for example chmod 600 /flash/nsconfig/ns.conf* at every boot).
+    return 1 if $path =~ m{^/(?:flash/)?nsconfig/(?:ns\.conf|rc\.netscaler|ntp\.conf|httpd\.conf|crontab)(?:\.[A-Za-z0-9_-]+)?\z};
+    return 1 if $path =~ m{^/(?:flash/)?nsconfig/keys/?\z};
+    return 1 if $path =~ m{^/etc/(?:passwd|master\.passwd|group|httpd\.conf|crontab|monitrc|rc\.conf|ntp\.conf|resolv\.conf|hosts|shells)\z};
+    return 0;
+}
+
+# Read-only use of a viewer command: no redirection, no in-place edit, no tee, no
+# pipe into an interpreter. "cat a>b" or "sed -i" write and are not viewers.
+sub viewer_command {
+    my ($command, $first) = @_;
+    return 0 unless $VIEWER_WORDS{$first};
+    return 0 if $command =~ />/;
+    return 0 if $command =~ /(?:^|\s)-i(?:\S*)?(?:\s|\z)/ && $first =~ /^(?:sed|awk|gawk|nawk)\z/;
+    return 0 if $command =~ /\|\s*(?:\S*\/)?(?:tee|sh|bash|ksh|csh|tcsh|zsh|perl|python[0-9.]*)(?:\s|;|\z)/;
+    return 1;
+}
+
+sub shell_command_text {
+    my ($line) = @_;
+    my $command = $line =~ /\b[A-Za-z]*_?command="(.*)"\s*\z/s ? $1
+                : $line =~ /\]:\s+(.*)\z/s                    ? $1
+                :                                              $line;
+    $command =~ s/[\x80-\x8f]//g;    # FreeBSD sh marks quoting with bytes 0x81-0x88
+    return $command;
+}
+
+sub generic_exec_reason {
+    my ($command) = @_;
+    my @urls = $command =~ m{\b((?:https?|ftp|tftp)://[^\s;|&\x60\x27"<>()]+)}gi;
+    if (grep { external_url($_) } @urls) {
+        return "download from external URL"
+            if $command =~ /\b(?:fetch|curl|wget|tftp|ftp|nc|ncat|socat|perl|python[0-9.]*)\b/i;
+    }
+    return "pipe into interpreter" if $command =~ /\|\s*(?:\S*\/)?(?:sh|bash|ksh|csh|tcsh|zsh|perl|python[0-9.]*)(?:\s|;|\z)/;
+    return "/dev/tcp or /dev/udp"  if $command =~ m{/dev/(?:tcp|udp)/};
+    return "Base64 decoding"       if $command =~ /\bbase64\s+(?:-d|-D|--decode)\b|b64decode/i;
+    return undef;
+}
+
+sub url_decode { my ($text) = @_; $text =~ s/%([0-9A-Fa-f]{2})/chr(hex $1)/ge; return $text }
+
+sub valid_ipv4 {
+    my ($ip) = @_;
+    return 0 unless defined $ip && $ip =~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\z/;
+    return ($1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255) ? 1 : 0;
+}
+
+sub public_ipv4 {
+    my ($ip) = @_;
+    return 0 unless valid_ipv4($ip);
+    my ($o1, $o2) = split /\./, $ip;
+    return 0 if $o1 == 0 || $o1 == 10 || $o1 == 127 || $o1 >= 224;
+    return 0 if $o1 == 169 && $o2 == 254;
+    return 0 if $o1 == 172 && $o2 >= 16 && $o2 <= 31;
+    return 0 if $o1 == 192 && $o2 == 168;
+    return 0 if $o1 == 100 && $o2 >= 64 && $o2 <= 127;
+    return 1;
+}
+
+sub external_host {
+    my ($hostport) = @_;
+    (my $host = $hostport) =~ s/:\d+\z//;
+    return 0 if $host =~ /^(?:localhost|.*\.local|.*\.localdomain)\z/i;
+    return public_ipv4($host) if $host =~ /^[\d.]+\z/;
+    return $host =~ /\./ ? 1 : 0;
+}
+
+sub external_url {
+    my ($url) = @_;
+    return 0 unless $url =~ m{^[A-Za-z]+://(?:[^@/]*@)?([^/:?#]+)};
+    return external_host($1);
+}
+
+# ---------------------------------------------------------------- findings
+
+sub add_finding {
+    my ($bucket, $text, $t, $file, $note) = @_;
+    my $store = $FINDINGS{$bucket} ||= {};
+    my $entry = $store->{$text};
+    if (!$entry) {
+        if (keys(%$store) >= $MAX_FINDING_KEYS) { $FINDINGS{"$bucket:overflow"}{count}++; return }
+        $entry = $store->{$text} = { count => 0, families => {}, note => $note };
+    }
+    $entry->{count}++;
+    $entry->{families}{ $file->{family} } = 1;
+    if (defined $t) {
+        $entry->{first} = $t if !defined $entry->{first} || $t < $entry->{first};
+        $entry->{last}  = $t if !defined $entry->{last}  || $t > $entry->{last};
+    }
+}
+
+sub findings { my ($bucket) = @_; return $FINDINGS{$bucket} && %{ $FINDINGS{$bucket} } ? 1 : 0 }
+
+sub finding_lines {
+    my ($bucket) = @_;
+    my $store = $FINDINGS{$bucket};
+    my @entries = sort { (defined $a->[1]{first} ? $a->[1]{first} : 0) <=> (defined $b->[1]{first} ? $b->[1]{first} : 0) }
+                  map { [$_, $store->{$_}] } keys %$store;
+    my @lines;
+    for my $item (@entries) {
+        my ($text, $e) = @$item;
+        my $when = !defined $e->{first} ? "time unknown"
+                 : fmt_time($e->{first}) . ($e->{last} != $e->{first} ? " .. " . fmt_time($e->{last}) : "");
+        push @lines, sprintf("  %s  (%dx, %s)%s", $when, $e->{count}, join(",", sort keys %{ $e->{families} }),
+                             defined $e->{note} && length $e->{note} ? " [" . show($e->{note}, 200) . "]" : ""),
+                     "    " . show($text, 400);
+    }
+    my @result = limit_list(\@lines, 2 * $MAX_LIST);
+    my $overflow = $FINDINGS{"$bucket:overflow"};
+    push @result, "  ... $overflow->{count} further distinct line(s) not kept (limit $MAX_FINDING_KEYS)" if $overflow;
+    return @result;
+}
+
+# ---------------------------------------------------------------- coverage
+
+sub family_coverage {
+    my ($family) = @_;
+    my %cov = (files => scalar @{ $FILES{$family} }, gaps => []);
+    my @files = sort { $a->{first} <=> $b->{first} } grep { defined $_->{first} } @{ $FILES{$family} };
+    return \%cov unless @files;
+    $cov{oldest} = $files[0]{first};
+    my $reach = $files[0]{last};
+    for my $file (@files[1 .. $#files]) {
+        push @{ $cov{gaps} }, [$reach, $file->{first}] if $file->{first} - $reach > $GAP_THRESHOLD;
+        $reach = $file->{last} if $file->{last} > $reach;
+    }
+    $cov{newest} = $reach;
+    return \%cov;
+}
+
+# Covered time ranges of the shell-audit logs (sh.log and bash.log merged).
+sub shell_intervals {
+    my @ranges = sort { $a->[0] <=> $b->[0] } map { [$_->{first}, $_->{last}] }
+                 grep { defined $_->{first} } map { @{ $FILES{$_} || [] } } @SHELL_FAMILIES;
+    my @merged;
+    for my $range (@ranges) {
+        if (@merged && $range->[0] - $merged[-1][1] <= $GAP_THRESHOLD) {
+            $merged[-1][1] = $range->[1] if $range->[1] > $merged[-1][1];
+        } else {
+            push @merged, [@$range];
+        }
+    }
+    return @merged;
+}
+
+sub in_intervals {
+    my ($t, $intervals) = @_;
+    for my $range (@$intervals) { return 1 if $t >= $range->[0] && $t <= $range->[1] }
+    return 0;
+}
+
+# ---------------------------------------------------------------- source-IP correlation
+
+sub correlate_sources {
+    return () unless @CORRELATED && @ALL_SECONDS;
+    my @requests = sort { $a->[0] <=> $b->[0] } @CORRELATED;
+    my %windows;
+    my $start = 0;
+    for my $second (@ALL_SECONDS) {
+        $start++ while $start < @requests && $requests[$start][0] < $second - $CORRELATION_WINDOW;
+        my %seen;
+        for (my $i = $start; $i < @requests && $requests[$i][0] <= $second + $CORRELATION_WINDOW; $i++) {
+            $seen{ $requests[$i][1] } = 1;
+        }
+        $windows{$_}++ for keys %seen;
+    }
+    return sort { $b->[1] <=> $a->[1] || $b->[2] <=> $a->[2] || $a->[0] cmp $b->[0] }
+           map { [$_, $windows{$_}, $AUTH_REQUESTS_BY_IP{$_} || 0] } keys %windows;
+}
+
+# ---------------------------------------------------------------- file artifacts
+
+sub check_artifacts {
+    for my $path (sort keys %PATH_REFERENCES) {
+        next if $path eq $SELF_PATH || $path eq $REPORT_PATH;
+        my $ref        = $PATH_REFERENCES{$path};
+        my $groups     = join(",", sort { $GROUP_ORDER{$a} <=> $GROUP_ORDER{$b} } keys %{ $ref->{groups} });
+        my $persistent = $path =~ m{^/(?:var|flash|nsconfig)/} ? 1 : 0;
+        my @st = lstat $path;
+        if (!@st) {
+            if ($persistent) {
+                status("OK", show($path) . " ($groups): absent on a persistent filesystem.");
+            } elsif (defined $BOOT_EPOCH && defined $ref->{first} && $BOOT_EPOCH > $ref->{first}) {
+                status("CHECK", show($path) . " ($groups): absent, but the path is volatile and the ADC booted at "
+                    . fmt_time($BOOT_EPOCH) . ", after the first attempt (" . fmt_time($ref->{first})
+                    . "). Absence is not meaningful.");
+            } else {
+                status("OK", show($path) . " ($groups): absent (volatile path, no boot since the first attempt).");
+            }
+            next;
+        }
+        my $mode = $st[2] & 07777;
+        my $type = -l _ ? "symlink" : -f _ ? "file" : -d _ ? "directory" : "other";
+        my @facts = (sprintf("type=%s mode=%04o uid=%d gid=%d size=%d mtime=%s",
+                             $type, $mode, $st[4], $st[5], $st[7], fmt_time($st[9])));
+        if ($type eq "symlink") {
+            my $target = readlink $path;
+            push @facts, "link target=" . show(defined $target ? $target : "");
+        }
+        if ($type eq "file" && $st[7] <= $MAX_HASH_BYTES) {
+            my $digest = sha256_file($path);
+            push @facts, "sha256=" . (defined $digest ? $digest : "unavailable");
+        }
+        my @reasons;
+        push @reasons, "modified at or after the first referencing attempt"
+            if defined $ref->{first} && $st[9] >= $ref->{first} - 60;
+        push @reasons, "permissions match the payload chmod $ref->{mode}"
+            if defined $ref->{mode} && ($mode & 0777) == (oct($ref->{mode}) & 0777);
+        if (@reasons) {
+            status("ACTION", show($path) . " ($groups) exists: " . join("; ", @reasons) . ". Preserve it before any change.");
+        } else {
+            status("CHECK", show($path) . " ($groups) exists and predates the attempts. Verify that it is legitimate.");
+        }
+        out(map { "  " . $_ } @facts);
+    }
+}
+
+sub sha256_file {
+    my ($path) = @_;
+    if ($HAVE_DIGEST) {
+        my $digest = eval { Digest::SHA->new(256)->addfile($path, "b")->hexdigest };
+        return $digest if defined $digest;
+    }
+    for my $command (grep { defined $_->[0] } [$SHA256, "-q"], [$SHA256SUM]) {
+        open(my $fh, "-|", @$command, $path) or next;
+        my $text = do { local $/; <$fh> };
+        close $fh;
+        return lc $1 if defined $text && $text =~ /\b([0-9a-fA-F]{64})\b/;
+    }
+    return undef;
+}
+
+# ---------------------------------------------------------------- output helpers
+
+# Log text is untrusted: printable ASCII only, bounded length, public hosts defanged.
+sub show {
+    my ($text, $max) = @_;
+    $max ||= 400;
+    $text = "" unless defined $text;
+    $text =~ s/[^\x20-\x7e]/./g;
+    $text = substr($text, 0, $max) . " [...]" if length $text > $max;
+    return defang($text);
+}
+
+sub defang {
+    my ($text) = @_;
+    $text =~ s{\bhttp(s?)://}{hxxp$1://}gi;
+    $text =~ s{\b((?:hxxps?|ftp|tftp)://(?:[^@/\s]*@)?)([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z][A-Za-z0-9-]*)}{$1 . defang_last_dot($2)}gie;
+    $text =~ s{(?<![\d.\[])((\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3}))(?!\d|\.\d)}{public_ipv4($1) ? "$2.$3.$4\[.]$5" : $1}ge;
+    return $text;
+}
+
+sub defang_last_dot { my ($host) = @_; $host =~ s/\.([^.]+)\z/[.]$1/; return $host }
+
+# Bare host names: defang the last dot of a name; IPv4 addresses go through defang().
+sub show_host {
+    my ($hostport) = @_;
+    my $text = show($hostport, 200);
+    return $text if index($text, "[.]") >= 0 || $hostport !~ /[A-Za-z]/;
+    $text =~ s/\.([^.:]+)((?::\d+)?)\z/[.]$1$2/;
+    return $text;
+}
+
+sub count_list {
+    my ($counts) = @_;
+    return join ", ", map { show($_) . " ($counts->{$_})" }
+                      sort { $counts->{$b} <=> $counts->{$a} || $a cmp $b } keys %$counts;
+}
+
+# Keep the beginning and the end of long chronological lists.
+sub limit_list {
+    my ($items, $max) = @_;
+    return @$items if @$items <= $max;
+    my $half = int($max / 2);
+    return (@$items[0 .. $half - 1],
+            sprintf("  ... %d line(s) omitted ...", @$items - 2 * $half),
+            @$items[$#$items - $half + 1 .. $#$items]);
+}
+
+sub combine_rules {
+    my @rules = @_;
+    return undef unless @rules;
+    my $alternation = join "|", map { $_->{re} } @rules;
+    return qr/$alternation/;
+}
+'
+geiger_analysis() {
+    if command -v perl >/dev/null 2>&1; then
+        perl -e "$GEIGER_ANALYSIS_PL" -- "$1" "$GEIGER_LOG_DIR" "$GEIGER_CAMPAIGN_START" \
+            "${INSTALL_EPOCH-}" "${GEIGER_BOOT_EPOCH-}" "$GEIGER_SELF_PATH" "$OUT"
+    else
+        status CHECK 'perl is unavailable; the GEIGER log analysis could not run.'
+    fi
+}
+
 LOG_EST_FILES=0
 LOG_EST_BYTES=0
 if [ "$RUNNING_ON_ADC" = YES ]; then
@@ -378,7 +1552,7 @@ check_nslog_nextfile_state() {
 FW_PATCHED=UNKNOWN
 
 printf 'Deyda Consulting NetScaler IOC and CVE triage report\n'
-printf 'Host: %s\nTime: %s\nScript version: 9.64\n\n' "$HOST" "$NOW"
+printf 'Host: %s\nTime: %s\nScript version: %s\nScript path: %s\n\n' "$HOST" "$NOW" "$SCRIPT_VERSION" "$GEIGER_SELF_PATH"
 printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n\n'
 printf 'Related articles\n  DE: https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
 printf '  EN: https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/\n\n'
@@ -485,7 +1659,7 @@ if [ -n "$CURRENT_INPUT" ]; then
         fi
     fi
 else
-    status CHECK 'Firmware comparison skipped; rerun with the version from show ns version as argument, e.g. sh deyda-netscaler-ioc-check.sh 14.1-73.37.nc.'
+    status CHECK "Firmware comparison skipped; rerun with the version from show ns version as argument, e.g. sh $GEIGER_SELF_BASE 14.1-73.37.nc."
 fi
 printf '\nCVE configuration matches below show feature/precondition clues from the configuration file.\n'
 printf 'The preceding threshold applies to CTX697096 (88771-88778). CVE-2026-88779 has a separate SAML assessment and newer thresholds below.\n'
@@ -737,8 +1911,16 @@ fi
 subsection 'SAML request workaround: saved policy and binding inventory'
 # Parse names and bindings without exposing proprietary policy expressions.
 # OK confirms selected saved-config structure/bindings, not exact vendor approval.
+# GEIGER: the request workaround is an interim measure until the CVE-2026-88779 fixed
+# build. On a fixed build missing workaround parts are informational, not ACTION.
+GEIGER_SAML_FIXED=NO
+if [ -n "${SAML_DOS_REQUIRED-}" ] && [ -n "${FW_MAJOR-}" ] && [ -n "${FW_MINOR-}" ]; then
+    if [ "$FW_MAJOR" -gt "${SAML_DOS_REQUIRED%.*}" ] || { [ "$FW_MAJOR" -eq "${SAML_DOS_REQUIRED%.*}" ] && [ "$FW_MINOR" -ge "${SAML_DOS_REQUIRED#*.}" ]; }; then
+        GEIGER_SAML_FIXED=YES
+    fi
+fi
 if [ -r "$CONFIG" ]; then
-    awk '
+    awk -v fixed="$GEIGER_SAML_FIXED" '
     function tokens(text, fields,    i,c,nextc,quoted,value,n,active,k) {
         for(k in fields) delete fields[k]
         n=0; value=""; quoted=0; active=0
@@ -798,10 +1980,15 @@ if [ -r "$CONFIG" ]; then
             exit
         }
         warning=(saml || other)?"ACTION":"CHECK"
-        if(!count) result(warning,"WARNING: No responder policy matching the /cgi/samlauth + SAMLResponse (or /saml/login + SAMLRequest) expression and DROP action was found in saved configuration. Verify the current Citrix mitigation and save the configuration.")
+        prefix="WARNING: "
+        if(fixed=="YES") {
+            warning="INFO"; prefix="Info (not required on the fixed build): "
+            result("OK","Firmware meets the CVE-2026-88779 fixed build; the SAML request workaround is an interim measure until that build and is not required. The workaround inventory below is informational.")
+        }
+        if(!count) result(warning,prefix "No responder policy matching the /cgi/samlauth + SAMLResponse (or /saml/login + SAMLRequest) expression and DROP action was found in saved configuration. Verify the current Citrix mitigation and save the configuration.")
         for(name in definitions) {
             if(valid[name]) result("INFO",name " matches a SAML endpoint/body-field pattern and DROP action. The full policy expression is not printed; verify it against current Citrix guidance.")
-            else result(warning,"WARNING: " name " is defined but does not contain the expected selected expression/action markers.")
+            else result(warning,prefix name " is defined but does not contain the expected selected expression/action markers.")
         }
         total=0; covered=0; missing=0
         for(key in servers) {
@@ -812,12 +1999,12 @@ if [ -r "$CONFIG" ]; then
                 result("OK",servers[key] ": " matched " is defined with recognized structure and an enabled AAA_REQUEST binding in saved configuration.")
             } else {
                 missing++
-                result(warning,"WARNING: " servers[key] " has no enabled AAA_REQUEST binding to a recognized policy with the selected structure. Check the required frontend binding.")
+                result(warning,prefix servers[key] " has no enabled AAA_REQUEST binding to a recognized policy with the selected structure. Check the required frontend binding.")
             }
         }
         if(total && !missing) result("OK","Recognized SAML workaround coverage found for all " total " saved Authentication/VPN vServers.")
-        else if(!total) result("CHECK","No Authentication/VPN vServers were found; frontend binding coverage cannot be established.")
-        else result(warning,"SAML workaround coverage incomplete: " covered " of " total " saved Authentication/VPN vServers have a recognized enabled AAA_REQUEST binding.")
+        else if(!total) result(fixed=="YES" ? "INFO" : "CHECK","No Authentication/VPN vServers were found; frontend binding coverage cannot be established.")
+        else result(warning,(fixed=="YES" ? prefix : "") "SAML workaround coverage incomplete: " covered " of " total " saved Authentication/VPN vServers have a recognized enabled AAA_REQUEST binding.")
         result("INFO","Scope: saved configuration only; selected structure is not exact expression validation. Verify current Support instructions, priorities, effective live flow and legitimate sign-ins. Global bindings are not counted as AAA_REQUEST coverage.")
     }
     ' "$CONFIG" | while IFS="$(printf '\t')" read -r SAML_LEVEL SAML_MESSAGE; do
@@ -1084,10 +2271,12 @@ done
 ACCESS_PAYLOAD_CANDIDATES=$(find /var/tmp /tmp /nsconfig /flash/nsconfig -type f -size -1024k -print 2>/dev/null | head -501)
 ACCESS_PAYLOAD_COUNT=$(printf '%s\n' "$ACCESS_PAYLOAD_CANDIDATES" | awk 'NF {n++} END {print n+0}')
 ACCESS_PAYLOAD_HITS=0
-printf '%s\n' 'Payload search: up to 500 readable regular files below 1 MiB in /var/tmp, /tmp, /nsconfig, and /flash/nsconfig; own generated reports excluded. Larger files, unreadable files, and other paths are outside coverage.'
+printf '%s\n' 'Payload search: up to 500 readable regular files below 1 MiB in /var/tmp, /tmp, /nsconfig, and /flash/nsconfig; this script (by resolved path) and generated reports excluded. Larger files, unreadable files, and other paths are outside coverage.'
 while IFS= read -r f; do
     [ -n "$f" ] && [ -r "$f" ] || continue
-    case "$f" in /var/tmp/deyda-netscaler-ioc-check_*.txt) continue ;; esac
+    # GEIGER: exclude the running script by resolved path and all generated reports.
+    [ "$f" = "$GEIGER_SELF_PATH" ] && continue
+    case "$f" in /var/tmp/deyda-netscaler-ioc-check_*.txt|/var/tmp/deyda-netscaler-ioc-check_*.txt) continue ;; esac
     if grep -E -i -q 'add[[:space:]]+system[[:space:]]+user[[:space:]]' "$f" 2>/dev/null &&
        grep -E -i -q 'bind[[:space:]]+system[[:space:]]+user[[:space:]]' "$f" 2>/dev/null &&
        grep -E -i -q 'set[[:space:]]+authentication[[:space:]]+epaAction.*-defaultEPAGroup[[:space:]]+NO_AUTH' "$f" 2>/dev/null &&
@@ -1126,7 +2315,7 @@ NSMON_PS=$(ps auxww 2>/dev/null)
 if [ -z "$NSMON_PS" ]; then
     status CHECK 'Process inventory unavailable for the targeted nsmon check.'
 else
-    NSMON_RUNNING=$(printf '%s\n' "$NSMON_PS" | awk '/nsmon[.]pl|\/var\/tmp\/[.]nsmon\// && !/awk|grep|deyda-netscaler-ioc-check/ {print}')
+    NSMON_RUNNING=$(printf '%s\n' "$NSMON_PS" | awk -v self="$GEIGER_SELF_BASE" '/nsmon[.]pl|\/var\/tmp\/[.]nsmon\// && !/awk|grep|deyda-netscaler-ioc-check/ && (self == "" || index($0, self) == 0) {print}')
     if [ -n "$NSMON_RUNNING" ]; then
         status ACTION 'A process command line refers to nsmon.pl or the .nsmon implant path. Preserve process/socket evidence and verify authorization; normal nsmonitor names are excluded:'
         printf '%s\n' "$NSMON_RUNNING" | head -20
@@ -1217,7 +2406,7 @@ else
 fi
 SLAP_PROCESS_SNAPSHOT=$(ps auxww 2>/dev/null)
 if [ -n "$SLAP_PROCESS_SNAPSHOT" ]; then
-    SLAP_PROCESSES=$(printf '%s\n' "$SLAP_PROCESS_SNAPSHOT" | awk '/\/(flash\/)?nsconfig\/[.]slap\/|\/var\/tmp\/[.]ux\/(slapshot|whipd|whippid)[.]py/ && !/awk|grep|deyda-netscaler-ioc-check/ {print}')
+    SLAP_PROCESSES=$(printf '%s\n' "$SLAP_PROCESS_SNAPSHOT" | awk -v self="$GEIGER_SELF_BASE" '/\/(flash\/)?nsconfig\/[.]slap\/|\/var\/tmp\/[.]ux\/(slapshot|whipd|whippid)[.]py/ && !/awk|grep|deyda-netscaler-ioc-check/ && (self == "" || index($0, self) == 0) {print}')
     if [ -n "$SLAP_PROCESSES" ]; then
         status ACTION 'Current process command line refers to a sample-associated hidden payload path. Preserve PID/executable/socket evidence and investigate; command-line identity alone does not authenticate the binary:'
         printf '%s\n' "$SLAP_PROCESSES" | head -20
@@ -1460,7 +2649,7 @@ else
     [ -n "$HA_PROCESS" ] && printf '%s\n' "$HA_PROCESS"
 fi
 
-HA_LOG_HITS=$(zgrep -E -i -n 'nsfsyncd|(^|[^[:alnum:]_])HA[[:space:]_-]+(sync|synchronization|state|fail|error)|(^|[^[:alnum:]_])(sync|synchronization)[[:space:]_-]+(HA|peer)' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | tail -60)
+HA_LOG_HITS=$(zgrep -E -i -n 'nsfsyncd|(^|[^[:alnum:]_])HA[[:space:]_-]+(sync|synchronization|state|fail|error)|(^|[^[:alnum:]_])(sync|synchronization)[[:space:]_-]+(HA|peer)' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | chrono_sort | tail -60)
 if [ "$HA_CONFIG_STATE" = YES ]; then
     if [ -n "$HA_LOG_HITS" ]; then
         status CHECK 'HA/synchronization-related log lines found; distinguish routine state changes from failures and compare both nodes:'
@@ -1796,8 +2985,10 @@ for f in /var/netscaler/logon/LogonPoint/custom/.slap.receiver /var/netscaler/lo
     fi
 done
 [ "$SLAP_WEB_FOUND" -eq 1 ] || status OK 'No selected .slap.receiver/.ctxs.receiver/receiver.deb file found in LogonPoint/custom.'
+# GEIGER: exclude the running script by resolved path; other copies of this tool and
+# generated reports by name, including date-prefixed copies.
 COOKIE_COMMAND_CANDIDATES=$(find /var/netscaler/logon/LogonPoint/custom /var/vpn /nsconfig/.slap /flash/nsconfig/.slap -type f -size -2048k \
-    ! -name 'deyda-netscaler-ioc-check*.sh' ! -name 'deyda-netscaler-ioc-check*.txt' \
+    ! -path "$GEIGER_SELF_PATH" ! -name '*deyda-netscaler-ioc-check*.sh' ! -name '*deyda-netscaler-ioc-check_*.txt' \
     -exec grep -lF 'CsrfToken2' {} + 2>/dev/null | head -30)
 COOKIE_COMMAND_FOUND=0
 while IFS= read -r f; do
@@ -1937,8 +3128,9 @@ fi
 progress 'Web and payload integrity: Platypus bootstrap content'
 # Find by content, not token/hash; no token or file content is printed.
 # Quoted find -exec avoids shell evaluation and xargs splitting of spaced paths.
+# GEIGER: the running script is excluded by resolved path (a renamed copy matched itself).
 PLATYPUS_BOOTSTRAPS=$(find /tmp /var/tmp /netscaler.local /var/core -type f -size -1024k \
-    ! -name 'deyda-netscaler-ioc-check*.txt' ! -name 'deyda-netscaler-ioc-check*.sh' \
+    ! -path "$GEIGER_SELF_PATH" ! -name '*deyda-netscaler-ioc-check_*.txt' ! -name '*deyda-netscaler-ioc-check*.sh' \
     -exec grep -lE 'Platypus agent bootstrap|PLATYPUS_INGRESS_CA|AGENT_TOKEN[[:space:]]*=[[:space:]]*.[pP][lL][tT]_' {} + 2>/dev/null | head -30)
 if [ -n "$PLATYPUS_BOOTSTRAPS" ]; then
     status ACTION 'Distinctive Platypus-bootstrap content matched in selected files below 1 MiB. This indicates a staged script, not proof of execution. Preserve and inspect offline; enrollment token values are omitted:'
@@ -2195,6 +3387,7 @@ SCRIPT_FILE_HITS=''
 ELF_FILE_HITS=''
 if [ -n "$RECENT_EXEC_CANDIDATES" ]; then
     printf '%s\n' "$RECENT_EXEC_CANDIDATES" | while IFS= read -r f; do
+        [ "$f" = "$GEIGER_SELF_PATH" ] && continue    # GEIGER: not the running script itself
         case "$f" in
             *.php|*.pl|*.py|*.sh|*.xhtml)
                 ls -l "$f" 2>/dev/null
@@ -2373,6 +3566,11 @@ if [ -n "$LOG_FILES_LIST" ]; then
 else
     status CHECK 'No readable candidate HTTP/system logs found; log-based IOC checks have no usable retention coverage.'
 fi
+# GEIGER: per-family coverage from the log lines themselves (point 4); the file
+# mtime summary above can look complete while ns.log only reaches back hours.
+progress 'Log coverage: per-family entries (GEIGER)'
+GEIGER_BOOT_EPOCH=$(sysctl -n kern.boottime 2>/dev/null | sed -nE 's/.*sec = ([0-9]+),.*/\1/p')
+geiger_analysis coverage
 printf '\nLocal log source inventory (rotation/retention context):\n'
 for pattern in /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/sh.log* /var/log/bash.log*; do
     for f in $pattern; do [ -f "$f" ] && ls -l "$f" 2>/dev/null; done
@@ -2398,7 +3596,7 @@ for f in /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn
     [ -f "$f" ] && [ -r "$f" ] && NSAAAD_LOG_COVERAGE=1
 done
 NSAAAD_EVENTS=$(zgrep -hEi '(^|[[:space:]:])proc[[:space:]]+nsaaad[[:space:]][^[:cntrl:]]*(SIGNALED|EXITED)|(^|[[:space:]:])nsaaad([[:space:]]+[0-9]+|[[:space:]]*\([0-9]+\))?[[:space:]]+(unexpectedly died|has had its maximum number of restarts)|Pitboss declaring system failure|All monitored processes have exited' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null |
-    grep -Eiv 'nsprofmon_mgmt[.]pl:|process_kernel_socket:[^[:cntrl:]]*call to authenticate user|cascade_auth:|start_ldap_auth:|receive_ldap_user_search_event:|AAAD API:|AAAD RESP:|LOGIN_FAILED|AAA LOGIN REQ|aaad_authenticate_req|Could not match login claims|CMD_EXECUTED|CLI CMD' | tail -30)
+    grep -Eiv 'nsprofmon_mgmt[.]pl:|process_kernel_socket:[^[:cntrl:]]*call to authenticate user|cascade_auth:|start_ldap_auth:|receive_ldap_user_search_event:|AAAD API:|AAAD RESP:|LOGIN_FAILED|AAA LOGIN REQ|aaad_authenticate_req|Could not match login claims|CMD_EXECUTED|CLI CMD' | chrono_sort | tail -30)
 if [ -n "$NSAAAD_EVENTS" ]; then
     status CHECK 'Authentication-service exit or general monitored-process restart-limit events found. These are availability/triage clues, not proof of payload installation. Correlate appliance time and timezone with SAML requests, reboot history and change records:'
     printf '%s\n' "$NSAAAD_EVENTS"
@@ -2420,7 +3618,7 @@ else
 fi
 
 subsection 'HTTPD reload and signal events'
-HTTPD_RELOAD_LOGS=$(zgrep -E -i -n 'apachectl[[:space:]]+graceful|httpd[^[:cntrl:]]*(SIGHUP|SIGUSR1)|graceful[^[:cntrl:]]*(restart|reload)' /var/log/httperror* /var/log/messages* /var/log/ns.log* 2>/dev/null | tail -40)
+HTTPD_RELOAD_LOGS=$(zgrep -E -i -n 'apachectl[[:space:]]+graceful|httpd[^[:cntrl:]]*(SIGHUP|SIGUSR1)|graceful[^[:cntrl:]]*(restart|reload)' /var/log/httperror* /var/log/messages* /var/log/ns.log* 2>/dev/null | chrono_sort | tail -40)
 if [ -n "$HTTPD_RELOAD_LOGS" ]; then
     status CHECK 'HTTPD graceful-reload or signal references found in retained logs; correlate with httpd.conf and web-file changes:'
     printf '%s\n' "$HTTPD_RELOAD_LOGS"
@@ -2428,8 +3626,8 @@ else
     status OK 'No selected HTTPD graceful-reload/signal references found in the searched logs.'
 fi
 subsection 'CVE-2026-88772 DTLS and NSPPE event correlation'
-DTLS_EVENT_LINES=$(zgrep -E -i -n 'SSL_HANDSHAKE_FAILURE.*DTLSv1[.]0.*Handshake failure-Internal Error' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | tail -30)
-NSPPE_EVENT_LINES=$(zgrep -E -i -n 'orphan rings|pitboss[^[:cntrl:]]*NOT restarting NSPPE|NSPPE[^[:cntrl:]]*(exit|crash|signal|terminated)' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | tail -50)
+DTLS_EVENT_LINES=$(zgrep -E -i -n 'SSL_HANDSHAKE_FAILURE.*DTLSv1[.]0.*Handshake failure-Internal Error' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | chrono_sort | tail -30)
+NSPPE_EVENT_LINES=$(zgrep -E -i -n 'orphan rings|pitboss[^[:cntrl:]]*NOT restarting NSPPE|NSPPE[^[:cntrl:]]*(exit|crash|signal|terminated)' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | chrono_sort | tail -50)
 if [ -n "$DTLS_EVENT_LINES" ]; then
     printf '%s\n' "$DTLS_EVENT_LINES"
     DTLS_EVENT_FOUND=1
@@ -2481,7 +3679,7 @@ fi
 printf '\n--- CVE-2026-88771 two-stage log-chain indicators ---\n'
 HTTP_IOC_LOGS_FOUND=0
 for f in /var/log/httpaccess* /var/log/httperror*; do [ -f "$f" ] && [ -r "$f" ] && HTTP_IOC_LOGS_FOUND=1; done
-INDEX_LINES=$(zgrep -hE -i 'INDEX:[A-Za-z0-9+/=]{8,}' /var/log/httpaccess* /var/log/httperror* 2>/dev/null | tail -20)
+INDEX_LINES=$(zgrep -hE -i 'INDEX:[A-Za-z0-9+/=]{8,}' /var/log/httpaccess* /var/log/httperror* 2>/dev/null | chrono_sort | tail -20)
 INDEX_PAYLOADS=$(zgrep -hoE 'INDEX:[A-Za-z0-9+/=]{8,}' /var/log/httpaccess* /var/log/httperror* 2>/dev/null | sort -u | head -10)
 if [ -n "$INDEX_PAYLOADS" ]; then
     status ACTION 'Base64 INDEX: payload candidate(s) found in HTTP logs. These are public-chain indicators, not proof of successful execution. Decoded content is displayed as inert text only:'
@@ -2563,10 +3761,11 @@ else
     status OK 'No scanner-probe string found in the retained candidate authentication/system logs. Coverage depends on log format and retention.'
 fi
 subsection 'PPE/pitboss log injection and two-stage correlation'
-PITBOSS_LINES=$(zgrep -hE -i 'pitboss PPE (missed too many heartbeats|unexpectedly died)[[:space:]]?NSPPE(-[0-9]+)?[^[:cntrl:]]*(;|%3[bB]|`|%60|\$\(|\$\{IFS\}|%24%7BIFS%7D)' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | tail -40)
+PITBOSS_LINES=$(zgrep -hE -i 'pitboss PPE (missed too many heartbeats|unexpectedly died)[[:space:]]?NSPPE(-[0-9]+)?[^[:cntrl:]]*(;|%3[bB]|`|%60|\$\(|\$\{IFS\}|%24%7BIFS%7D)' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | chrono_sort | tail -40)
 if [ -n "$PITBOSS_LINES" ]; then
     status ACTION 'System/authentication-log line matches a publicly reported PPE trigger (missed heartbeats or unexpectedly died) followed by shell syntax. This records an exploit attempt; it does not prove the line was later processed or that a command ran. Preserve and correlate it:'
     printf '%s\n' "$PITBOSS_LINES"
+    printf '%s\n' 'GEIGER: newest 40 matching lines in time order; the complete summary by payload follows below.'
 elif [ "$SYS_IOC_LOGS_FOUND" -eq 0 ]; then
     status CHECK 'No readable ns.log/messages/notice/nsvpn files found; the authentication-trigger check has no coverage.'
 else
@@ -2579,6 +3778,11 @@ elif [ -n "$PITBOSS_LINES" ]; then
 elif [ -n "$INDEX_LINES" ]; then
     status CHECK 'An INDEX: token was found without the selected authentication trigger. Review decoded text and correlate its timestamp with authentication logs and resulting files.'
 fi
+
+# GEIGER: complete attempt summary, source IPs, execution traces and time order
+# (points 1-3) instead of judging the attack from the newest 40 lines above.
+progress 'Attack logs: injection summary and execution traces (GEIGER)'
+geiger_analysis injection
 
 
 subsection 'Multi-signal authentication-log injection without a PPE trigger'
@@ -2626,8 +3830,8 @@ else
 fi
 
 subsection 'Reconnaissance: nsepa.deb and vp_probe_nonexist'
-NSEPA_PROBES=$(zgrep -E -i -n 'nsepa[.]deb' /var/log/httpaccess* 2>/dev/null | grep -E '"[[:space:]]*206[[:space:]]+1([[:space:]]|$)' | tail -20)
-VP_PROBE_HITS=$(zgrep -E -i -n 'vp_probe_nonexist' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -20)
+NSEPA_PROBES=$(zgrep -E -i -n 'nsepa[.]deb' /var/log/httpaccess* 2>/dev/null | grep -E '"[[:space:]]*206[[:space:]]+1([[:space:]]|$)' | chrono_sort | tail -20)
+VP_PROBE_HITS=$(zgrep -E -i -n 'vp_probe_nonexist' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -20)
 if [ -n "$NSEPA_PROBES" ]; then
     status CHECK 'HTTP access logs contain nsepa.deb requests answered with HTTP 206 and a one-byte response. Public reporting associates this with reconnaissance/probing; it does not establish exploitation. Review source, timestamps, and adjacent requests:'
     printf '%s\n' "$NSEPA_PROBES"
@@ -2645,20 +3849,20 @@ else
     status OK 'No vp_probe_nonexist marker found in available HTTP access/error logs. This is limited to retained logs and the selected format.'
 fi
 subsection 'Authentication endpoint requests and payload combinations'
-EXPLOIT_PATH_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html|/logon/LogonPoint/Authentication/GetUserName)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -40)
+EXPLOIT_PATH_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html|/logon/LogonPoint/Authentication/GetUserName)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -40)
 if [ -n "$EXPLOIT_PATH_HITS" ]; then
     status CHECK 'Requests to endpoints observed in public honeypot/research reporting found. These are legitimate NetScaler paths; the requests alone are not IOCs. Review any logged username/body/User-Agent for shell metacharacters or payloads and correlate with auth/system logs:'
     printf '%s\n' "$EXPLOIT_PATH_HITS"
 else
     status OK 'No requests to selected public exploit/authentication paths found in available HTTP logs; this is limited by log retention and format.'
 fi
-AUTH_POISON_HTTP_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html|/logon/LogonPoint/Authentication/GetUserName)[^[:cntrl:]]*(pitboss|NSPPE|PPE unexpectedly died|missed too many heartbeats|%3[bB]|%60|\$\{IFS\}|curl[[:space:]]|wget[[:space:]]|fetch[[:space:]])' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -30)
+AUTH_POISON_HTTP_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html|/logon/LogonPoint/Authentication/GetUserName)[^[:cntrl:]]*(pitboss|NSPPE|PPE unexpectedly died|missed too many heartbeats|%3[bB]|%60|\$\{IFS\}|curl[[:space:]]|wget[[:space:]]|fetch[[:space:]])' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -30)
 if [ -n "$AUTH_POISON_HTTP_HITS" ]; then
     status ACTION 'A logged exploit-path request also contains a public log-poisoning trigger or shell/download marker. Review the full request and correlate with ns.log/messages and file artifacts; this indicates an attempt, not automatically successful execution:'
     printf '%s\n' "$AUTH_POISON_HTTP_HITS"
 fi
 subsection 'VPN icon requests combined with encoded PHP markers'
-ICO_STAGE_HITS=$(zgrep -E -i -n '/vpn/media/[^[:space:]]+[.]ico[^[:cntrl:]]*PD9[A-Za-z0-9+/=]{12,}|PD9[A-Za-z0-9+/=]{12,}[^[:cntrl:]]*/vpn/media/[^[:space:]]+[.]ico' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -30)
+ICO_STAGE_HITS=$(zgrep -E -i -n '/vpn/media/[^[:space:]]+[.]ico[^[:cntrl:]]*PD9[A-Za-z0-9+/=]{12,}|PD9[A-Za-z0-9+/=]{12,}[^[:cntrl:]]*/vpn/media/[^[:space:]]+[.]ico' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -30)
 if [ -n "$ICO_STAGE_HITS" ]; then
     status ACTION 'HTTP log line combines a /vpn/media/*.ico request with a User-Agent-like base64 PHP prefix (PD9). Treat as a targeted exploitation lead and correlate with log injection and resulting files:'
     printf '%s\n' "$ICO_STAGE_HITS"
@@ -2666,14 +3870,14 @@ else
     status OK 'No selected /vpn/media/*.ico plus base64-PHP (PD9...) pattern found in available HTTP logs.'
 fi
 subsection 'Webshell/tunneler HTTP markers and staging-path requests'
-UX_HEADER_LOG_HITS=$(zgrep -E -i -n 'HTTP_NSC_(LDAP|CLIENTTYPE)|HTTP_X_UX(_[0-9]+)?|/vpn/media/[^[:space:]]+[.]ico|/vpn/scripts/(linux|vista|mac)/[^[:space:]]+[.](sig|deb|php)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -40)
+UX_HEADER_LOG_HITS=$(zgrep -E -i -n 'HTTP_NSC_(LDAP|CLIENTTYPE)|HTTP_X_UX(_[0-9]+)?|/vpn/media/[^[:space:]]+[.]ico|/vpn/scripts/(linux|vista|mac)/[^[:space:]]+[.](sig|deb|php)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -40)
 if [ -n "$UX_HEADER_LOG_HITS" ]; then
     status CHECK 'HTTP logs contain reported webshell/tunneler header names or VPN staging-path requests. Logs may not record request headers; correlate timestamps and inspect response status, size, duration, and corresponding error-log entries:'
     printf '%s\n' "$UX_HEADER_LOG_HITS"
 else
     status OK 'No selected WHIPSHOT/SLAPSHOT header names or reported VPN staging-path requests found in available HTTP logs; coverage depends on retained logs and log format.'
 fi
-PITSCALER_HTTP_HITS=$(zgrep -E -i -n 'ns-88771-poc|/vpn/media/[^[:space:]]+[.]ico|PD9[A-Za-z0-9+/=]{12,}|NSC_TASS|CsrfToken' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | tail -40)
+PITSCALER_HTTP_HITS=$(zgrep -E -i -n 'ns-88771-poc|/vpn/media/[^[:space:]]+[.]ico|PD9[A-Za-z0-9+/=]{12,}|NSC_TASS|CsrfToken' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -40)
 if [ -n "$PITSCALER_HTTP_HITS" ]; then
     status CHECK 'HTTP logs contain additional public-research markers (test strings, staging paths, base64-PHP prefix, or cookie names). These are triage clues; cookie names alone and ns-88771-poc can be benign/authorized tests. Do not expose cookie values; correlate method, URI, response, and timestamps with other evidence:'
     printf '%s\n' "$PITSCALER_HTTP_HITS" | awk '
@@ -2744,26 +3948,26 @@ fi
 printf '%s\n' 'Follow-up: inspect external egress records from NSIP/SNIP for configuration/key/backup transfers and internal tunneling, including /nsconfig, F1.key/F2.key, ns.conf saved copies, and /var/ns_sys_backup. Do not print archive or private-key contents. NSGW banner or HTTP 404 alone is insufficient. No active network probe is performed.'
 
 
-subsection 'Operator-reported payload delivery: pyrlnk.cc domains'
-# Domain boundaries exclude lookalikes such as evilpyrlnk.cc / pyrlnk.cc.example.
+subsection 'Operator-reported payload delivery: pylrk.cc domains'
+# Domain boundaries exclude lookalikes such as evilpylrk.cc / pylrk.cc.example.
 # Count only, no attacker URLs/tokens or logged credential fields are printed.
-PYRLNK_LOG_COVERAGE=0
+PYLRK_LOG_COVERAGE=0
 for f in /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/sh.log* /var/log/bash.log* /var/log/named* /var/log/dns*; do
-    [ -f "$f" ] && [ -r "$f" ] && PYRLNK_LOG_COVERAGE=1
+    [ -f "$f" ] && [ -r "$f" ] && PYLRK_LOG_COVERAGE=1
 done
-PYRLNK_DOMAIN_PATTERN='(^|[^[:alnum:]_.-])([[:alnum:]-]+[.])*pyrlnk[.]cc([^[:alnum:]_.-]|$)'
-PYRLNK_LOG_COUNT=$(zgrep -hiE -c "$PYRLNK_DOMAIN_PATTERN" /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/sh.log* /var/log/bash.log* /var/log/named* /var/log/dns* 2>/dev/null | awk '{n+=$0} END{print n+0}')
-if [ "$PYRLNK_LOG_COUNT" -gt 0 ]; then
-    status CHECK "Operator-reported payload-delivery domain pyrlnk[.]cc or a subdomain occurs in $PYRLNK_LOG_COUNT retained log line(s). The report is independently unverified; a logged download command is not proof of execution or transfer, and the destination is not the incoming attacker source. Preserve originals and correlate timestamps with nsaaad events, /v artifacts, DNS and outbound firewall telemetry. URL/token values are withheld."
-elif [ "$PYRLNK_LOG_COVERAGE" -eq 0 ]; then
-    status CHECK 'No readable candidate logs; pyrlnk.cc delivery-domain coverage unavailable.'
+PYLRK_DOMAIN_PATTERN='(^|[^[:alnum:]_.-])([[:alnum:]-]+[.])*pylrk[.]cc([^[:alnum:]_.-]|$)'
+PYLRK_LOG_COUNT=$(zgrep -hiE -c "$PYLRK_DOMAIN_PATTERN" /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/sh.log* /var/log/bash.log* /var/log/named* /var/log/dns* 2>/dev/null | awk '{n+=$0} END{print n+0}')
+if [ "$PYLRK_LOG_COUNT" -gt 0 ]; then
+    status CHECK "Operator-reported payload-delivery domain pylrk[.]cc or a subdomain occurs in $PYLRK_LOG_COUNT retained log line(s). The report is independently unverified; a logged download command is not proof of execution or transfer, and the destination is not the incoming attacker source. Preserve originals and correlate timestamps with nsaaad events, /v artifacts, DNS and outbound firewall telemetry. URL/token values are withheld."
+elif [ "$PYLRK_LOG_COVERAGE" -eq 0 ]; then
+    status CHECK 'No readable candidate logs; pylrk.cc delivery-domain coverage unavailable.'
 else
-    status OK 'No pyrlnk.cc or subdomain reference found in retained candidate logs. Encoded destinations, removed records and external-only DNS/egress history are outside coverage.'
+    status OK 'No pylrk.cc or subdomain reference found in retained candidate logs. Encoded destinations, removed records and external-only DNS/egress history are outside coverage.'
 fi
 printf '%s\n' 'Follow-up: validate the dated domain report with your security team; assess an egress block for the base domain/subdomains using approved DNS/proxy/firewall controls. Do not infer HTTPS merely from port 443. This script performs no DNS lookup, download or automatic blocking.'
 
 subsection 'Public callback destinations and DNS references'
-PUBLIC_CALLBACK_HITS=$(zgrep -E -i -n 'instances[.]httpworkbench[.]com|httpworkbench[.]com|entretiensol[.]com|gsocket[.]io|31[.]56[.]197[.]72|64[.]94[.]85[.]67|139[.]180[.]152[.]138|77[.]83[.]199[.]39|104[.]248[.]244[.]66|23[.]27[.]143[.]20|62[.]133[.]62[.]80|45[.]141[.]21[.]130|199[.]233[.]217[.]13|130[.]94[.]20[.]222' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | tail -40)
+PUBLIC_CALLBACK_HITS=$(zgrep -E -i -n 'instances[.]httpworkbench[.]com|httpworkbench[.]com|entretiensol[.]com|gsocket[.]io|31[.]56[.]197[.]72|64[.]94[.]85[.]67|139[.]180[.]152[.]138|77[.]83[.]199[.]39|104[.]248[.]244[.]66|23[.]27[.]143[.]20|62[.]133[.]62[.]80|45[.]141[.]21[.]130|199[.]233[.]217[.]13|130[.]94[.]20[.]222' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | chrono_sort | tail -40)
 if [ -n "$PUBLIC_CALLBACK_HITS" ]; then
     status CHECK 'References to selected public NetScaler campaign payload/callback indicators found in retained logs. IPs/domains are time-sensitive, may be reused or victim-specific, and must not be treated as a blocklist or attribution by themselves:'
     printf '%s\n' "$PUBLIC_CALLBACK_HITS"
@@ -2771,7 +3975,7 @@ else
     status OK 'No references to the selected public payload/callback indicators found in the searched retained logs. The source IoC lists are not exhaustive.'
 fi
 printf '%s\n' 'Network follow-up from TENEX: review VLAN/firewall/IDS telemetry for the cleartext mDNS service name platypus-mesh.tcp over UDP/5353 and investigate unknown participants. This appliance-local script cannot recover historical multicast traffic or inspect other hosts on the VLAN.'
-DNS_CALLBACK_HITS=$(zgrep -E -i -n 'httpworkbench[.]com' /var/log/messages* /var/log/ns.log* /var/log/named* /var/log/dns* 2>/dev/null | tail -30)
+DNS_CALLBACK_HITS=$(zgrep -E -i -n 'httpworkbench[.]com' /var/log/messages* /var/log/ns.log* /var/log/named* /var/log/dns* 2>/dev/null | chrono_sort | tail -30)
 if [ -n "$DNS_CALLBACK_HITS" ]; then
     status CHECK 'A public-research DNS test/callback domain appears in local logs. Confirm whether the query originated from the ADC and correlate with endpoint, HTTP, and egress telemetry; domain presence alone does not prove compromise:'
     printf '%s\n' "$DNS_CALLBACK_HITS"
@@ -2782,15 +3986,15 @@ fi
 printf '\n--- Script extension references in HTTP error logs ---\n'
 ERROR_LOGS_FOUND=0
 for f in /var/log/httperror.log*; do [ -f "$f" ] && ERROR_LOGS_FOUND=1; done
-PHP_ERROR_HITS=$(zgrep -E -i -n '\.php' /var/log/httperror.log* 2>/dev/null | tail -50)
-SCRIPT_ERROR_HITS=$(zgrep -E -i -n '\.(sh|pl|sig|deb|rpm|tgz)' /var/log/httperror.log* /var/log/httperror-vpn.log* 2>/dev/null | tail -50)
+PHP_ERROR_HITS=$(zgrep -E -i -n '\.php' /var/log/httperror.log* 2>/dev/null | chrono_sort | tail -50)
+SCRIPT_ERROR_HITS=$(zgrep -E -i -n '\.(sh|pl|sig|deb|rpm|tgz)' /var/log/httperror.log* /var/log/httperror-vpn.log* 2>/dev/null | chrono_sort | tail -50)
 if [ -n "$PHP_ERROR_HITS" ]; then status CHECK 'PHP references found in HTTP error logs; review the request context and correlate timestamps:'; echo "$PHP_ERROR_HITS"; elif [ "$ERROR_LOGS_FOUND" -eq 0 ]; then status CHECK 'No candidate HTTP error log files found; coverage is unknown.'; else status OK 'No PHP references found in candidate HTTP error logs.'; fi
 if [ -n "$SCRIPT_ERROR_HITS" ]; then status CHECK 'References to .sh/.pl/.sig/.deb/.rpm/.tgz paths found in HTTP error logs; review the full request and correlate timestamps:'; echo "$SCRIPT_ERROR_HITS"; elif [ "$ERROR_LOGS_FOUND" -eq 1 ]; then status OK 'No .sh/.pl/.sig/.deb/.rpm/.tgz references found in candidate HTTP error logs.'; fi
 
 printf '\n--- Unusual HTTP methods, responses, and resource references ---\n'
 HTTP_REQUEST_LOGS_FOUND=0
 for f in /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn*; do [ -f "$f" ] && [ -r "$f" ] && HTTP_REQUEST_LOGS_FOUND=1; done
-HTTP_METHOD_RESOURCE_HITS=$(zgrep -E -i -n 'POST|[[:space:]]404[[:space:]]|[[:space:]]500[[:space:]]' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | grep -E -i '/(nf/auth/doAuthentication[.]do|cgi/login|p/u/doLogon[.]do|logon/LogonPoint/Authentication/GetUserName)|[.](php|pl|sh|sig|deb|rpm|tgz)([?[:space:]/]|$)|/vpn/media/[^[:space:]]+[.]ico' | tail -60)
+HTTP_METHOD_RESOURCE_HITS=$(zgrep -E -i -n 'POST|[[:space:]]404[[:space:]]|[[:space:]]500[[:space:]]' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | grep -E -i '/(nf/auth/doAuthentication[.]do|cgi/login|p/u/doLogon[.]do|logon/LogonPoint/Authentication/GetUserName)|[.](php|pl|sh|sig|deb|rpm|tgz)([?[:space:]/]|$)|/vpn/media/[^[:space:]]+[.]ico' | chrono_sort | tail -60)
 if [ -n "$HTTP_METHOD_RESOURCE_HITS" ]; then
     status CHECK 'HTTP log lines combine POST/error response markers with selected authentication, script, package, or VPN-media resources. Review method, source, status, response size/duration when logged, and nearby authentication/system events:'
     printf '%s\n' "$HTTP_METHOD_RESOURCE_HITS"
@@ -2838,8 +4042,8 @@ for f in /var/log/sh.log* /var/log/bash.log*; do
     [ -f "$f" ] && [ -r "$f" ] || continue
     SHELL_AUDIT_LOGS_FOUND=1
     case "$f" in
-        *.gz) matches=$(zgrep -E -i -n 'database\.php|/flash/nsconfig/keys|LDAPTLS_REQCERT|ldapsearch|(^|[[:space:]])openssl([[:space:]]|$)|/nsconfig/ns\.conf|/etc/auth\.conf|cp /usr/bin/bash|F1\.key|F2\.key|nobody|(^|[^[:alnum:]_])id([^[:alnum:]_]|$)|curl[[:space:]]|wget[[:space:]]|/ns_gui/vpn|/var/netscaler/logon|/var/vpn|/var/tmp' "$f" 2>/dev/null | tail -50) ;;
-        *) matches=$(grep -E -i -n 'database\.php|/flash/nsconfig/keys|LDAPTLS_REQCERT|ldapsearch|(^|[[:space:]])openssl([[:space:]]|$)|/nsconfig/ns\.conf|/etc/auth\.conf|cp /usr/bin/bash|F1\.key|F2\.key|nobody|(^|[^[:alnum:]_])id([^[:alnum:]_]|$)|curl[[:space:]]|wget[[:space:]]|/ns_gui/vpn|/var/netscaler/logon|/var/vpn|/var/tmp' "$f" 2>/dev/null | tail -50) ;;
+        *.gz) matches=$(zgrep -E -i -n 'database\.php|/flash/nsconfig/keys|LDAPTLS_REQCERT|ldapsearch|(^|[[:space:]])openssl([[:space:]]|$)|/nsconfig/ns\.conf|/etc/auth\.conf|cp /usr/bin/bash|F1\.key|F2\.key|nobody|(^|[^[:alnum:]_])id([^[:alnum:]_]|$)|curl[[:space:]]|wget[[:space:]]|fetch[[:space:]]|/ns_gui/vpn|/var/netscaler/logon|/var/vpn|/var/tmp' "$f" 2>/dev/null | tail -50) ;;
+        *) matches=$(grep -E -i -n 'database\.php|/flash/nsconfig/keys|LDAPTLS_REQCERT|ldapsearch|(^|[[:space:]])openssl([[:space:]]|$)|/nsconfig/ns\.conf|/etc/auth\.conf|cp /usr/bin/bash|F1\.key|F2\.key|nobody|(^|[^[:alnum:]_])id([^[:alnum:]_]|$)|curl[[:space:]]|wget[[:space:]]|fetch[[:space:]]|/ns_gui/vpn|/var/netscaler/logon|/var/vpn|/var/tmp' "$f" 2>/dev/null | tail -50) ;;
     esac
     if [ -n "$matches" ]; then SHELL_AUDIT_HITS="$SHELL_AUDIT_HITS\n--- $f ---\n$matches"; fi
 done
@@ -2848,8 +4052,8 @@ if [ -n "$SHELL_AUDIT_HITS" ]; then status CHECK 'Command-pattern matches found 
 printf '\n--- Gateway/VPN access-log session indicators ---\n'
 VPN_ACCESS_FILES_FOUND=0
 for f in /var/log/httpaccess-vpn.log*; do [ -f "$f" ] && [ -r "$f" ] && VPN_ACCESS_FILES_FOUND=1; done
-VPN_200_NO_RECEIVER=$(zgrep -E -v 'CitrixReceiver' /var/log/httpaccess-vpn.log* 2>/dev/null | grep ' 200 ' | tail -50)
-VPN_HEADLESS=$(zgrep -E -i -n 'HeadlessChrome' /var/log/httpaccess-vpn.log* 2>/dev/null | tail -50)
+VPN_200_NO_RECEIVER=$(zgrep -E -v 'CitrixReceiver' /var/log/httpaccess-vpn.log* 2>/dev/null | grep ' 200 ' | chrono_sort | tail -50)
+VPN_HEADLESS=$(zgrep -E -i -n 'HeadlessChrome' /var/log/httpaccess-vpn.log* 2>/dev/null | chrono_sort | tail -50)
 if [ "$VPN_ACCESS_FILES_FOUND" -eq 0 ]; then
     status CHECK 'No readable httpaccess-vpn.log files found; Gateway/VPN session-log checks have no coverage.'
 else
@@ -2891,7 +4095,7 @@ printf '%s\n' 'Purpose: complete vendor-supported integrity validation that this
 subsection 'Firewall containment reminder: reported payload IP'
 status CHECK 'BLOCKING RECOMMENDATION: block 213.209.159.55 on upstream firewalls for inbound access to public NetScaler VIPs and outbound connections from the appliance (NSIP/SNIP, including TCP 443). Validate and document the rule with the security team; this script cannot inspect or confirm upstream firewall enforcement.'
 printf '%s\n' 'Context: the IP is a reported payload destination. The operator-provided community comment also describes it as an incoming attack source; that attribution is not independently verified here. An IP reference inside a crafted username does not identify the incoming request source.'
-printf '%s\n' 'Port 443 may carry plain HTTP in this reported activity. An IP block does not replace patching, the applicable SAML workaround or incident investigation; delivery infrastructure can change. No firewall/ADC configuration is modified by this script.'
+printf '%s\n' 'Port 443 may carry plain HTTP in this reported activity. An IP block does not replace patching or incident investigation; delivery infrastructure can change. The SAML responder workaround is an interim mitigation for affected builds and is not required once the applicable CVE-2026-88779 fixed build is installed. No firewall/ADC configuration is modified by this script.'
 
 subsection 'File Integrity Monitoring'
 status CHECK 'Run the supported Citrix/NetScaler File Integrity Monitoring scan and compare results with a known-good baseline; this script does not run that scan.'
