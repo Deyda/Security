@@ -2,7 +2,7 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.62
+# Version: 9.64
 # Sample-specific checks below additionally use the operator-supplied 380d56
 # analysis screenshot and follow-up description (2026-10-02), not independently verified. No partial hash
 # is used. Paths/ports alone are CHECK; matching behavior requires investigation.
@@ -32,6 +32,8 @@
 #   https://www.deyda-consulting.de/expertise/netscaler-security-readiness/
 #
 # References
+#   Additional security bulletin: CTX697174 (CVE-2026-88779, SAML SP/IdP DoS)
+#   https://support.citrix.com/external/article/CTX697174
 #   NetScaler CVE checklist (DE):
 #   https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/
 #   NetScaler CVE checklist (EN):
@@ -87,6 +89,16 @@
 #   Obtain the reference from a trusted, identical firmware build; never infer it from an
 #   appliance under investigation. Internal /var/python/bin and /var/configd_devno values
 #   below come from one clean 14.1-73.37 appliance and are not Citrix-published checksums.
+#
+# Optional CLI captures for the additional Global Deny List assessment:
+#   DEYDA_GDL_SIGNATURES_FILE=/path/to/signatures.txt
+#   DEYDA_GDL_STATS_FILE=/path/to/denylist-aaa-request.txt
+#   Capture "show appfw signatures" and "stat denylist global AAA_REQUEST"
+#   in the ADC CLI, then set these variables when invoking the script. Captures
+#   are reported as operator-supplied evidence, not live verification. If omitted,
+#   the appliance attempts the two read-only queries via /netscaler/cli_script.sh
+#   or /netscaler/nscli -c,
+#   each limited to 15 seconds. Missing CLI support produces CHECK, no prompts.
 #
 # Status labels: [OK] no match in scanned scope; [ACTION] investigate indicator;
 # [CHECK] manual validation required or scan coverage incomplete.
@@ -365,7 +377,7 @@ check_nslog_nextfile_state() {
 FW_PATCHED=UNKNOWN
 
 printf 'Deyda Consulting NetScaler IOC and CVE triage report\n'
-printf 'Host: %s\nTime: %s\nScript version: 9.62\n\n' "$HOST" "$NOW"
+printf 'Host: %s\nTime: %s\nScript version: 9.64\n\n' "$HOST" "$NOW"
 printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n\n'
 printf 'Related articles\n  DE: https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
 printf '  EN: https://www.deyda.net/index.php/en/2026/08/28/netscaler-cve-checklist-updates-security-assessment-and-incident-response/\n\n'
@@ -475,7 +487,8 @@ else
     status CHECK 'Firmware comparison skipped; rerun with the version from show ns version as argument, e.g. sh deyda-netscaler-ioc-check.sh 14.1-73.37.nc.'
 fi
 printf '\nCVE configuration matches below show feature/precondition clues from the configuration file.\n'
-printf 'If the entered build meets the fixed threshold, these matches do not mean the patched appliance remains vulnerable; they may matter when assessing exposure before the update.\n'
+printf 'The preceding threshold applies to CTX697096 (88771-88778). CVE-2026-88779 has a separate SAML assessment and newer thresholds below.\n'
+printf 'For each CVE, a matching precondition on its fixed build is configuration context; it may matter when assessing exposure before the update.\n'
 
 if [ -r "$CONFIG" ]; then
     printf '\nSaved configuration reviewed: %s\n' "$CONFIG"
@@ -600,6 +613,47 @@ if [ -r "$CONFIG" ]; then
     printf 'vServer search source: %s; Enhanced ISN assessment source: %s\n' "$CONFIG" "$ISN_SOURCE"
 else
     status CHECK "Saved config $CONFIG is unavailable; perform all CVE precondition checks against the running configuration."
+fi
+
+subsection 'CVE-2026-88779: SAML SP or IdP denial of service (CTX697174)'
+printf '%s\n' 'Memory overflow leading to denial of service; configured SAML SP or SAML IdP is the bulletin precondition.'
+printf '%s\n' 'Fixed minimums: standard 14.1 / 14.1 FIPS 73.41; standard 13.1 64.28; 13.1 FIPS/NDcPP 37.282.'
+printf '%s\n' 'Source: supplied CTX697174 bulletin dated 2026-10-04; verify the current vendor bulletin before changes.'
+if [ -r "$CONFIG" ]; then
+    SAML_DOS_SP=$(awk 'tolower($0) ~ /^[[:space:]]*add[[:space:]]+authentication[[:space:]]+samlaction[[:space:]]+/ { n++ } END { print n+0 }' "$CONFIG")
+    SAML_DOS_IDP=$(awk 'tolower($0) ~ /^[[:space:]]*add[[:space:]]+authentication[[:space:]]+samlidpprofile[[:space:]]+/ { n++ } END { print n+0 }' "$CONFIG")
+    printf 'Saved-config SAML SP actions: %s; SAML IdP profiles: %s\n' "$SAML_DOS_SP" "$SAML_DOS_IDP"
+    if [ "$SAML_DOS_SP" -eq 0 ] && [ "$SAML_DOS_IDP" -eq 0 ]; then
+        status OK 'No SAML SP action or SAML IdP profile found in the scanned saved configuration; CVE-2026-88779 precondition not found in this source.'
+    elif [ -n "${FW_FAMILY-}" ] && [ -n "${FW_BUILD-}" ]; then
+        SAML_DOS_REQUIRED=''
+        case "$FW_FAMILY" in
+            14.1) SAML_DOS_REQUIRED='73.41' ;;
+            13.1)
+                if [ "$FW_MAJOR" -eq 37 ] || printf '%s\n' "$CURRENT_INPUT" | grep -Eiq 'FIPS|NDcPP'; then
+                    SAML_DOS_REQUIRED='37.282'
+                else
+                    SAML_DOS_REQUIRED='64.28'
+                fi ;;
+        esac
+        if [ -n "$SAML_DOS_REQUIRED" ]; then
+            SAML_DOS_MAJOR=${SAML_DOS_REQUIRED%.*}
+            SAML_DOS_MINOR=${SAML_DOS_REQUIRED#*.}
+            printf 'CVE-2026-88779 firmware comparison: %s-%s; fixed minimum %s-%s.\n' "$FW_FAMILY" "$FW_BUILD" "$FW_FAMILY" "$SAML_DOS_REQUIRED"
+            if [ "$FW_MAJOR" -gt "$SAML_DOS_MAJOR" ] || { [ "$FW_MAJOR" -eq "$SAML_DOS_MAJOR" ] && [ "$FW_MINOR" -ge "$SAML_DOS_MINOR" ]; }; then
+                status OK 'SAML precondition found, but the assessed firmware meets the CVE-2026-88779 fixed-build threshold. Earlier compromise and crash causes require separate investigation.'
+            else
+                status ACTION 'SAML SP/IdP precondition found and firmware is below the CVE-2026-88779 fixed build; install the relevant update promptly. Workaround-policy recognition does not clear this firmware finding.'
+            fi
+        else
+            status CHECK 'SAML SP/IdP precondition found, but a CVE-2026-88779 threshold could not be selected; verify release, edition and live build.'
+        fi
+    else
+        status CHECK 'SAML SP/IdP precondition found, but the full firmware build is unknown; verify show ns version against CTX697174.'
+    fi
+    printf 'Scope: %s is saved configuration, not necessarily live configuration. Only object counts are displayed; SAML secrets are omitted.\n' "$CONFIG"
+else
+    status CHECK 'Saved configuration unreadable; CVE-2026-88779 SAML SP/IdP applicability could not be assessed.'
 fi
 
 # Access-control inventory intentionally omits user passwords and password hashes.
@@ -768,6 +822,140 @@ if [ -r "$CONFIG" ]; then
 else
     status CHECK 'Saved configuration unreadable; SAML workaround inventory unavailable.'
 fi
+
+# Query only two fixed read-only CLI commands. No credentials, input evaluation,
+# arbitrary CLI commands, configuration writes or counter resets are used.
+gdl_read_cli() {
+    case "$1" in
+        'show appfw signatures'|'stat denylist global AAA_REQUEST') ;;
+        *) return 1 ;;
+    esac
+    [ "$RUNNING_ON_ADC" = YES ] || return 1
+    command -v perl >/dev/null 2>&1 || return 1
+    # A pending alarm survives exec and bounds CLI/authentication waits to 15s.
+    if [ -x /netscaler/cli_script.sh ]; then
+        perl -e 'alarm 15; exec {"/netscaler/cli_script.sh"} "/netscaler/cli_script.sh", $ARGV[0]; exit 127;' "$1" </dev/null 2>&1
+    elif [ -x /netscaler/nscli ]; then
+        perl -e 'alarm 15; exec {"/netscaler/nscli"} "/netscaler/nscli", "-c", $ARGV[0]; exit 127;' "$1" </dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+# Deliberately restrict the version parser to the Default Signatures object;
+# a higher version on another object must not clear a stale default version.
+gdl_default_version() {
+    awk '
+    {
+        line=$0; low=tolower(line)
+        if(low ~ /(^|[[:space:]])name[[:space:]]*:/) {
+            sub(/^.*[Nn][Aa][Mm][Ee][[:space:]]*:[[:space:]]*/, "", line)
+            in_default=(tolower(line) ~ /^["\047]?[*]default[[:space:]]+signatures(["\047[:space:]]|$)/)
+        }
+        if(in_default && low ~ /encrypted[[:space:]]+version[[:space:]]*:/) {
+            sub(/^.*[Vv][Ee][Rr][Ss][Ii][Oo][Nn][[:space:]]*:[[:space:]]*/, "", line)
+            if(line ~ /^[vV]?[0-9]+([[:space:]]|$)/) {
+                sub(/^[vV]/,"",line); sub(/[[:space:]].*$/, "", line)
+                print line; exit
+            }
+        }
+    }'
+}
+
+gdl_counter_state() {
+    awk '
+    {
+        line=$0; low=tolower(line)
+        if(low ~ /(rules?[[:space:]_-]*(evaluated|matched|hits)|packets?[[:space:]_-]*(evaluated|matched|dropped|denied)|total[[:space:]_-]*(hits|matches))([[:space:]]|:|=)/) {
+            sub(/^[^:=]*[:=][[:space:]]*/, "", line)
+            if(line ~ /^[0-9]+([[:space:]]|$)/) { seen=1; if(line+0>0) positive=1 }
+        }
+    }
+    END { if(positive) print "ACTIVITY"; else if(seen) print "ZERO"; else print "UNPARSED" }'
+}
+
+subsection 'CVE-2026-88779: Global Deny List signatures and AAA_REQUEST statistics'
+printf '%s\n' 'Additional mitigation checks from the supplied Citrix Community guidance; these do not replace the fixed-build assessment above.'
+printf '%s\n' 'Console service, or on-premises Console with Cloud Connect, and Virtual patching Enabled are required. Local signatures/statistics alone do not verify these Console settings.'
+GDL_SCOPE=UNKNOWN
+if [ -r "$CONFIG" ] && [ "${SAML_DOS_SP:-0}" -eq 0 ] && [ "${SAML_DOS_IDP:-0}" -eq 0 ]; then
+    GDL_SCOPE=NO_SAML
+elif [ -n "${FW_FAMILY-}" ] && [ -n "${FW_BUILD-}" ]; then
+    if [ -n "${SAML_DOS_REQUIRED-}" ] && { [ "$FW_MAJOR" -gt "${SAML_DOS_MAJOR:-999999}" ] || { [ "$FW_MAJOR" -eq "${SAML_DOS_MAJOR:-999999}" ] && [ "$FW_MINOR" -ge "${SAML_DOS_MINOR:-999999}" ]; }; }; then
+        GDL_SCOPE=FIXED
+    elif printf '%s\n' "$CURRENT_INPUT" | grep -Eiq 'FIPS|NDcPP' || { [ "$FW_FAMILY" = '13.1' ] && [ "$FW_MAJOR" -eq 37 ]; }; then
+        GDL_SCOPE=EDITION_UNCONFIRMED
+    elif [ "$FW_FAMILY" = '14.1' ]; then
+        if [ "$FW_MAJOR" -gt 73 ] || { [ "$FW_MAJOR" -eq 73 ] && [ "$FW_MINOR" -ge 41 ]; }; then GDL_SCOPE=FIXED
+        elif [ "$FW_MAJOR" -eq 73 ] && [ "$FW_MINOR" -ge 37 ]; then GDL_SCOPE=SUPPORTED_RANGE
+        else GDL_SCOPE=OUTSIDE_RANGE; fi
+    elif [ "$FW_FAMILY" = '13.1' ]; then
+        if [ "$FW_MAJOR" -gt 64 ] || { [ "$FW_MAJOR" -eq 64 ] && [ "$FW_MINOR" -ge 28 ]; }; then GDL_SCOPE=FIXED
+        elif [ "$FW_MAJOR" -eq 64 ] && [ "$FW_MINOR" -ge 23 ]; then GDL_SCOPE=SUPPORTED_RANGE
+        else GDL_SCOPE=OUTSIDE_RANGE; fi
+    fi
+fi
+printf 'Reported mitigation scope: %s\n' "$GDL_SCOPE"
+case "$GDL_SCOPE" in
+    NO_SAML) status OK 'No SAML SP/IdP prerequisite found in saved configuration; this CVE-specific Global Deny List mitigation is not required by the scanned configuration.' ;;
+    FIXED) status OK 'Firmware meets the CVE-2026-88779 fixed threshold; Global Deny List mitigation is not a prerequisite for that firmware result.' ;;
+    *)
+        case "$GDL_SCOPE" in
+            SUPPORTED_RANGE) printf '%s\n' 'Build is in the reported standard-version mitigation range. Verify signature version >=24 and Console prerequisites until updating.' ;;
+            OUTSIDE_RANGE) status CHECK 'Build is outside the published mitigation ranges (14.1-73.37..<73.41 or 13.1-64.23..<64.28); do not assume Global Deny List protection. Update to the applicable fixed build.' ;;
+            EDITION_UNCONFIRMED) status CHECK 'The supplied Global Deny List guidance does not establish these mitigation ranges for FIPS/NDcPP; confirm support for this edition with Citrix.' ;;
+            *) status CHECK 'Build or SAML applicability is unknown; Global Deny List mitigation applicability is unverified.' ;;
+        esac
+        GDL_SIGNATURE_OUTPUT=''; GDL_SIGNATURE_RC=1
+        GDL_STATS_OUTPUT=''; GDL_STATS_RC=1
+        if [ -n "${DEYDA_GDL_SIGNATURES_FILE-}" ]; then
+            if [ -f "$DEYDA_GDL_SIGNATURES_FILE" ] && [ -r "$DEYDA_GDL_SIGNATURES_FILE" ]; then
+                GDL_SIGNATURE_OUTPUT=$(cat "$DEYDA_GDL_SIGNATURES_FILE"); GDL_SIGNATURE_RC=0
+                printf 'Signature source: operator-supplied CLI capture %s (not a live verification).\n' "$DEYDA_GDL_SIGNATURES_FILE"
+            fi
+        elif [ "$RUNNING_ON_ADC" = YES ]; then
+            GDL_SIGNATURE_OUTPUT=$(gdl_read_cli 'show appfw signatures'); GDL_SIGNATURE_RC=$?
+            printf '%s\n' 'Signature source: attempted local read-only ADC CLI query (15-second limit).'
+        fi
+        if [ -n "${DEYDA_GDL_STATS_FILE-}" ]; then
+            if [ -f "$DEYDA_GDL_STATS_FILE" ] && [ -r "$DEYDA_GDL_STATS_FILE" ]; then
+                GDL_STATS_OUTPUT=$(cat "$DEYDA_GDL_STATS_FILE"); GDL_STATS_RC=0
+                printf 'Statistics source: operator-supplied CLI capture %s (not a live verification).\n' "$DEYDA_GDL_STATS_FILE"
+            fi
+        elif [ "$RUNNING_ON_ADC" = YES ]; then
+            GDL_STATS_OUTPUT=$(gdl_read_cli 'stat denylist global AAA_REQUEST'); GDL_STATS_RC=$?
+            printf '%s\n' 'Statistics source: attempted local read-only ADC CLI query (15-second limit).'
+        fi
+        if [ "$GDL_SIGNATURE_RC" -eq 0 ] && ! printf '%s\n' "$GDL_SIGNATURE_OUTPUT" | grep -Eiq '(^|[[:space:]])(ERROR:|not authorized|permission denied|authentication failed|unknown command|invalid command)'; then
+            GDL_VERSION=$(printf '%s\n' "$GDL_SIGNATURE_OUTPUT" | gdl_default_version)
+            if [ -n "$GDL_VERSION" ]; then
+                printf 'Default Signatures / Encrypted Version observed: %s\n' "$GDL_VERSION"
+                if [ "$GDL_VERSION" -ge 24 ]; then
+                    status OK 'Default Signatures encrypted version is >=24 in the selected source. This confirms the version only, not effective mitigation or Console configuration.'
+                else
+                    status CHECK 'Default Signatures encrypted version is below 24; the required signature revision is not confirmed. Check Console connectivity, Virtual patching and signature delivery; prioritize the firmware update.'
+                fi
+            else
+                status CHECK 'A numeric Encrypted Version could not be parsed for *Default Signatures; verify show appfw signatures manually. No signature-version OK was inferred.'
+            fi
+        else
+            status CHECK 'Signature query/capture unavailable or unsuccessful; run show appfw signatures in the ADC CLI and verify *Default Signatures / Encrypted Version >=24.'
+        fi
+        if [ "$GDL_STATS_RC" -eq 0 ] && printf '%s\n' "$GDL_STATS_OUTPUT" | grep -Eiq 'denylist|AAA_REQUEST|rule.*evaluat' && ! printf '%s\n' "$GDL_STATS_OUTPUT" | grep -Eiq '(^|[[:space:]])(ERROR:|not authorized|permission denied|authentication failed|unknown command|invalid command)'; then
+            printf '\nAAA_REQUEST statistics (selected source; inspect counters and Last Hit Time):\n'
+            printf '%s\n' "$GDL_STATS_OUTPUT" | head -100
+            GDL_COUNTER_STATE=$(printf '%s\n' "$GDL_STATS_OUTPUT" | gdl_counter_state)
+            case "$GDL_COUNTER_STATE" in
+                ACTIVITY) status OK 'Positive evaluation/match counters were observed. This shows recorded activity, not complete protection; distinguish evaluated requests from blocked hits and inspect Last Hit Time.' ;;
+                ZERO) status OK 'Recognized counters are zero in the selected statistics. Zero is not a failure indication and does not prove that mitigation is disabled or working.' ;;
+                *) status CHECK 'Statistics were retrieved, but the counter layout was not recognized; inspect evaluation/hit counters and Last Hit Time manually. No activity was inferred from dates or unrelated numbers.' ;;
+            esac
+        else
+            status CHECK 'AAA_REQUEST statistics query/capture unavailable or unsuccessful; run stat denylist global AAA_REQUEST in the ADC CLI. Missing statistics are not proof of disabled mitigation.'
+        fi
+        status CHECK 'Confirm in NetScaler Console: service or on-premises with Cloud Connect; Virtual patching Status Enabled. This remote setting cannot be verified from local ns.conf alone.'
+        ;;
+esac
 
 if [ "$RUNNING_ON_ADC" = YES ]; then
 section '3. Host integrity and persistence'
