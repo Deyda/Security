@@ -2,14 +2,15 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.64
+# Version: 9.65
 # Sample-specific checks below additionally use the operator-supplied 380d56
 # analysis screenshot and follow-up description (2026-10-02), not independently verified. No partial hash
 # is used. Paths/ports alone are CHECK; matching behavior requires investigation.
 # New operator-reported lead (2026-10-02): pyrlnk.cc and its subdomains as
 # attempted payload delivery destinations; independently unverified, time-sensitive.
-# Changes: recognize pol_saml_prefix_v5c and per-vServer AAA_REQUEST bindings;
-# normalize the standard-build reference scope for compact and full CLI versions.
+# Changes: detect the SAML workaround by request-expression and DROP action rather
+# than policy name; verify its AAA_REQUEST bindings. Matching internal package
+# hashes now report identity matches independently of the reference build label.
 # Confidential vendor policy expressions are neither embedded nor printed.
 # Earlier changes: tighten real nsaaad lifecycle matching; exclude LDAP username payloads
 # and monitoring command echoes; bound reboot keywords to avoid powerbi noise.
@@ -755,7 +756,7 @@ if [ -r "$CONFIG" ]; then
         if(active) fields[++n]=value
         return n
     }
-    function known(name) {return name=="pol_samlauth_prefixlist_block" || name=="pol_saml_prefix_v5c"}
+    function target_policy(name) {return selected[name]}
     function result(level,message) {printf "%s\t%s\n",level,message}
     {
         n=tokens($0,t)
@@ -765,12 +766,15 @@ if [ -r "$CONFIG" ]; then
         if(verb=="add" && kind=="authentication" && object=="samlidpprofile") other++
         if((verb=="add" || verb=="set") && kind=="vpn" && object=="sessionaction")
             for(i=5;i<n;i++) if(tolower(t[i])=="-samlsso" && tolower(t[i+1])=="enabled") other++
-        if(verb=="add" && kind=="responder" && object=="policy" && known(t[4])) {
-            name=t[4]; definitions[name]=1; expression=tolower(t[5])
-            shape=(index(expression,"/cgi/samlauth") && index(expression,"prefixlist") && index(expression,"b64decode") && toupper(t[6])=="DROP")
-            if(name=="pol_saml_prefix_v5c")
-                shape=shape && index(expression,"/saml/login") && index(expression,"typecast_nvlist_t") && index(expression,"name_count") && index(expression,"samlresponse") && index(expression,"samlrequest") && index(expression,".gt(1)") && index(expression,"regex_match")
-            valid[name]=shape
+        if(verb=="add" && kind=="responder" && object=="policy") {
+            name=t[4]; expression=tolower(t[5])
+            # Names vary between Citrix builds/advisories. Identify the policy
+            # by its endpoint and SAML payload field, then require a DROP action.
+            cgi_match=(index(expression,"http.req.url.path.set_text_mode(ignorecase)") && index(expression,"/cgi/samlauth") && index(expression,"samlresponse"))
+            saml_login_match=(index(expression,"http.req.url.path.set_text_mode(ignorecase)") && index(expression,"/saml/login") && index(expression,"samlrequest"))
+            if((cgi_match || saml_login_match) && toupper(t[6])=="DROP") {
+                definitions[name]=1; selected[name]=1; valid[name]=1
+            }
         }
         if(verb=="add" && (kind=="vpn" || kind=="authentication") && object=="vserver") {
             key=kind SUBSEP t[4]; servers[key]=kind " vServer " t[4]
@@ -783,7 +787,7 @@ if [ -r "$CONFIG" ]; then
                 if(option=="-type") type=tolower(t[i+1])
                 if(option=="-state" && tolower(t[i+1])=="disabled") disabled=1
             }
-            if(known(policy) && type=="aaa_request" && !disabled) bindings[kind SUBSEP t[4] SUBSEP policy]=1
+            if(target_policy(policy) && type=="aaa_request" && !disabled) bindings[kind SUBSEP t[4] SUBSEP policy]=1
         }
     }
     END {
@@ -794,10 +798,10 @@ if [ -r "$CONFIG" ]; then
             exit
         }
         warning=(saml || other)?"ACTION":"CHECK"
-        if(!count) result(warning,"WARNING: No recognized SAML workaround policy is defined in saved configuration. Accepted names: pol_saml_prefix_v5c and pol_samlauth_prefixlist_block. Verify the approved mitigation and save the configuration.")
+        if(!count) result(warning,"WARNING: No responder policy matching the /cgi/samlauth + SAMLResponse (or /saml/login + SAMLRequest) expression and DROP action was found in saved configuration. Verify the current Citrix mitigation and save the configuration.")
         for(name in definitions) {
-            if(valid[name]) result("INFO",name " has the selected request-path, decoding and DROP structure. The confidential expression is not printed.")
-            else result(warning,"WARNING: " name " is defined but does not contain the expected selected expression/action markers. Its name alone is insufficient.")
+            if(valid[name]) result("INFO",name " matches a SAML endpoint/body-field pattern and DROP action. The full policy expression is not printed; verify it against current Citrix guidance.")
+            else result(warning,"WARNING: " name " is defined but does not contain the expected selected expression/action markers.")
         }
         total=0; covered=0; missing=0
         for(key in servers) {
@@ -1876,11 +1880,11 @@ if [ -n "$STAGING_FILES" ]; then
             if [ -n "$ACTUAL_HASH" ]; then
                 printf 'SHA-256 observed:  %s\n' "$ACTUAL_HASH"
                 printf 'SHA-256 reference: %s\n' "$EXPECTED_HASH"
-                if { reference_build_supported; } && [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ]; then
-                    status OK "$f matches the internal single-appliance 14.1-73.37 SHA-256 reference."
+                if [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ]; then
+                    status OK "$f SHA-256 exactly matches the internal reference captured on a clean 14.1-73.37 appliance. Identical bytes are confirmed; the reference is not Citrix-published and does not establish provenance for this appliance."
                     STAGING_REFERENCE_MATCHES=$((STAGING_REFERENCE_MATCHES + 1))
                 else
-                    status CHECK "$f does not match the usable internal baseline (or the entered build is outside its scope); inspect before disposition."
+            status CHECK "$f SHA-256 differs from the internal reference; inspect before disposition."
                     STAGING_REFERENCE_MISMATCHES=$((STAGING_REFERENCE_MISMATCHES + 1))
                 fi
             else
