@@ -4,32 +4,8 @@
 # Script:  deyda-netscaler-ioc-check.sh
 # Version: 9.67
 #
-# GEIGER-derived additions (read-only), implementation by Patrick Wagner,
-# integrated into the Deyda checker with attribution:
-#   1. Execution traces: every injected command found in the authentication logs
-#      is correlated with the shell-audit logs (sh.log, bash.log, sh_command lines
-#      in notice.log), with other log lines naming the payload hosts, and with the
-#      files the payloads reference (metadata and SHA-256 only).
-#   2. Complete attempt summary instead of the last 40 lines: grouped by payload,
-#      first/last time, attempt count, client IPs from the same log line and
-#      time-correlated authentication requests from the HTTP access logs.
-#   3. Chronological output: multi-file matches are sorted by the timestamp inside
-#      each line (chrono_sort), so "tail" returns the newest lines. Rotated names
-#      sort as ns.log.1, ns.log.10, ns.log.2 and previously gave a random subset.
-#   4. Log coverage per family from the log content (oldest/newest entry, gaps),
-#      compared with the campaign start (GEIGER_CAMPAIGN_START) and the install marker.
-#   5. Self-exclusion by resolved script path instead of an assumed file name, so a
-#      renamed copy no longer reports itself; own shell-audit lines are not evidence.
-#   6. (GEIGER.2) SAML request workaround: on the CVE-2026-88779 fixed build missing
-#      workaround parts are reported as information instead of ACTION.
-#   7. (GEIGER.3) Execution-trace accuracy: standard configuration files (ns.conf, rc.netscaler,
-#      /etc/passwd, ...) are no payload markers; viewer commands with redirection or in-place
-#      edits (cat a>b, sed -i) count as writes; inbound requests from payload hosts are listed
-#      separately; unreadable log files turn "nothing found" into CHECK; own names match only
-#      as whole file names of at least 8 characters.
-#   The script version is printed from a single variable (SCRIPT_VERSION).
-#   Optional: GEIGER_CAMPAIGN_START=YYYY-MM-DD (default 2026-09-05).
-#
+# GEIGER detection enhancements are integrated into the read-only checks below.
+# Optional campaign start override: GEIGER_CAMPAIGN_START=YYYY-MM-DD.
 # Sample-specific checks below additionally use the operator-supplied 380d56
 # analysis screenshot and follow-up description (2026-10-02), not independently verified. No partial hash
 # is used. Paths/ports alone are CHECK; matching behavior requires investigation.
@@ -60,6 +36,7 @@
 #   https://www.deyda-consulting.de/expertise/netscaler-security-readiness/
 #
 # References
+#   GEIGER variant and additions: Patrick Wagner (shared with permission)
 #   Additional security bulletin: CTX697174 (CVE-2026-88779, SAML SP/IdP DoS)
 #   https://support.citrix.com/external/article/CTX697174
 #   NetScaler CVE checklist (DE):
@@ -116,7 +93,8 @@
 #   DEYDA_CUSTOMSNMPD_REFERENCE_SHA256=<64-hex-SHA256> sh /path/to/deyda-netscaler-ioc-check.sh
 #   Obtain the reference from a trusted, identical firmware build; never infer it from an
 #   appliance under investigation. Internal /var/python/bin and /var/configd_devno values
-#   below come from one clean 14.1-73.37 appliance and are not Citrix-published checksums.
+#   below use internal samples from one clean 14.1-73.37 appliance and one clean
+#   14.1-73.41 appliance; these are not Citrix-published checksums.
 #
 # Optional CLI captures for the additional Global Deny List assessment:
 #   DEYDA_GDL_SIGNATURES_FILE=/path/to/signatures.txt
@@ -135,7 +113,7 @@
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 export PATH
 umask 077
-SCRIPT_VERSION='9.67'
+SCRIPT_VERSION='9.69'
 # GEIGER: identify this script by its resolved path, not by an assumed file name.
 GEIGER_SELF_PATH=$(realpath "$0" 2>/dev/null)
 [ -n "$GEIGER_SELF_PATH" ] || GEIGER_SELF_PATH=$(cd "$(dirname "$0")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename "$0")")
@@ -226,6 +204,17 @@ reference_build_supported() {
     printf '%s\n' "${CURRENT_INPUT-}" | grep -Eiq 'FIPS|NDcPP' && return 1
     _reference_build=$(printf '%s\n' "${CURRENT_INPUT-}" | sed -nE 's/.*(14[.]1|13[.]1)[^0-9]*([0-9]+[.][0-9]+).*/\1-\2/p' | head -1)
     [ "$_reference_build" = '14.1-73.37' ]
+}
+reference_hash_build() {
+    printf '%s\n' "${CURRENT_INPUT-}" | grep -Eiq 'FIPS|NDcPP' && return 1
+    _hash_reference_build=$(printf '%s\n' "${CURRENT_INPUT-}" | sed -nE 's/.*(14[.]1|13[.]1)[^0-9]*([0-9]+[.][0-9]+).*/\1-\2/p' | head -1)
+    case "$_hash_reference_build" in
+        14.1-73.37|14.1-73.41) printf '%s' "$_hash_reference_build" ;;
+        *) return 1 ;;
+    esac
+}
+reference_hash_build_supported() {
+    [ -n "$(reference_hash_build)" ]
 }
 
 # Read Enhanced ISN from the saved ns.conf by default. An explicit CLI value
@@ -1485,26 +1474,31 @@ check_1417337_reference() {
     REFERENCE_MATCH=UNKNOWN
     _ref_path=$1
     _ref_hash=$2
-    reference_build_supported || return 0
+    _reference_build=$(reference_hash_build) || return 0
     _actual_hash=$(sha256_of "$_ref_path")
     if [ -n "$_actual_hash" ]; then
         printf 'SHA-256 observed:  %s\n' "$_actual_hash"
         printf 'SHA-256 reference: %s\n' "$_ref_hash"
     fi
     if [ -z "$_actual_hash" ]; then
-        status CHECK "Could not calculate SHA-256 for $_ref_path against the internal 14.1-73.37 sample."
+        status CHECK "Could not calculate SHA-256 for $_ref_path against the internal $_reference_build sample."
     elif [ "$_actual_hash" = "$_ref_hash" ]; then
         REFERENCE_MATCH=YES
-        status OK "$_ref_path SHA-256 matches the internal 14.1-73.37 reference from one clean appliance; this is not a Citrix-published checksum."
+        status OK "$_ref_path SHA-256 matches the internal $_reference_build reference from one clean appliance; this is not a Citrix-published checksum."
     else
-        status CHECK "$_ref_path SHA-256 differs from the internal one-appliance 14.1-73.37 reference; compare edition, configuration, and a trusted peer before treating it as anomalous."
+        status CHECK "$_ref_path SHA-256 differs from the internal one-appliance $_reference_build reference; compare edition, configuration, and a trusted peer before treating it as anomalous."
     fi
 }
 reference_suid_1417337() {
     case "$1" in
         /var/nslog/nslog.nextfile) check_nslog_nextfile_state "$1" ;;
         /var/run/nsprofmgmt.pid) check_nsprofmgmt_pid "$1" ;;
-        /var/configd_devno) check_1417337_reference "$1" '5b76771117eacc288a42de079a719402e26528e997cfa82241c4d7a842eba5d2' ;;
+        /var/configd_devno)
+            case "$(reference_hash_build)" in
+                14.1-73.37) check_1417337_reference "$1" '5b76771117eacc288a42de079a719402e26528e997cfa82241c4d7a842eba5d2' ;;
+                14.1-73.41) check_1417337_reference "$1" '7aa41973005e4f74eab7fc630d49fc5d96afc16edd786f9c22ca3d8cd993bb75' ;;
+            esac
+            ;;
     esac
 }
 check_nsprofmgmt_pid() {
@@ -1528,7 +1522,7 @@ check_nsprofmgmt_pid() {
         status CHECK "$_pid_file contains PID $_pid, but no matching live process was found; check for a stale PID file or stopped service."
     fi
     if [ "$_pid_meta" = '---x--S---:0:0' ]; then
-        status OK 'nsprofmgmt.pid mode and numeric owner/group match the internal 14.1-73.37 sample; size, timestamp, and hash are intentionally not compared.'
+        status OK 'nsprofmgmt.pid mode and numeric owner/group match the internal sample; size, timestamp, and hash are intentionally not compared.'
     else
         status CHECK "nsprofmgmt.pid mode/owner/group differ from the internal sample (observed ${_pid_meta:-unavailable}); validate against a trusted same-build peer."
     fi
@@ -1544,7 +1538,7 @@ check_nslog_nextfile_state() {
         printf 'Observed content: %s\n' "${_next_value:-<empty>}"
     fi
     if [ "$_state_meta" = '-rwS--x---:0:0' ]; then
-        status OK 'nslog.nextfile mode and numeric owner/group match the internal 14.1-73.37 sample; size, timestamp, and hash are intentionally not compared.'
+        status OK 'nslog.nextfile mode and numeric owner/group match the internal sample; size, timestamp, and hash are intentionally not compared.'
     else
         status CHECK "nslog.nextfile mode/owner/group differ from the internal sample (observed ${_state_meta:-unavailable}); validate against a trusted same-build peer."
     fi
@@ -2533,18 +2527,27 @@ for f in /nsconfig/rc.netscaler /nsconfig/nsafter.sh /flash/nsconfig/rc.netscale
         case "$f" in
             /nsconfig/rc.netscaler)
                 RCN_PRIMARY_HASH=$(sha256_of "$f")
-                check_1417337_reference "$f" '7f65ac090000fda7fed9fb56b2d4e7678181f4f9fac71961e4336fdfa7cbf738'
+                case "$(reference_hash_build)" in
+                    14.1-73.37) check_1417337_reference "$f" '7f65ac090000fda7fed9fb56b2d4e7678181f4f9fac71961e4336fdfa7cbf738' ;;
+                    14.1-73.41) check_1417337_reference "$f" '14992b3198863449f54b631e11248852e808d993d057c597c40c906f1889172d' ;;
+                esac
                 ;;
             /flash/nsconfig/rc.netscaler)
                 RCN_SECONDARY_HASH=$(sha256_of "$f")
                 if [ -n "$RCN_PRIMARY_HASH" ] && [ "$RCN_PRIMARY_HASH" = "$RCN_SECONDARY_HASH" ]; then
                     status OK '/flash/nsconfig/rc.netscaler has the same SHA-256 content as /nsconfig/rc.netscaler; the baseline comparison is reported once.'
                 else
-                    check_1417337_reference "$f" '7f65ac090000fda7fed9fb56b2d4e7678181f4f9fac71961e4336fdfa7cbf738'
+                    case "$(reference_hash_build)" in
+                        14.1-73.37) check_1417337_reference "$f" '7f65ac090000fda7fed9fb56b2d4e7678181f4f9fac71961e4336fdfa7cbf738' ;;
+                        14.1-73.41) check_1417337_reference "$f" '14992b3198863449f54b631e11248852e808d993d057c597c40c906f1889172d' ;;
+                    esac
                 fi
                 ;;
             /etc/monitrc)
-                check_1417337_reference "$f" 'ab1aae7ba469c122ae16a992da9ddc4b12f81301b0b05d8eba2b379a06d56e54'
+                case "$(reference_hash_build)" in
+                    14.1-73.37) check_1417337_reference "$f" 'ab1aae7ba469c122ae16a992da9ddc4b12f81301b0b05d8eba2b379a06d56e54' ;;
+                    14.1-73.41) check_1417337_reference "$f" '1725ed493fde5361f84c6cd4f545b3815737cecf30b0cc75af20c44eb73cef8f' ;;
+                esac
                 ;;
         esac
         if [ -r "$f" ] && [ -f "$f" ]; then
@@ -2682,21 +2685,27 @@ if [ -e /bin/sh ]; then
         printf '%s\n' "$SHA_OUTPUT"
         SHELL_HASH=$(printf '%s\n' "$SHA_OUTPUT" | sha256_from_stream)
     fi
-    if reference_build_supported; then
-        if [ "$SHELL_HASH" = '2c1310d7c4d7dfb1ef47b137be1eb572cc743cc609898ae38320963cc0578665' ]; then
-            status OK '/bin/sh SHA-256 matches the internal reference recorded for NetScaler 14.1-73.37; this is not a vendor-published checksum.'
+    SHELL_REFERENCE_BUILD=$(reference_hash_build)
+    case "$SHELL_REFERENCE_BUILD" in
+        14.1-73.37) SHELL_EXPECTED_HASH='2c1310d7c4d7dfb1ef47b137be1eb572cc743cc609898ae38320963cc0578665' ;;
+        14.1-73.41) SHELL_EXPECTED_HASH='8c121937b172124e5895e5296dff5227841b1f8d9a698489377b65e3adb309c7' ;;
+        *) SHELL_EXPECTED_HASH='' ;;
+    esac
+    if [ -n "$SHELL_EXPECTED_HASH" ]; then
+        if [ "$SHELL_HASH" = "$SHELL_EXPECTED_HASH" ]; then
+            status OK "/bin/sh SHA-256 matches the internal $SHELL_REFERENCE_BUILD reference from one clean appliance; this is not a vendor-published checksum."
         elif [ -n "$SHELL_HASH" ]; then
-            status CHECK '/bin/sh SHA-256 differs from the internal 14.1-73.37 reference; compare platform/edition and a trusted appliance before treating it as anomalous. The reference is not vendor-published.'
+            status CHECK "/bin/sh SHA-256 differs from the internal $SHELL_REFERENCE_BUILD reference; compare platform/edition and another trusted same-build appliance before treating it as anomalous."
         else
-            status CHECK 'Could not calculate /bin/sh SHA-256 for comparison with the internal 14.1-73.37 reference.'
+            status CHECK "Could not calculate /bin/sh SHA-256 for comparison with the internal $SHELL_REFERENCE_BUILD reference."
         fi
     fi
     ls -ld /bin /bin/sh 2>&1
     SHELL_META=$(ls -ln /bin/sh 2>/dev/null | awk 'NR==1{print $1 ":" $3 ":" $4 ":" $5}')
-    if { reference_build_supported; } && [ "$SHELL_META" = '-r-xr-xr-x:0:0:165368' ]; then
-        status OK '/bin/sh mode, numeric owner/group, and size match the internal clean-sample reference for 14.1-73.37; timestamps are host-specific and are not compared. This is not a vendor-published baseline.'
+    if reference_hash_build_supported && [ "$SHELL_META" = '-r-xr-xr-x:0:0:165368' ]; then
+        status OK "/bin/sh mode, numeric owner/group, and size match the internal clean-sample reference for $(reference_hash_build); timestamps are host-specific and are not compared. This is not a vendor-published baseline."
     else
-        status CHECK "Compare /bin/sh mode, owner, group, size, timestamp, and hash with a trusted same-build reference; observed metadata: ${SHELL_META:-unavailable}. The internal reference is from one clean 14.1-73.37 appliance, not a vendor-published universal baseline."
+        status CHECK "Compare /bin/sh mode, owner, group, size, timestamp, and hash with a trusted same-build reference; observed metadata: ${SHELL_META:-unavailable}. The internal reference is not a vendor-published universal baseline."
     fi
 else
     status ACTION '/bin/sh was not found at the expected path; verify platform paths and investigate.'
@@ -2805,14 +2814,20 @@ RECENT_SUID_EOF
                 _expected=''
                 case "$f" in
                     /var/nslog/nslog.nextfile|/var/run/nsprofmgmt.pid) continue ;;
-                    /var/configd_devno) _expected='5b76771117eacc288a42de079a719402e26528e997cfa82241c4d7a842eba5d2' ;;
+                    /var/configd_devno)
+                        case "$(reference_hash_build)" in
+                            14.1-73.37) _expected='5b76771117eacc288a42de079a719402e26528e997cfa82241c4d7a842eba5d2' ;;
+                            14.1-73.41) _expected='7aa41973005e4f74eab7fc630d49fc5d96afc16edd786f9c22ca3d8cd993bb75' ;;
+                        esac
+                        ;;
                 esac
+                _reference_build=$(reference_hash_build)
                 _observed=$(sha256_of "$f")
-                if { reference_build_supported; } && [ -n "$_observed" ] && [ "$_observed" = "$_expected" ]; then
-                    status OK "$f is newer than installns_state but matches the internal 14.1-73.37 reference; recency alone is not suspicious. Reference is from one clean appliance, not Citrix."
+                if [ -n "$_reference_build" ] && [ -n "$_expected" ] && [ -n "$_observed" ] && [ "$_observed" = "$_expected" ]; then
+                    status OK "$f is newer than installns_state but matches the internal $_reference_build reference; recency alone is not suspicious. Reference is from one clean appliance, not Citrix."
                 else
                     ls -ldn "$f" 2>&1
-                    status CHECK "$f is newer than installns_state and does not match the internal reference (or the firmware is not 14.1-73.37); validate runtime changes and compare with another clean same-build appliance."
+                    status CHECK "$f is newer than installns_state and does not match a usable internal reference for the detected build; validate runtime changes and compare with another clean same-build appliance."
                 fi
             done
         fi
@@ -2844,10 +2859,10 @@ if [ -f "$CUSTOMSNMPD_FILE" ]; then
                 status CHECK '/var/python/bin/customsnmpd differs from the operator-supplied trusted same-build SHA-256 reference. Preserve it and verify the baseline source and approved changes.'
                 printf 'Trusted reference: %s\n' "$DEYDA_CUSTOMSNMPD_REFERENCE_SHA256"
             fi
-        elif { reference_build_supported; } && [ "$CUSTOMSNMPD_HASH" = '1dd0887ff21b18b0eb78a336e76d4dc3bb6f4fc645e9d864414a2958cb1637fe' ]; then
-            status OK '/var/python/bin/customsnmpd matches the internal clean-appliance 14.1-73.37 SHA-256 reference; this is not a Citrix-published checksum.'
-        elif { reference_build_supported; }; then
-            status CHECK '/var/python/bin/customsnmpd differs from the internal one-appliance 14.1-73.37 reference. Compare edition, approved changes, and another trusted same-build node.'
+        elif { reference_hash_build_supported; } && [ "$CUSTOMSNMPD_HASH" = '1dd0887ff21b18b0eb78a336e76d4dc3bb6f4fc645e9d864414a2958cb1637fe' ]; then
+            status OK "/var/python/bin/customsnmpd matches the internal clean-appliance $(reference_hash_build) SHA-256 reference; this is not a Citrix-published checksum."
+        elif { reference_hash_build_supported; }; then
+            status CHECK "/var/python/bin/customsnmpd differs from the internal one-appliance $(reference_hash_build) reference. Compare edition, approved changes, and another trusted same-build node."
             printf 'Internal clean reference: %s\n' '1dd0887ff21b18b0eb78a336e76d4dc3bb6f4fc645e9d864414a2958cb1637fe'
         else
             status CHECK '/var/python/bin/customsnmpd does not match the selected public malicious-sample hash, but no valid trusted same-build hash was supplied; integrity remains unverified.'
@@ -2858,7 +2873,7 @@ if [ -f "$CUSTOMSNMPD_FILE" ]; then
 else
     status OK 'No /var/python/bin/customsnmpd file found.'
 fi
-if reference_build_supported; then
+if reference_hash_build_supported; then
     PYTHON_REFERENCE_NAMES='fixup_pubsub_v1_keywords.py CreateCluster.py MyFirstNitroApplication.py get_config.py jp.py rm_config.py set_config.py stat_config.py'
     PYTHON_REFERENCE_COUNT=0
     PYTHON_REFERENCE_MISMATCHES=0
@@ -2876,15 +2891,15 @@ if reference_build_supported; then
             stat_config.py) PYTHON_EXPECTED='c03a8b059878d685fabd3c3d166965e46cbf9163f6ec9c88cb11eda9d46e2b58' ;;
         esac
         if [ ! -f "$f" ]; then
-            status CHECK "$f is absent but exists in the internal clean 14.1-73.37 reference; verify whether the component is expected on this appliance."
+            status CHECK "$f is absent but exists in the internal clean $(reference_hash_build) reference; verify whether the component is expected on this appliance."
             PYTHON_REFERENCE_MISMATCHES=$((PYTHON_REFERENCE_MISMATCHES + 1))
             continue
         fi
         PYTHON_OBSERVED=$(sha256_of "$f")
         if [ -n "$PYTHON_OBSERVED" ] && [ "$PYTHON_OBSERVED" = "$PYTHON_EXPECTED" ]; then
-            status OK "$f matches the internal clean 14.1-73.37 SHA-256 reference. This is not a Citrix-published checksum."
+            status OK "$f matches the internal clean $(reference_hash_build) SHA-256 reference. This is not a Citrix-published checksum."
         else
-            status CHECK "$f differs from the internal clean 14.1-73.37 reference or could not be hashed; validate approved changes and compare with another trusted same-build appliance."
+            status CHECK "$f differs from the internal clean $(reference_hash_build) reference or could not be hashed; validate approved changes and compare with another trusted same-build appliance."
             printf 'Observed: %s\nExpected: %s\n' "${PYTHON_OBSERVED:-unavailable}" "$PYTHON_EXPECTED"
             PYTHON_REFERENCE_MISMATCHES=$((PYTHON_REFERENCE_MISMATCHES + 1))
         fi
@@ -2903,20 +2918,20 @@ if reference_build_supported; then
         printf '%s\n' "$UNKNOWN_PYTHON_FILES"
         printf '%s\n' "$UNKNOWN_PYTHON_FILES" | while IFS= read -r f; do ls -ln "$f" 2>/dev/null; printf 'SHA-256: %s\n' "$(sha256_of "$f")"; done
     elif [ "$PYTHON_REFERENCE_MISMATCHES" -eq 0 ]; then
-        status OK "All $PYTHON_REFERENCE_COUNT referenced Python files under /var/python/bin match the internal clean 14.1-73.37 hashes; no additional .py files were found."
+        status OK "All $PYTHON_REFERENCE_COUNT referenced Python files under /var/python/bin match the internal clean $(reference_hash_build) hashes; no additional .py files were found."
     fi
 fi
 subsection 'configd state-file metadata baseline'
-if { reference_build_supported; }; then
+if reference_hash_build_supported; then
     if [ -f /var/configd_devno ]; then
         CONFIGD_DEVNO_META=$(ls -ln /var/configd_devno 2>/dev/null | awk 'NR==1{print $1 ":" $3 ":" $4 ":" $5}')
         if [ "$CONFIGD_DEVNO_META" = '-rwxr-Sr--:0:0:129' ]; then
-            status OK '/var/configd_devno mode, numeric owner/group, and size match the internal clean 14.1-73.37 sample.'
+            status OK "/var/configd_devno mode, numeric owner/group, and size match the internal clean $(reference_hash_build) sample."
         else
             status CHECK "/var/configd_devno metadata differs from the internal clean sample (-rwxr-Sr--:0:0:129); observed: ${CONFIGD_DEVNO_META:-unavailable}. Compare with another trusted same-build appliance."
         fi
     else
-        status CHECK '/var/configd_devno is absent on this appliance, but was present on the internal 14.1-73.37 reference; verify whether it is expected here and compare with a trusted peer.'
+        status CHECK "/var/configd_devno is absent on this appliance, but was present on the internal $(reference_hash_build) reference; verify whether it is expected here and compare with a trusted peer."
     fi
 fi
 section '4. Web configuration and served-file integrity'
@@ -3072,7 +3087,7 @@ if [ -n "$STAGING_FILES" ]; then
                 printf 'SHA-256 observed:  %s\n' "$ACTUAL_HASH"
                 printf 'SHA-256 reference: %s\n' "$EXPECTED_HASH"
                 if [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ]; then
-                    status OK "$f SHA-256 exactly matches the internal reference captured on a clean 14.1-73.37 appliance. Identical bytes are confirmed; the reference is not Citrix-published and does not establish provenance for this appliance."
+                    status OK "$f SHA-256 exactly matches the internal reference captured on clean 14.1-73.37 and 14.1-73.41 reference appliances. Identical bytes are confirmed; the reference is not Citrix-published and does not establish provenance for this appliance."
                     STAGING_REFERENCE_MATCHES=$((STAGING_REFERENCE_MATCHES + 1))
                 else
             status CHECK "$f SHA-256 differs from the internal reference; inspect before disposition."
@@ -3088,7 +3103,7 @@ if [ -n "$STAGING_FILES" ]; then
         fi
     done
     if [ "$STAGING_REVIEW_UNKNOWN" -eq 0 ] && [ "$STAGING_REFERENCE_MISMATCHES" -eq 0 ] && [ "$STAGING_REFERENCE_MATCHES" -eq "$(printf '%s\n' "$STAGING_CANDIDATE_PATHS" | wc -l | tr -d ' ')" ] && [ "$STAGING_REFERENCE_MATCHES" -gt 0 ]; then
-        status OK 'Every VPN staging file found matches a known package hash in the internal 14.1-73.37 reference set; presence alone is expected on this reference build. The hashes are not Citrix-published.'
+        status OK 'Every VPN staging file found matches a known package hash in the internal 14.1-73.37 / 14.1-73.41 reference set; presence alone is expected on this reference build. The hashes are not Citrix-published.'
     else
         status CHECK 'VPN staging inventory includes an unknown, unverified, or hash-mismatching file; validate it against a trusted same-build baseline.'
     fi
@@ -3435,7 +3450,7 @@ if [ -d "$LANGUAGE_DIR" ]; then
                 LANGUAGE_HASH_UNAVAILABLE=1
             fi
             [ -n "$LANGUAGE_HASH" ] || LANGUAGE_HASH_UNAVAILABLE=1
-            if reference_build_supported; then
+            if reference_hash_build_supported; then
                 LANGUAGE_EXPECTED_HASH=''
                 case "${f##*/}" in
                     strings.de.js) LANGUAGE_EXPECTED_HASH='60a9b62d59f1e025b9d1b413ec7c926dbe02134d82e8dea902fcb087c2d81879' ;;
@@ -3468,9 +3483,9 @@ if [ -d "$LANGUAGE_DIR" ]; then
         if [ "$LANGUAGE_PATTERN_HITS" -eq 0 ]; then
             status OK 'No selected network/request-related patterns found in strings.*.js files.'
         fi
-        if reference_build_supported; then
+        if reference_hash_build_supported; then
             if [ "$LANGUAGE_BASELINE_COUNT" -eq 12 ] && [ "$LANGUAGE_HASH_UNAVAILABLE" -eq 0 ] && [ -z "$LANGUAGE_BASELINE_MISMATCHES" ]; then
-                status OK 'All 12 strings.*.js files, filenames, and SHA-256 hashes match the internal clean-sample reference for NetScaler 14.1-73.37. This is an internal single-appliance reference, not a Citrix-published checksum set or a universal baseline.'
+                status OK "All 12 strings.*.js files, filenames, and SHA-256 hashes match the internal clean-sample reference for NetScaler $(reference_hash_build). This is an internal single-appliance reference, not a Citrix-published checksum set or a universal baseline."
             else
                 status CHECK "Language-file baseline differs or could not be fully checked (observed count: $LANGUAGE_BASELINE_COUNT; expected: 12; hash tool unavailable: $LANGUAGE_HASH_UNAVAILABLE). Review filenames and hashes against a trusted same-build appliance."
                 [ -n "$LANGUAGE_BASELINE_MISMATCHES" ] && printf '%s\n' "$LANGUAGE_BASELINE_MISMATCHES"
@@ -3478,8 +3493,8 @@ if [ -d "$LANGUAGE_DIR" ]; then
         fi
     else
         status OK 'No strings.*.js language files found in the LogonPoint/custom directory.'
-        if reference_build_supported; then
-            status CHECK 'The internal 14.1-73.37 reference contains 12 strings.*.js files, but none were found here.'
+        if reference_hash_build_supported; then
+            status CHECK "The internal $(reference_hash_build) reference contains 12 strings.*.js files, but none were found here."
         fi
     fi
 else
@@ -3487,7 +3502,7 @@ else
 fi
 
 printf '\n--- Additional LogonPoint customization baseline files ---\n'
-if reference_build_supported; then
+if reference_hash_build_supported; then
     CUSTOM_ASSET_EXPECTED_COUNT=15
     CUSTOM_ASSET_OBSERVED_COUNT=0
     CUSTOM_ASSET_BASELINE_MISMATCHES=''
@@ -3509,9 +3524,9 @@ if reference_build_supported; then
         printf '%s\n' "$f"
         printf 'Observed SHA-256: %s\n' "${CUSTOM_ASSET_HASH:-unavailable}"
         if [ -n "$CUSTOM_ASSET_HASH" ] && [ "$CUSTOM_ASSET_HASH" = "$CUSTOM_ASSET_EXPECTED_HASH" ]; then
-            status OK "$f matches the internal clean 14.1-73.37 single-appliance reference. This is not a vendor checksum."
+            status OK "$f matches the internal clean $(reference_hash_build) single-appliance reference. This is not a vendor checksum."
         elif [ -n "$CUSTOM_ASSET_HASH" ]; then
-            status CHECK "$f differs from the internal clean 14.1-73.37 reference; validate intended customization and compare with another trusted same-build appliance."
+            status CHECK "$f differs from the internal clean $(reference_hash_build) reference; validate intended customization and compare with another trusted same-build appliance."
             printf 'Reference SHA-256: %s\n' "$CUSTOM_ASSET_EXPECTED_HASH"
             CUSTOM_ASSET_BASELINE_MISMATCHES="${CUSTOM_ASSET_BASELINE_MISMATCHES}${CUSTOM_ASSET_BASELINE_MISMATCHES:+
 }$f"
@@ -3522,7 +3537,7 @@ if reference_build_supported; then
         fi
     done
     if [ "$CUSTOM_ASSET_OBSERVED_COUNT" -eq "$CUSTOM_ASSET_EXPECTED_COUNT" ] && [ -z "$CUSTOM_ASSET_BASELINE_MISMATCHES" ]; then
-        status OK 'All 15 additional LogonPoint assets (script.js, style.css, ajax-loader.gif, and strings.*.json) match the internal clean 14.1-73.37 reference.'
+        status OK "All 15 additional LogonPoint assets (script.js, style.css, ajax-loader.gif, and strings.*.json) match the internal clean $(reference_hash_build) reference."
     else
         status CHECK "LogonPoint baseline coverage is partial or differs (observed $CUSTOM_ASSET_OBSERVED_COUNT of $CUSTOM_ASSET_EXPECTED_COUNT expected files). Missing files and intentional customizations require local validation."
         for name in script.js style.css ajax-loader.gif strings.de.json strings.en.json strings.es.json strings.fr.json strings.it.json strings.ja.json strings.nl.json strings.pt.json strings.ko.json strings.ru.json strings.zh-CN.json strings.zh-TW.json; do
@@ -3530,7 +3545,7 @@ if reference_build_supported; then
         done
     fi
 else
-    status CHECK 'These additional LogonPoint hashes are a single-appliance 14.1-73.37 reference and were not compared because the running build is outside that exact scope.'
+    status CHECK 'These additional LogonPoint hashes are single-appliance 14.1-73.37 and 14.1-73.41 references and were not compared because the running build is outside that exact scope.'
 fi
 
 section '5. Log coverage and event correlation'
