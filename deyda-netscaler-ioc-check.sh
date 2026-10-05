@@ -2,7 +2,7 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.67
+# Version: 9.72
 #
 # GEIGER detection enhancements are integrated into the read-only checks below.
 # Optional campaign start override: GEIGER_CAMPAIGN_START=YYYY-MM-DD.
@@ -113,7 +113,7 @@
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 export PATH
 umask 077
-SCRIPT_VERSION='9.69'
+SCRIPT_VERSION='9.72'
 # GEIGER: identify this script by its resolved path, not by an assumed file name.
 GEIGER_SELF_PATH=$(realpath "$0" 2>/dev/null)
 [ -n "$GEIGER_SELF_PATH" ] || GEIGER_SELF_PATH=$(cd "$(dirname "$0")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename "$0")")
@@ -1574,7 +1574,7 @@ cat <<'READ_GUIDE'
 [CHECK] means the output needs human validation, usually against an approved change, a trusted same-build baseline, or a wider evidence source.
 [ACTION] means a higher-priority indicator matched. Preserve the relevant evidence and correlate it before cleanup, restart, or rebuild. It is not automatic proof that the appliance was compromised.
 
-Read the report in this order: firmware/CVE applicability; host integrity and persistence; web configuration and files; log coverage and attack indicators; then the final next-action list.
+Read the report in this order: executive summary and priority finding map; status definitions; firmware/CVE applicability; host integrity and persistence; web configuration and files; log coverage and attack indicators; then next actions.
 READ_GUIDE
 
 section '1. Platform and uptime'
@@ -2518,7 +2518,6 @@ fi
 printf '\n--- Startup and monitoring persistence files ---\n'
 PERSIST_FILES_FOUND=0
 PERSIST_READABLE=0
-RCN_PRIMARY_HASH=''
 for f in /nsconfig/rc.netscaler /nsconfig/nsafter.sh /flash/nsconfig/rc.netscaler /etc/monitrc; do
     if [ -e "$f" ]; then
         PERSIST_FILES_FOUND=$((PERSIST_FILES_FOUND + 1))
@@ -2526,27 +2525,18 @@ for f in /nsconfig/rc.netscaler /nsconfig/nsafter.sh /flash/nsconfig/rc.netscale
         ls -la "$f" 2>&1
         case "$f" in
             /nsconfig/rc.netscaler)
-                RCN_PRIMARY_HASH=$(sha256_of "$f")
-                case "$(reference_hash_build)" in
-                    14.1-73.37) check_1417337_reference "$f" '7f65ac090000fda7fed9fb56b2d4e7678181f4f9fac71961e4336fdfa7cbf738' ;;
-                    14.1-73.41) check_1417337_reference "$f" '14992b3198863449f54b631e11248852e808d993d057c597c40c906f1889172d' ;;
-                esac
                 ;;
             /flash/nsconfig/rc.netscaler)
-                RCN_SECONDARY_HASH=$(sha256_of "$f")
-                if [ -n "$RCN_PRIMARY_HASH" ] && [ "$RCN_PRIMARY_HASH" = "$RCN_SECONDARY_HASH" ]; then
-                    status OK '/flash/nsconfig/rc.netscaler has the same SHA-256 content as /nsconfig/rc.netscaler; the baseline comparison is reported once.'
+                if [ -r /nsconfig/rc.netscaler ] && cmp -s /nsconfig/rc.netscaler "$f"; then
+                    status OK '/flash/nsconfig/rc.netscaler is byte-for-byte identical to /nsconfig/rc.netscaler; no static content hash baseline is applied because this startup file may be customized.'
                 else
-                    case "$(reference_hash_build)" in
-                        14.1-73.37) check_1417337_reference "$f" '7f65ac090000fda7fed9fb56b2d4e7678181f4f9fac71961e4336fdfa7cbf738' ;;
-                        14.1-73.41) check_1417337_reference "$f" '14992b3198863449f54b631e11248852e808d993d057c597c40c906f1889172d' ;;
-                    esac
+                    status CHECK 'The two rc.netscaler copies differ or the primary copy is unreadable; compare their contents with the approved startup configuration.'
                 fi
                 ;;
             /etc/monitrc)
                 case "$(reference_hash_build)" in
                     14.1-73.37) check_1417337_reference "$f" 'ab1aae7ba469c122ae16a992da9ddc4b12f81301b0b05d8eba2b379a06d56e54' ;;
-                    14.1-73.41) check_1417337_reference "$f" '1725ed493fde5361f84c6cd4f545b3815737cecf30b0cc75af20c44eb73cef8f' ;;
+                    14.1-73.41) check_1417337_reference "$f" '2c6d46cc538b48bf8d7e4ba0d598025114d554fd8a28c391c6290e9c7f98e0ee' ;;
                 esac
                 ;;
         esac
@@ -3516,9 +3506,9 @@ if reference_hash_build_supported; then
             script.js) CUSTOM_ASSET_EXPECTED_HASH='31d53110df746be20920919bd72b80408e758a44852d3cf4a3d88e1b7bd5460a' ;;
             style.css) CUSTOM_ASSET_EXPECTED_HASH='0ecdfbe22feb58756224e2e3b9f38abeafcf4c491f79cdba6ebb8de52acc044b' ;;
             ajax-loader.gif) CUSTOM_ASSET_EXPECTED_HASH='b98f0466a81ba5642c9bafbc00964f0e559945a4ec996a165d2179d03bd5e8ca' ;;
-            strings.de.json|strings.en.json|strings.fr.json|strings.it.json|strings.ja.json|strings.pt.json|strings.nl.json|strings.ko.json|strings.ru.json|strings.zh-TW.json)
+            strings.de.json|strings.en.json|strings.fr.json|strings.it.json|strings.ja.json|strings.pt.json|strings.nl.json|strings.ko.json|strings.ru.json|strings.zh-CN.json|strings.zh-TW.json)
                 CUSTOM_ASSET_EXPECTED_HASH='8eb95bcbc154530931e15fc418c8b1fe991095671409552099ea1aa596999ede' ;;
-            strings.es.json|strings.zh-CN.json)
+            strings.es.json)
                 CUSTOM_ASSET_EXPECTED_HASH='d914176fd50bd7f565700006a31aa97b79d3ad17cee20c8e5ff2061d5cb74817' ;;
         esac
         printf '%s\n' "$f"
@@ -4133,22 +4123,81 @@ These are response reminders, not automated actions. Follow your incident-respon
 Citrix guidance: https://support.citrix.com/external/article/CTX694799/steps-to-take-if-netscaler-adc-is-suspec.html
 IRGUIDE
 
-section '8. Triage summary and next actions'
+section '8. Next actions'
 ACTION_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[ACTION\]/{n++} END{print n+0}' "$OUT")
 CHECK_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[CHECK\]/{n++} END{print n+0}' "$OUT")
 OK_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[OK\]/{n++} END{print n+0}' "$OUT")
-printf 'Finding-message counts: ACTION=%s, CHECK=%s, OK=%s. These counts are not a risk score.\n' "$ACTION_COUNT" "$CHECK_COUNT" "$OK_COUNT"
 if [ "$ACTION_COUNT" -gt 0 ]; then
-    printf '%s\n' 'PRIORITY 1 — ACTION: preserve matching files and raw logs; record time/timezone; do not clean up or reboot before evidence is secured.'
-    printf '%s\n' 'Correlate each hit across HTTP access/error logs, ns.log/messages/notice/nsvpn, file metadata, and approved change records. Escalate to incident response.'
+    printf '%s\n' '1. Preserve matching files, raw logs, and available core dumps. Record appliance time/timezone and do not clean up or restart before evidence is secured.'
+    printf '%s\n' '2. Correlate each hit across HTTP access/error logs, ns.log/messages/notice/nsvpn, file metadata, firewall egress records, and approved change records. Escalate to incident response.'
 else
-    printf '%s\n' 'PRIORITY 1 — No selected high-priority pattern was reported. This does not exclude activity outside scanned paths, formats, or retention.'
+    printf '%s\n' '1. No selected high-priority pattern was reported. This does not exclude activity outside scanned paths, formats, or retention.'
 fi
 if [ "$CHECK_COUNT" -gt 0 ]; then
-    printf '%s\n' 'PRIORITY 2 — CHECK: resolve each item in its section against same-build baselines, change records, and (for HA) the peer node. Record the evidence and disposition.'
+    printf '%s\n' '3. Resolve CHECK items against same-build baselines, change records, and (for HA) the peer node. Record the evidence and disposition.'
 fi
-printf '%s\n' 'PRIORITY 3 — Coverage: confirm logs reach the relevant pre-patch period; document any gaps. Missing/rotated logs are not a clean result.'
-printf '%s\n' 'PRIORITY 4 — Validation: run Citrix/NetScaler File Integrity Monitoring or the Console advisory scan as a separate check.'
+printf '%s\n' '4. Confirm log coverage reaches the relevant pre-patch period; document gaps. Missing or rotated logs are not a clean result.'
+printf '%s\n' '5. Run Citrix/NetScaler File Integrity Monitoring or the Console advisory scan separately and retain its results.'
+
+# Put a concise, scan-derived summary before the detailed sections while
+# preserving every detailed check and raw evidence line in its original order.
+SUMMARY_TMP=$(mktemp "${OUT}.summary.XXXXXX" 2>/dev/null)
+REPORT_TMP=$(mktemp "${OUT}.final.XXXXXX" 2>/dev/null)
+if [ -n "$SUMMARY_TMP" ] && [ -n "$REPORT_TMP" ]; then
+    {
+        printf '===== Executive summary =====\n'
+        printf 'Finding-message counts: ACTION=%s, CHECK=%s, OK=%s. Counts are not a risk score.\n' "$ACTION_COUNT" "$CHECK_COUNT" "$OK_COUNT"
+        if [ "$ACTION_COUNT" -gt 0 ]; then
+            printf '%s\n' 'Assessment: selected high-priority indicators were found. They require investigation; they do not by themselves prove successful command execution or compromise.'
+        elif [ "$CHECK_COUNT" -gt 0 ]; then
+            printf '%s\n' 'Assessment: no selected ACTION indicator was reported, but CHECK items and scan-coverage limits remain to be resolved.'
+        else
+            printf '%s\n' 'Assessment: no selected ACTION or CHECK result was reported in the scanned scope. This is not proof that the appliance is clean.'
+        fi
+        if [ "$FW_PATCHED" = YES ]; then
+            printf 'Firmware: %s meets the applicable fixed-build threshold assessed by this script. This does not rule out earlier compromise.\n' "${CURRENT_INPUT:-detected build}"
+        elif [ "$FW_PATCHED" = NO ]; then
+            printf 'Firmware: %s is below the applicable fixed-build threshold; update is a priority.\n' "${CURRENT_INPUT:-detected build}"
+        else
+            printf 'Firmware: fixed-build status is UNKNOWN; verify the running build before drawing a conclusion.\n'
+        fi
+        printf 'Enhanced ISN: %s (source: %s).\n' "${ISN_STATE:-UNKNOWN}" "${ISN_SOURCE:-unknown}"
+        if [ "${GEIGER_SAML_FIXED-UNKNOWN}" = YES ]; then
+            printf '%s\n' 'SAML workaround: this build meets the CVE-2026-88779 fixed threshold; responder-policy coverage is informational and not required for that CVE.'
+        elif [ "${GEIGER_SAML_FIXED-UNKNOWN}" = NO ]; then
+            printf '%s\n' 'SAML workaround: review the policy and binding results below; interim mitigation may be required on an affected build.'
+        fi
+        if [ "$ACTION_COUNT" -gt 0 ]; then
+            printf '\nPriority finding areas (details remain in the sections below):\n'
+            awk '
+                function clean(s) {sub(/^===== /,"",s); sub(/ =====$/, "", s); sub(/^--- /,"",s); sub(/ ---$/, "", s); return s}
+                /^===== / {major=$0; minor=""; next}
+                /^--- / {minor=$0; next}
+                /^\[ACTION\]/ {
+                    title=clean(major)
+                    if(minor!="") title=title " / " clean(minor)
+                    if(title=="") title="General checks"
+                    if(!seen[title]++) print "  - " title
+                }
+            ' "$OUT"
+        fi
+        printf '\n%s\n' 'Read the coverage and time-range notes before treating a no-hit result as meaningful.'
+        printf '\n'
+    } > "$SUMMARY_TMP"
+    awk -v summary="$SUMMARY_TMP" '
+        /^===== How to read this report =====$/ {
+            while ((getline line < summary) > 0) print line
+            close(summary)
+            print ""
+        }
+        {print}
+    ' "$OUT" > "$REPORT_TMP" && mv "$REPORT_TMP" "$OUT"
+    rm -f "$SUMMARY_TMP" "$REPORT_TMP"
+else
+    [ -n "$SUMMARY_TMP" ] && rm -f "$SUMMARY_TMP"
+    [ -n "$REPORT_TMP" ] && rm -f "$REPORT_TMP"
+    printf '%s\n' 'Executive summary could not be inserted; detailed report remains available.'
+fi
 
 printf '\nCompleted. Plain-text report saved at: %s\n' "$OUT"
 exec 1>&3 2>&4 3>&- 4>&-
