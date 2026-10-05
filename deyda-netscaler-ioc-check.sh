@@ -2,7 +2,7 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.72
+# Version: 9.74
 #
 # GEIGER detection enhancements are integrated into the read-only checks below.
 # Optional campaign start override: GEIGER_CAMPAIGN_START=YYYY-MM-DD.
@@ -27,6 +27,10 @@
 # open-file and /flash privileged-file inventories. No mitigation is applied.
 # Additional leads: operator-supplied Gotham advisory/checker package (2026-10-02).
 # Its observations are scoped to inspected systems, not universal patch guarantees.
+# Additional SAML reconnaissance leads: Lupovis probe/1 and oversized SAML requests,
+# plus the Gotham-reported 138.199.60.0/24 range (CHECK-only; shared VPN/hosting range).
+# These leads were reviewed from the supplied public community checker v1.13;
+# the detection logic here is independently implemented and is not vendor IoC coverage.
 #
 # Publisher
 #   Deyda Consulting GmbH
@@ -37,6 +41,8 @@
 #
 # References
 #   GEIGER variant and additions: Patrick Wagner (shared with permission)
+#   Community SAML reconnaissance leads reviewed from checker v1.13:
+#   https://github.com/ThomasPoppelgaard/netscaler-ctx697096-checker
 #   Additional security bulletin: CTX697174 (CVE-2026-88779, SAML SP/IdP DoS)
 #   https://support.citrix.com/external/article/CTX697174
 #   NetScaler CVE checklist (DE):
@@ -113,7 +119,7 @@
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 export PATH
 umask 077
-SCRIPT_VERSION='9.72'
+SCRIPT_VERSION='9.74'
 # GEIGER: identify this script by its resolved path, not by an assumed file name.
 GEIGER_SELF_PATH=$(realpath "$0" 2>/dev/null)
 [ -n "$GEIGER_SELF_PATH" ] || GEIGER_SELF_PATH=$(cd "$(dirname "$0")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename "$0")")
@@ -1938,6 +1944,7 @@ if [ -r "$CONFIG" ]; then
         n=tokens($0,t)
         if(n<3 || t[1] ~ /^#/) next
         verb=tolower(t[1]); kind=tolower(t[2]); object=tolower(t[3])
+        if(verb=="enable" && kind=="ns" && object=="feature" && toupper(t[4])=="RESPONDER") responder_enabled=1
         if(verb=="add" && kind=="authentication" && object=="samlaction") saml++
         if(verb=="add" && kind=="authentication" && object=="samlidpprofile") other++
         if((verb=="add" || verb=="set") && kind=="vpn" && object=="sessionaction")
@@ -1999,6 +2006,10 @@ if [ -r "$CONFIG" ]; then
         if(total && !missing) result("OK","Recognized SAML workaround coverage found for all " total " saved Authentication/VPN vServers.")
         else if(!total) result(fixed=="YES" ? "INFO" : "CHECK","No Authentication/VPN vServers were found; frontend binding coverage cannot be established.")
         else result(warning,(fixed=="YES" ? prefix : "") "SAML workaround coverage incomplete: " covered " of " total " saved Authentication/VPN vServers have a recognized enabled AAA_REQUEST binding.")
+        if(count) {
+            if(responder_enabled) result("OK","RESPONDER feature enablement is present in the saved configuration.")
+            else result(warning,prefix "A matching SAML workaround policy is present, but 'enable ns feature RESPONDER' is not recorded in the saved configuration. Verify the live feature state with 'show ns feature'; a bound policy is ineffective if Responder is disabled.")
+        }
         result("INFO","Scope: saved configuration only; selected structure is not exact expression validation. Verify current Support instructions, priorities, effective live flow and legitimate sign-ins. Global bindings are not counted as AAA_REQUEST coverage.")
     }
     ' "$CONFIG" | while IFS="$(printf '\t')" read -r SAML_LEVEL SAML_MESSAGE; do
@@ -3852,6 +3863,30 @@ elif [ "$RECON_LOGS_FOUND" -eq 0 ]; then
     status CHECK 'No readable candidate HTTP logs found for the vp_probe_nonexist check; coverage is unavailable.'
 else
     status OK 'No vp_probe_nonexist marker found in available HTTP access/error logs. This is limited to retained logs and the selected format.'
+fi
+subsection 'SAML reconnaissance: probe User-Agent, oversized requests, and reported source range'
+printf '%s\n' 'These community-reported patterns are hunting leads, not Citrix-published IoCs. A match needs timestamp, source, request, and authentication/crash correlation.'
+SAML_PROBE_HITS=$(zgrep -E -i -n '"probe/1"|"(GET|POST|HEAD) /(saml/login|cgi/samlauth)' /var/log/httpaccess* 2>/dev/null \
+    | awk 'tolower($0) ~ /probe\/1/ || (tolower($0) ~ /"(get|post|head) \/(saml\/login|cgi\/samlauth)/ && length($0) > 2500)' \
+    | chrono_sort | tail -30)
+if [ -n "$SAML_PROBE_HITS" ]; then
+    status CHECK 'SAML access logs contain the reported probe/1 User-Agent or a request longer than 2500 characters to /saml/login or /cgi/samlauth. This is a hunting lead, not proof of exploitation; correlate source, time, nsaaad events, and sign-in outcome:'
+    printf '%s\n' "$SAML_PROBE_HITS" | cut -c1-320
+elif [ "$RECON_LOGS_FOUND" -eq 0 ]; then
+    status CHECK 'No readable HTTP access logs are available for the SAML reconnaissance check.'
+else
+    status OK 'No probe/1 User-Agent or selected oversized SAML request found in retained HTTP access logs; other formats and rotated-out logs are outside coverage.'
+fi
+GOTHAM_SAML_RANGE_HITS=$(zgrep -E -i -n '(^|[^0-9.])138[.]199[.]60[.]([0-9]{1,3})([^0-9]|$)' \
+    /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null \
+    | chrono_sort | tail -30)
+if [ -n "$GOTHAM_SAML_RANGE_HITS" ]; then
+    status CHECK 'Log lines contain an address in the community-reported 138.199.60.0/24 range. This range may include shared VPN/hosting infrastructure; treat it as a correlation lead, not attribution or an automatic block recommendation:'
+    printf '%s\n' "$GOTHAM_SAML_RANGE_HITS" | cut -c1-320
+elif [ "$RECON_LOGS_FOUND" -eq 0 ]; then
+    status CHECK 'No readable candidate HTTP logs are available for the reported SAML source-range check; system-log coverage may still have been searched above.'
+else
+    status OK 'No 138.199.60.0/24 address found in the selected retained logs. This is limited to searched files and retention.'
 fi
 subsection 'Authentication endpoint requests and payload combinations'
 EXPLOIT_PATH_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html|/logon/LogonPoint/Authentication/GetUserName)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -40)
