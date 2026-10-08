@@ -2,7 +2,7 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.79
+# Version: 9.82
 #
 # GEIGER detection enhancements are integrated into the read-only checks below.
 # Optional campaign start override: GEIGER_CAMPAIGN_START=YYYY-MM-DD.
@@ -25,6 +25,13 @@
 # configurations; authentication-service crash triage; SAML workaround inventory;
 # tagged User-Agent payloads; multi-signal login injection; unusual HTTP responses;
 # open-file and /flash privileged-file inventories. No mitigation is applied.
+# v9.81: added triage for crafted log records targeting the warm-restart helper,
+# its -WR activation/callhome traces, scoped helper-hash references, web-served
+# archive magic bytes, and cron commands that may erase evidence. No payload
+# content is executed; hashes from independent analysis are not Citrix checksums.
+# v9.82: added internal clean-appliance hash references for standard 14.1-73.46
+# from the operator-supplied reference capture. These are not Citrix-published
+# checksums or universal baselines.
 # Additional leads: operator-supplied Gotham advisory/checker package (2026-10-02).
 # Its observations are scoped to inspected systems, not universal patch guarantees.
 # Additional SAML reconnaissance leads: Lupovis probe/1 and oversized SAML requests,
@@ -54,6 +61,8 @@
 #   https://github.com/ThomasPoppelgaard/netscaler-ctx697096-checker
 #   Additional security bulletin: CTX697174 (CVE-2026-88779, SAML SP/IdP DoS)
 #   https://support.citrix.com/external/article/CTX697174
+#   Additional security bulletin: CTX697191 (CVE-2026-107406, SAML memory overflow)
+#   https://support.citrix.com/support-home/kbsearch/article?articleNumber=CTX697191
 #   NetScaler CVE checklist (DE):
 #   https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/
 #   NetScaler CVE checklist (EN):
@@ -70,6 +79,8 @@
 #   https://tenex.ai/blog/what-tenex-observed-inside-active-exploitation-of-netscaler-zero-day/
 #   SOCRadar NetScaler C2 and CVE-2026-88771 analysis (2026-10-07):
 #   https://socradar.io/blog/netscaler-c2-cve-2026-88771-exploitation/
+#   Independent static analysis of ns_monuploadd_err.pl on 14.1-73.30/73.37:
+#   https://mac.sploit.dk/blog/cve-2026-88771-netscaler-login-log-command-injection/
 #   Citrix incident response: CTX694799
 #
 # Operation
@@ -110,8 +121,8 @@
 #   DEYDA_CUSTOMSNMPD_REFERENCE_SHA256=<64-hex-SHA256> sh /path/to/deyda-netscaler-ioc-check.sh
 #   Obtain the reference from a trusted, identical firmware build; never infer it from an
 #   appliance under investigation. Internal /var/python/bin and /var/configd_devno values
-#   below use internal samples from one clean 14.1-73.37 appliance and one clean
-#   14.1-73.41 appliance; these are not Citrix-published checksums.
+#   below use internal samples from clean 14.1-73.37, 14.1-73.41, and
+#   14.1-73.46 appliances; these are not Citrix-published checksums.
 #
 # Optional CLI captures for the additional Global Deny List assessment:
 #   DEYDA_GDL_SIGNATURES_FILE=/path/to/signatures.txt
@@ -130,7 +141,7 @@
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 export PATH
 umask 077
-SCRIPT_VERSION='9.79'
+SCRIPT_VERSION='9.82'
 # GEIGER: identify this script by its resolved path, not by an assumed file name.
 GEIGER_SELF_PATH=$(realpath "$0" 2>/dev/null)
 [ -n "$GEIGER_SELF_PATH" ] || GEIGER_SELF_PATH=$(cd "$(dirname "$0")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename "$0")")
@@ -226,7 +237,7 @@ reference_hash_build() {
     printf '%s\n' "${CURRENT_INPUT-}" | grep -Eiq 'FIPS|NDcPP' && return 1
     _hash_reference_build=$(printf '%s\n' "${CURRENT_INPUT-}" | sed -nE 's/.*(14[.]1|13[.]1)[^0-9]*([0-9]+[.][0-9]+).*/\1-\2/p' | head -1)
     case "$_hash_reference_build" in
-        14.1-73.37|14.1-73.41) printf '%s' "$_hash_reference_build" ;;
+        14.1-73.37|14.1-73.41|14.1-73.46) printf '%s' "$_hash_reference_build" ;;
         *) return 1 ;;
     esac
 }
@@ -1515,6 +1526,7 @@ reference_suid_1417337() {
             case "$(reference_hash_build)" in
                 14.1-73.37) check_1417337_reference "$1" '5b76771117eacc288a42de079a719402e26528e997cfa82241c4d7a842eba5d2' ;;
                 14.1-73.41) check_1417337_reference "$1" '7aa41973005e4f74eab7fc630d49fc5d96afc16edd786f9c22ca3d8cd993bb75' ;;
+                14.1-73.46) check_1417337_reference "$1" '37f0cdff01c6a6f6b431d9bd2d63960b88a4565f8fbfae7c3df884abe7a29f1f' ;;
             esac
             ;;
     esac
@@ -1628,6 +1640,9 @@ Citrix reports observed exploitation of CVE-2026-88771 and CVE-2026-88772.
   88774: possible policy bypass involving HTTP URL-based expressions.
   88775-88777: memory overflows that may cause unexpected behavior or DoS in specified configurations.
   88778: TCP Initial Sequence Number (ISN) prediction.
+  88779: SAML SP/IdP memory overflow leading to denial of service (CTX697174).
+  107406: SAML-role-dependent memory overflow (CTX697191; standard fixed builds
+          assessed separately below; FIPS/NDcPP thresholds remain CHECK here).
 NOTE
 if [ -n "$CURRENT_INPUT" ]; then
     FW_FAMILY=$(printf '%s\n' "$CURRENT_INPUT" | sed -E -n 's/.*(14\.1|13\.1)[^0-9]*([0-9]+\.[0-9]+).*/\1/p' | head -1)
@@ -1835,6 +1850,56 @@ if [ -r "$CONFIG" ]; then
     printf 'Scope: %s is saved configuration, not necessarily live configuration. Only object counts are displayed; SAML secrets are omitted.\n' "$CONFIG"
 else
     status CHECK 'Saved configuration unreadable; CVE-2026-88779 SAML SP/IdP applicability could not be assessed.'
+fi
+
+subsection 'CVE-2026-107406: SAML SP/IdP memory overflow (CTX697191)'
+printf '%s\n' 'Critical, CVSS v4 9.5; CWE-119 memory overflow with potential RCE or DoS, according to Citrix community guidance.'
+printf '%s\n' 'The applicability depends on both the SAML role and firmware branch/build.'
+printf '%s\n' 'Standard fixed-build references used here: 14.1-73.46 and 13.1-64.29. FIPS/NDcPP fixed thresholds are not assumed by this check.'
+if [ -r "$CONFIG" ]; then
+    CVE107406_SP=$(awk 'tolower($0) ~ /^[[:space:]]*add[[:space:]]+authentication[[:space:]]+samlaction[[:space:]]+/ { n++ } END { print n+0 }' "$CONFIG")
+    CVE107406_IDP=$(awk 'tolower($0) ~ /^[[:space:]]*add[[:space:]]+authentication[[:space:]]+samlidpprofile[[:space:]]+/ { n++ } END { print n+0 }' "$CONFIG")
+    printf 'Saved-config SAML SP actions: %s; SAML IdP profiles: %s\n' "$CVE107406_SP" "$CVE107406_IDP"
+    if [ "$CVE107406_SP" -eq 0 ] && [ "$CVE107406_IDP" -eq 0 ]; then
+        status OK 'No SAML SP action or SAML IdP profile was found in the scanned saved configuration; the stated CVE precondition was not found.'
+    elif printf '%s\n' "${CURRENT_INPUT-}" | grep -Eiq 'FIPS|NDcPP' || { [ "${FW_FAMILY-}" = '13.1' ] && [ "${FW_MAJOR-}" -eq 37 ] 2>/dev/null; }; then
+        status CHECK 'SAML configuration is present on a FIPS/NDcPP build. The applicable CVE-2026-107406 fixed threshold was not independently confirmed here; verify CTX697191 for this edition.'
+    elif [ -n "${FW_FAMILY-}" ] && [ -n "${FW_BUILD-}" ]; then
+        CVE107406_ROLE_APPLIES=NO
+        if [ "$FW_FAMILY" = '14.1' ]; then
+            CVE107406_ROLE_FLOOR='73.37'
+            CVE107406_FIXED='73.46'
+        elif [ "$FW_FAMILY" = '13.1' ]; then
+            CVE107406_ROLE_FLOOR='64.23'
+            CVE107406_FIXED='64.29'
+        else
+            CVE107406_ROLE_FLOOR=''
+            CVE107406_FIXED=''
+        fi
+        if [ -n "$CVE107406_FIXED" ]; then
+            CVE107406_FIXED_MAJOR=${CVE107406_FIXED%.*}
+            CVE107406_FIXED_MINOR=${CVE107406_FIXED#*.}
+            CVE107406_FLOOR_MAJOR=${CVE107406_ROLE_FLOOR%.*}
+            CVE107406_FLOOR_MINOR=${CVE107406_ROLE_FLOOR#*.}
+            printf 'CVE-2026-107406 comparison: firmware %s-%s; standard fixed minimum %s-%s.\n' "$FW_FAMILY" "$FW_BUILD" "$FW_FAMILY" "$CVE107406_FIXED"
+            if [ "$FW_MAJOR" -gt "$CVE107406_FIXED_MAJOR" ] || { [ "$FW_MAJOR" -eq "$CVE107406_FIXED_MAJOR" ] && [ "$FW_MINOR" -ge "$CVE107406_FIXED_MINOR" ]; }; then
+                status OK 'Firmware meets the standard fixed-build threshold for CVE-2026-107406; this does not establish that the appliance was never exposed before updating.'
+            elif [ "$FW_MAJOR" -lt "$CVE107406_FLOOR_MAJOR" ] || { [ "$FW_MAJOR" -eq "$CVE107406_FLOOR_MAJOR" ] && [ "$FW_MINOR" -lt "$CVE107406_FLOOR_MINOR" ]; }; then
+                status ACTION 'SAML SP/IdP is configured on a build below the bulletin role-transition baseline and below the fixed build; upgrade to the applicable fixed release.'
+            elif [ "$CVE107406_IDP" -gt 0 ]; then
+                status ACTION 'A SAML IdP profile is configured on an affected-range build below the fixed build; upgrade to the applicable fixed release.'
+            else
+                status OK 'Only SAML SP configuration was found at/above the bulletin role-transition baseline; CTX697191 states that this range applies only to SAML IdP. CVE-2026-88779 is assessed separately.'
+            fi
+        else
+            status CHECK 'SAML configuration is present, but this release family has no fixed-build mapping in this check; verify CTX697191 and the supported update path.'
+        fi
+    else
+        status CHECK 'SAML configuration is present, but the full firmware family/build is unavailable; the role-specific CVE-2026-107406 applicability cannot be assessed.'
+    fi
+    printf 'Scope: %s is saved configuration, not necessarily live configuration. SAML secrets are omitted.\n' "$CONFIG"
+else
+    status CHECK 'Saved configuration unreadable; SAML role applicability for CVE-2026-107406 could not be assessed.'
 fi
 
 # Access-control inventory intentionally omits user passwords and password hashes.
@@ -2586,6 +2651,28 @@ else
     status OK '/var/cron/tabs directory is absent on this appliance.'
 fi
 
+subsection 'Scheduled deletion or truncation of forensic evidence'
+CRON_EVIDENCE_PATTERN='(rm|shred|truncate|find)[[:space:]].*(/var/log|/var/nslog|/var/core|/var/crash|ns[.]log|messages|httpaccess|httperror|core)([^[:alnum:]_]|$)|(^|[[:space:]])(>|>>)[[:space:]]*/var/(log|nslog|core|crash)(/|[[:space:]]|$)|cat[[:space:]]+/dev/null[[:space:]]*>'
+CRON_EVIDENCE_MATCHES=0
+for f in /etc/crontab /nsconfig/crontab /flash/nsconfig/crontab /var/cron/tabs/*; do
+    [ -f "$f" ] && [ -r "$f" ] || continue
+    CRON_SCAN_LINE=0
+    while IFS= read -r line; do
+        CRON_SCAN_LINE=$((CRON_SCAN_LINE + 1))
+        case "$line" in ''|\#*) continue ;; esac
+        if printf '%s\n' "$line" | grep -E -i -q "$CRON_EVIDENCE_PATTERN"; then
+            CRON_EVIDENCE_MATCHES=$((CRON_EVIDENCE_MATCHES + 1))
+            CRON_EVIDENCE_SOURCES="${CRON_EVIDENCE_SOURCES}${CRON_EVIDENCE_SOURCES:+\n}${f}:${CRON_SCAN_LINE}"
+        fi
+    done < "$f"
+done
+if [ "$CRON_EVIDENCE_MATCHES" -gt 0 ]; then
+    status CHECK "$CRON_EVIDENCE_MATCHES cron line(s) match deletion/truncation patterns targeting logs or core files. This is heuristic; approved cleanup and log rotation can be legitimate. Full active cron lines are listed above; validate owner, command, schedule, and change record:"
+    printf '%b\n' "$CRON_EVIDENCE_SOURCES"
+else
+    status OK 'No selected cron command patterns for deleting or truncating logs/core files found in readable system and per-user crontabs.'
+fi
+
 printf '\n--- Startup and monitoring persistence files ---\n'
 PERSIST_FILES_FOUND=0
 PERSIST_READABLE=0
@@ -2608,6 +2695,7 @@ for f in /nsconfig/rc.netscaler /nsconfig/nsafter.sh /flash/nsconfig/rc.netscale
                 case "$(reference_hash_build)" in
                     14.1-73.37) check_1417337_reference "$f" 'ab1aae7ba469c122ae16a992da9ddc4b12f81301b0b05d8eba2b379a06d56e54' ;;
                     14.1-73.41) check_1417337_reference "$f" '2c6d46cc538b48bf8d7e4ba0d598025114d554fd8a28c391c6290e9c7f98e0ee' ;;
+                    14.1-73.46) check_1417337_reference "$f" '1725ed493fde5361f84c6cd4f545b3815737cecf30b0cc75af20c44eb73cef8f' ;;
                 esac
                 ;;
         esac
@@ -2750,6 +2838,7 @@ if [ -e /bin/sh ]; then
     case "$SHELL_REFERENCE_BUILD" in
         14.1-73.37) SHELL_EXPECTED_HASH='2c1310d7c4d7dfb1ef47b137be1eb572cc743cc609898ae38320963cc0578665' ;;
         14.1-73.41) SHELL_EXPECTED_HASH='8c121937b172124e5895e5296dff5227841b1f8d9a698489377b65e3adb309c7' ;;
+        14.1-73.46) SHELL_EXPECTED_HASH='6e10647b03ef1e7725ce369e2bc07f1cfa54dec406bc4d85452cd563b4036907' ;;
         *) SHELL_EXPECTED_HASH='' ;;
     esac
     if [ -n "$SHELL_EXPECTED_HASH" ]; then
@@ -2879,6 +2968,7 @@ RECENT_SUID_EOF
                         case "$(reference_hash_build)" in
                             14.1-73.37) _expected='5b76771117eacc288a42de079a719402e26528e997cfa82241c4d7a842eba5d2' ;;
                             14.1-73.41) _expected='7aa41973005e4f74eab7fc630d49fc5d96afc16edd786f9c22ca3d8cd993bb75' ;;
+                            14.1-73.46) _expected='37f0cdff01c6a6f6b431d9bd2d63960b88a4565f8fbfae7c3df884abe7a29f1f' ;;
                         esac
                         ;;
                 esac
@@ -3163,7 +3253,7 @@ if [ -n "$STAGING_FILES" ]; then
                 printf 'SHA-256 observed:  %s\n' "$ACTUAL_HASH"
                 printf 'SHA-256 reference: %s\n' "$EXPECTED_HASH"
                 if [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ]; then
-                    status OK "$f SHA-256 exactly matches the internal reference captured on clean 14.1-73.37 and 14.1-73.41 reference appliances. Identical bytes are confirmed; the reference is not Citrix-published and does not establish provenance for this appliance."
+                    status OK "$f SHA-256 exactly matches the internal reference captured on clean 14.1-73.37, 14.1-73.41, and 14.1-73.46 reference appliances. Identical bytes are confirmed; the reference is not Citrix-published and does not establish provenance for this appliance."
                     STAGING_REFERENCE_MATCHES=$((STAGING_REFERENCE_MATCHES + 1))
                 else
             status CHECK "$f SHA-256 differs from the internal reference; inspect before disposition."
@@ -3180,7 +3270,7 @@ if [ -n "$STAGING_FILES" ]; then
     done
     STAGING_CLASSIFIED=$((STAGING_REFERENCE_MATCHES + STAGING_MALICIOUS_MATCHES))
     if [ "$STAGING_REVIEW_UNKNOWN" -eq 0 ] && [ "$STAGING_REFERENCE_MISMATCHES" -eq 0 ] && [ "$STAGING_CLASSIFIED" -eq "$(printf '%s\n' "$STAGING_CANDIDATE_PATHS" | wc -l | tr -d ' ')" ] && [ "$STAGING_REFERENCE_MATCHES" -gt 0 ] && [ "$STAGING_MALICIOUS_MATCHES" -eq 0 ]; then
-        status OK 'Every VPN staging file found matches a known package hash in the internal 14.1-73.37 / 14.1-73.41 reference set; presence alone is expected on this reference build. The hashes are not Citrix-published.'
+        status OK 'Every VPN staging file found matches a known package hash in the internal 14.1-73.37 / 14.1-73.41 / 14.1-73.46 reference set; presence alone is expected on these reference builds. The hashes are not Citrix-published.'
     elif [ "$STAGING_REVIEW_UNKNOWN" -gt 0 ] || [ "$STAGING_REFERENCE_MISMATCHES" -gt 0 ]; then
         status CHECK 'VPN staging inventory includes an unknown, unverified, or hash-mismatching file; validate it against a trusted same-build baseline.'
     fi
@@ -3471,6 +3561,31 @@ else
     status OK 'No matching web/application files with modification times within the last 14 days were found in the scanned paths.'
 fi
 
+subsection 'Archive content disguised as a web-served file'
+printf '%s\n' 'Checks file signatures only (gzip, tar, ZIP) in selected web-served trees; names and contents are not trusted as indicators by themselves.'
+ARCHIVE_MAGIC_FILES=$(find /var/netscaler/logon /netscaler/ns_gui /var/vpn /var/nsproflog /var/netscaler/gui /netscaler/gui /netscaler/portal \
+    -type f \( -name '*.html' -o -name '*.htm' -o -name '*.json' -o -name '*.css' -o -name '*.js' -o -name '*.txt' \) \
+    -size -64M -print 2>/dev/null | perl -ne '
+        chomp; my $p=$_; open(my $h,"<",$p) or next; binmode($h); my $n=read($h,my $b,512); close($h);
+        next unless defined $n;
+        if (substr($b,0,2) eq "\x1f\x8b" || substr($b,0,4) eq "PK\x03\x04" || ($n >= 262 && substr($b,257,5) eq "ustar")) {
+            print "$p\n";
+        }
+    ' 2>/dev/null | head -50)
+if [ -n "$ARCHIVE_MAGIC_FILES" ]; then
+    status CHECK 'Archive signatures found in files with web-facing text/asset extensions. This can indicate staged data, but validate expected content and preserve metadata; no file contents are printed:'
+    printf '%s\n' "$ARCHIVE_MAGIC_FILES" | while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        ls -ln "$f" 2>/dev/null
+        printf 'SHA-256: %s\n' "$(sha256_of "$f")"
+    done
+    status CHECK 'The signature test covers gzip, tar, and ZIP headers in the selected paths and file extensions (files larger than 64 MiB and other formats are excluded).'
+elif [ -d /var/netscaler/logon ] || [ -d /netscaler/ns_gui ] || [ -d /var/vpn ] || [ -d /var/netscaler/gui ] || [ -d /netscaler/portal ]; then
+    status OK 'No gzip/tar/ZIP magic bytes found in the selected web-served text/asset files up to 64 MiB.'
+else
+    status CHECK 'None of the candidate web-served paths exists; archive-signature coverage is unavailable.'
+fi
+
 printf '\n--- New script files and ELF binaries in served-file trees ---\n'
 if [ -r "${INSTALL_STATE_FILE-}" ]; then
     RECENT_EXEC_CANDIDATES=$(find /var/netscaler/logon /netscaler/ns_gui /var/vpn /var/nsproflog /var/python /var/netscaler/gui /netscaler/gui /netscaler/portal /tmp /var/tmp -type f -newer "$INSTALL_STATE_FILE" -print 2>/dev/null | head -200)
@@ -3597,10 +3712,15 @@ if reference_hash_build_supported; then
             script.js) CUSTOM_ASSET_EXPECTED_HASH='31d53110df746be20920919bd72b80408e758a44852d3cf4a3d88e1b7bd5460a' ;;
             style.css) CUSTOM_ASSET_EXPECTED_HASH='0ecdfbe22feb58756224e2e3b9f38abeafcf4c491f79cdba6ebb8de52acc044b' ;;
             ajax-loader.gif) CUSTOM_ASSET_EXPECTED_HASH='b98f0466a81ba5642c9bafbc00964f0e559945a4ec996a165d2179d03bd5e8ca' ;;
-            strings.de.json|strings.en.json|strings.fr.json|strings.it.json|strings.ja.json|strings.pt.json|strings.nl.json|strings.ko.json|strings.ru.json|strings.zh-CN.json|strings.zh-TW.json)
+            strings.de.json|strings.en.json|strings.fr.json|strings.it.json|strings.ja.json|strings.pt.json|strings.nl.json|strings.ko.json|strings.ru.json|strings.zh-TW.json)
                 CUSTOM_ASSET_EXPECTED_HASH='8eb95bcbc154530931e15fc418c8b1fe991095671409552099ea1aa596999ede' ;;
             strings.es.json)
                 CUSTOM_ASSET_EXPECTED_HASH='d914176fd50bd7f565700006a31aa97b79d3ad17cee20c8e5ff2061d5cb74817' ;;
+            strings.zh-CN.json)
+                case "$(reference_hash_build)" in
+                    14.1-73.46) CUSTOM_ASSET_EXPECTED_HASH='d914176fd50bd7f565700006a31aa97b79d3ad17cee20c8e5ff2061d5cb74817' ;;
+                    *) CUSTOM_ASSET_EXPECTED_HASH='8eb95bcbc154530931e15fc418c8b1fe991095671409552099ea1aa596999ede' ;;
+                esac ;;
         esac
         printf '%s\n' "$f"
         printf 'Observed SHA-256: %s\n' "${CUSTOM_ASSET_HASH:-unavailable}"
@@ -3626,7 +3746,7 @@ if reference_hash_build_supported; then
         done
     fi
 else
-    status CHECK 'These additional LogonPoint hashes are single-appliance 14.1-73.37 and 14.1-73.41 references and were not compared because the running build is outside that exact scope.'
+    status CHECK 'These additional LogonPoint hashes are single-appliance 14.1-73.37, 14.1-73.41, and 14.1-73.46 references and were not compared because the running build is outside that exact scope.'
 fi
 
 section '5. Log coverage and event correlation'
@@ -3872,6 +3992,57 @@ elif [ -n "$INDEX_PAYLOADS" ]; then
 else
     status OK 'Neither selected stage of this two-stage log-chain pattern was found in retained logs. This result is limited by log coverage, formats, and retention.'
 fi
+
+subsection 'Deferred warm-restart log processing and helper integrity'
+printf '%s\n' 'Separates crafted records written to logs from later helper execution. A trigger-shaped log entry is evidence of an attempt; it does not prove the helper ran or a command executed.'
+WARM_HELPER=/netscaler/ns_monuploadd_err.pl
+WARM_VULNERABLE_SHA256=fb7f574a4c185fa8e520c47280939ce22899243a0083ee7120b7300c43baca29
+WARM_FIXED_737_SHA256=02b24a9923a6cee1fbee48137b7f81b7e0f5169246728b7368fc3a066c43a708
+if [ -f "$WARM_HELPER" ] && [ -r "$WARM_HELPER" ]; then
+    WARM_HELPER_HASH=$(sha256_of "$WARM_HELPER")
+    printf 'Helper: %s\nSHA-256 observed: %s\n' "$WARM_HELPER" "$WARM_HELPER_HASH"
+    if [ "$WARM_HELPER_HASH" = "$WARM_VULNERABLE_SHA256" ]; then
+        if [ "${FW_FAMILY-}" = '14.1' ] && [ "${FW_PATCHED-UNKNOWN}" = YES ]; then
+            status ACTION 'The helper matches the independently analyzed vulnerable NetScaler 14.1-73.30 sample hash, but the detected 14.1 firmware meets the fixed-build threshold. This may indicate a stale/restored helper; preserve it and verify against the exact installed package or Citrix Support. The hash is research-derived, not a Citrix-published checksum.'
+        elif [ "${FW_FAMILY-}" = '14.1' ]; then
+            status CHECK 'The helper matches the independently analyzed vulnerable 14.1-73.30 sample hash. The firmware finding above determines whether this is expected on the installed build; do not infer execution from the hash alone.'
+        else
+            status CHECK 'The helper matches an independently analyzed vulnerable 14.1-73.30 sample hash, but that reference does not establish applicability to this detected firmware family/build. Verify with the matching vendor package.'
+        fi
+    elif [ "${FW_FAMILY-}" = '14.1' ] && [ "${FW_BUILD-}" = '73.37' ] && [ "$WARM_HELPER_HASH" = "$WARM_FIXED_737_SHA256" ]; then
+        status OK 'The helper hash matches the independently analyzed 14.1-73.37 package sample. This is a single-build research reference, not a Citrix-published checksum or a general integrity guarantee.'
+    else
+        status OK 'The exact known vulnerable 14.1-73.30 helper sample hash was not found. This does not validate the file against the current build; compare with a trusted package of the exact edition/build.'
+    fi
+elif [ "${FW_FAMILY-}" = '14.1' ]; then
+    status CHECK '/netscaler/ns_monuploadd_err.pl is absent or unreadable; verify the expected path and compare with the exact installed build package.'
+else
+    status CHECK 'The helper path is absent/unreadable or the detected family is outside the scoped 14.1 research reference; helper integrity is not established.'
+fi
+
+WARM_LOG_FILES_FOUND=0
+for f in /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/auth.log*; do
+    [ -f "$f" ] && [ -r "$f" ] && WARM_LOG_FILES_FOUND=1
+done
+WARM_TRIGGER_PATTERN='pitboss[^[:cntrl:]]*PPE[^[:cntrl:]]*(missed too many heartbeats|unexpectedly died)[^[:cntrl:]]*NSPPE[^[:cntrl:]]*(;|%3[bB]|%3[eE]|%7[cC]|%24%7[bB]IFS|%60|`|\$\(|\$\{|\|)'
+WARM_TRIGGER_COUNT=$(zgrep -hE -i "$WARM_TRIGGER_PATTERN" /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/auth.log* 2>/dev/null | grep -v 'shell_command=' | sort -u | wc -l | tr -d ' ')
+WARM_WR_COUNT=$(zgrep -hE -i 'ns_monuploadd_err[.]pl[^[:cntrl:]]*(-WR|--warm-restart)' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/sh.log* /var/log/bash.log* 2>/dev/null | grep -v 'deyda-netscaler-ioc-check' | sort -u | wc -l | tr -d ' ')
+WARM_HISTORY_COUNT=$( { for f in /root/.bash_history /root/.sh_history /nsconfig/.bash_history; do [ -r "$f" ] && grep -E -i 'ns_monuploadd_err[.]pl[^[:cntrl:]]*(-WR|--warm-restart)' "$f" 2>/dev/null; done; ps axww -o command= 2>/dev/null | grep -E -i 'ns_monuploadd_err[.]pl[^[:cntrl:]]*(-WR|--warm-restart)' | grep -vE 'grep|deyda-netscaler-ioc-check'; } | sort -u | wc -l | tr -d ' ')
+WARM_CALLHOME_COUNT=$(zgrep -hE -i 'ns_monuploadd_err[.]pl|arm restart' /var/log/callhome* 2>/dev/null | sort -u | wc -l | tr -d ' ')
+if [ "${WARM_TRIGGER_COUNT:-0}" -gt 0 ]; then
+    if [ "${WARM_WR_COUNT:-0}" -gt 0 ] || [ "${WARM_HISTORY_COUNT:-0}" -gt 0 ] || [ "${WARM_CALLHOME_COUNT:-0}" -gt 0 ]; then
+        status ACTION "Found $WARM_TRIGGER_COUNT unique trigger-shaped log record(s) plus separate helper/callhome activation markers (WR log entries: $WARM_WR_COUNT; history/process matches: $WARM_HISTORY_COUNT; callhome markers: $WARM_CALLHOME_COUNT). This is uncorrelated co-occurrence, not proof the helper processed that record or that a command succeeded. Preserve logs and correlate exact timestamps with artifacts, processes, and external telemetry."
+    else
+        status ACTION "Found $WARM_TRIGGER_COUNT unique trigger-shaped log record(s) containing shell syntax after the NSPPE marker. This is evidence of an exploit attempt in the logs, not proof that ns_monuploadd_err.pl processed it. No selected -WR/callhome activation clue was found in searched sources."
+    fi
+elif [ "${WARM_WR_COUNT:-0}" -gt 0 ] || [ "${WARM_HISTORY_COUNT:-0}" -gt 0 ] || [ "${WARM_CALLHOME_COUNT:-0}" -gt 0 ]; then
+    status CHECK "Helper -WR or callhome activity markers were found without a matching trigger-shaped record (WR log entries: $WARM_WR_COUNT; history/process matches: $WARM_HISTORY_COUNT; callhome markers: $WARM_CALLHOME_COUNT). Confirm whether the invocation was approved and correlate timestamps."
+elif [ "$WARM_LOG_FILES_FOUND" -eq 1 ]; then
+    status OK 'No selected crafted warm-restart trigger or helper activation pattern found in the retained local logs, selected histories, and process snapshot. This does not prove complete log retention or exclude other execution paths.'
+else
+    status CHECK 'No readable candidate system logs were found for the deferred warm-restart log-processing check; coverage is unavailable.'
+fi
+printf '%s\n' 'Scope note: the script reports counts, not attacker-controlled log lines. It does not automatically correlate timestamps across local/rotated logs and callhome; use the source logs and remote telemetry for that step.'
 
 
 subsection 'Multi-signal authentication-log injection without a PPE trigger'
