@@ -2,7 +2,7 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.75
+# Version: 9.79
 #
 # GEIGER detection enhancements are integrated into the read-only checks below.
 # Optional campaign start override: GEIGER_CAMPAIGN_START=YYYY-MM-DD.
@@ -35,6 +35,11 @@
 # (nsgtrust.deb sample hash, PHP handling of .ico, .local_journal webshell, and
 # account changes in saved configuration):
 # https://www.esentire.com/blog/more-shells-than-a-seafood-buffet-tracking-citrix-netscaler-exploitation-activities-cve-2026-88771
+# Additional CVE-2026-88771 C2 and log-injection indicators from SOCRadar's
+# 2026-10-07 analysis: 45.143.130.195, /tmp/.nsagent, staged callback paths,
+# alternate pitboss NSPPE-00;...;# unexpectedly died form, and up to 24h delayed
+# processing. These are campaign leads, not vendor IoCs or proof of execution.
+# https://socradar.io/blog/netscaler-c2-cve-2026-88771-exploitation/
 #
 # Publisher
 #   Deyda Consulting GmbH
@@ -63,6 +68,8 @@
 #   https://unit42.paloaltonetworks.com/netscaler-zero-days-exploited/
 #   TENEX active exploitation observations (2026-10-01):
 #   https://tenex.ai/blog/what-tenex-observed-inside-active-exploitation-of-netscaler-zero-day/
+#   SOCRadar NetScaler C2 and CVE-2026-88771 analysis (2026-10-07):
+#   https://socradar.io/blog/netscaler-c2-cve-2026-88771-exploitation/
 #   Citrix incident response: CTX694799
 #
 # Operation
@@ -123,7 +130,7 @@
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 export PATH
 umask 077
-SCRIPT_VERSION='9.75'
+SCRIPT_VERSION='9.79'
 # GEIGER: identify this script by its resolved path, not by an assumed file name.
 GEIGER_SELF_PATH=$(realpath "$0" 2>/dev/null)
 [ -n "$GEIGER_SELF_PATH" ] || GEIGER_SELF_PATH=$(cd "$(dirname "$0")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename "$0")")
@@ -400,9 +407,9 @@ my @SHELL_FAMILIES     = qw(sh.log bash.log);
 my @REFERENCE_FAMILIES = qw(ns.log nsvpn.log messages notice.log auth.log httperror.log httperror-vpn.log);
 
 # The injected value follows the pitboss text; a shell separator must come next.
-my $TRIGGER_RE      = qr/pitboss\s+PPE\s+(?:missed\s+too\s+many\s+heartbeats|unexpectedly\s+died)\s*NSPPE(?:-\d+)?/i;
+my $TRIGGER_RE      = qr/(?:pitboss\s+PPE\s+(?:missed\s+too\s+many\s+heartbeats|unexpectedly\s+died)\s*NSPPE(?:-\d+)?|pitboss\s+NSPPE(?:-\d+)?)/i;
 my $INJECT_START_RE = qr/^\s*(?:[;|&\x60]|\$\(|\$\{?IFS|%0a|%3b|%60|%7c|%26)/i;
-my $AUTH_PATH_RE    = qr{^/(?:nf/auth/|p/u/|cgi/(?:login|samlauth|authenticate)|saml/|oauth/|logon/LogonPoint/Authentication/)}i;
+my $AUTH_PATH_RE    = qr{^/(?:nitro/v1/config/login|nf/auth/|vpn/index[.]html|p/u/|cgi/(?:login|samlauth|authenticate)|saml/|oauth/|logon/LogonPoint/(?:index[.]html|Authentication/))}i;
 my $IPV4_RE         = qr/\d{1,3}(?:\.\d{1,3}){3}/;
 
 # Read/search commands: a payload string in them is analysis, not execution.
@@ -597,7 +604,8 @@ sub report_coverage {
 }
 
 sub report_attempts {
-    heading("GEIGER: injection attempts, complete and grouped by payload");
+    heading("CVE-2026-88771 attack-chain analysis");
+    out("Attempt records grouped by payload:");
     if (@READ_ERRORS) {
         status("CHECK", scalar(@READ_ERRORS) . " log file(s) could not be read completely. All GEIGER results below "
             . "are incomplete for these files; rerun the script and keep the files for offline analysis:");
@@ -642,7 +650,7 @@ sub report_attempts {
 }
 
 sub report_sources {
-    heading("GEIGER: source IPs of the attempts");
+    out("", "Source-IP correlation:");
     if (!@GROUP_LIST) { out("No attempts, nothing to correlate."); return }
     my %direct;
     for my $group (@GROUP_LIST) {
@@ -675,7 +683,7 @@ sub report_sources {
 }
 
 sub report_execution {
-    heading("GEIGER: execution traces of the injected commands");
+    out("", "Execution evidence in shell-audit logs:");
     out(sprintf("Shell-audit lines analysed: %d (own runs excluded: %d; other triage tools excluded: %d).",
                 $SHELL_STATS{lines}, $SHELL_STATS{own}, $SHELL_STATS{tool}),
         "Shell-audit coverage: " . (@SHELL_INTERVALS
@@ -752,7 +760,7 @@ sub report_execution {
 }
 
 sub report_chronology {
-    heading("GEIGER: attempts, nsaaad deaths and pitboss reboots in time order");
+    out("", "Time correlation: attempts, nsaaad deaths, and Pitboss restarts:");
     my (%day, %minute);
     for my $group (@GROUP_LIST) {
         for my $t (keys %{ $group->{seconds} }) {
@@ -1568,23 +1576,19 @@ if [ "$RUNNING_ON_ADC" = YES ]; then
 else
     printf 'Pre-scan estimate: %s\n' "$LOG_EST_TIME"
 fi
-printf 'Status definitions are provided once in the section \"How to read this report\" below.\n\n'
 printf 'Build input/source: %s / %s\n' "${CURRENT_INPUT:-not supplied}" "$VERSION_SOURCE"
 if [ "$RUNNING_ON_ADC" = YES ] && [ -n "$CONFIG_VERSION" ] && [ -n "$RUNTIME_FAMILY" ] && [ "${CONFIG_VERSION%%-*}" != "$RUNTIME_FAMILY" ]; then
     status CHECK "Saved ns.conf header reports $CONFIG_VERSION, but the running kernel release identifies $RUNTIME_FAMILY. The running-kernel source takes precedence; treat the saved header as stale until verified."
 elif [ "$RUNNING_ON_ADC" = YES ] && [ -n "$CONFIG_VERSION" ] && [ -n "$CURRENT_INPUT" ] && [ "$CONFIG_VERSION" != "$CURRENT_INPUT" ] && [ "$VERSION_SOURCE" != 'operator-supplied version' ] && [ "$CURRENT_INPUT" = *-* ]; then
     status CHECK "Saved ns.conf header reports $CONFIG_VERSION while the running build source reports $CURRENT_INPUT. The saved header may be stale after upgrade."
 fi
-printf 'Enhanced ISN: assessed=%s (source: %s); saved-config=%s (%s)\n' \
-    "$ISN_STATE" "$ISN_SOURCE" "$ISN_CONFIG_STATE" "$CONFIG"
-
 section 'How to read this report'
 cat <<'READ_GUIDE'
 [OK] means the selected pattern was not found in the source and time range the check scanned. It is not a clean bill of health.
 [CHECK] means the output needs human validation, usually against an approved change, a trusted same-build baseline, or a wider evidence source.
 [ACTION] means a higher-priority indicator matched. Preserve the relevant evidence and correlate it before cleanup, restart, or rebuild. It is not automatic proof that the appliance was compromised.
 
-Read the report in this order: executive summary and priority finding map; status definitions; firmware/CVE applicability; host integrity and persistence; web configuration and files; log coverage and attack indicators; then next actions.
+Identical numbered ns.conf evidence lines are printed only at their first occurrence, even if several CVE checks use that same configuration line.
 READ_GUIDE
 
 section '1. Platform and uptime'
@@ -1609,9 +1613,7 @@ else
 fi
 
 section '2. Firmware and CVE applicability'
-subsection 'Purpose and follow-up'
-printf '%s\n' 'Purpose: compare the detected build with the bulletin threshold and inventory saved-config preconditions.'
-printf '%s\n' 'If below threshold: schedule the fixed build. If at/above threshold: treat matching config lines as historical-exposure context, then review the pre-update logs and file evidence.'
+printf '%s\n' 'Compares the detected build with bulletin thresholds and inventories saved-config preconditions. Matching configuration on a fixed build is historical context; it does not establish whether earlier compromise occurred.'
 cat <<'NOTE'
 Citrix fixed-build thresholds stated in the bulletin:
   Standard 14.1: 14.1-73.37 or later
@@ -1803,7 +1805,7 @@ if [ -r "$CONFIG" ]; then
     SAML_DOS_IDP=$(awk 'tolower($0) ~ /^[[:space:]]*add[[:space:]]+authentication[[:space:]]+samlidpprofile[[:space:]]+/ { n++ } END { print n+0 }' "$CONFIG")
     printf 'Saved-config SAML SP actions: %s; SAML IdP profiles: %s\n' "$SAML_DOS_SP" "$SAML_DOS_IDP"
     if [ "$SAML_DOS_SP" -eq 0 ] && [ "$SAML_DOS_IDP" -eq 0 ]; then
-        status OK 'No SAML SP action or SAML IdP profile found in the scanned saved configuration; CVE-2026-88779 precondition not found in this source.'
+        status OK 'No configured SAML SP action or SAML IdP profile was found in the scanned saved configuration.'
     elif [ -n "${FW_FAMILY-}" ] && [ -n "${FW_BUILD-}" ]; then
         SAML_DOS_REQUIRED=''
         case "$FW_FAMILY" in
@@ -2035,41 +2037,40 @@ if [ -r "$CONFIG" ]; then
         }
     }
     END {
-        result("INFO","Saved SAML action count: " (saml+0))
         count=0; for(name in definitions) count++
         if(!saml && !other && !count) {
-            result("OK","No selected SAML configuration or recognized workaround policy found; this SAML workaround check is not applicable in the scanned saved configuration.")
+            result("INFO","Workaround policy check skipped; CVE-2026-88779 SAML applicability is reported above.")
             exit
         }
         warning=(saml || other)?"ACTION":"CHECK"
         prefix="WARNING: "
         if(fixed=="YES") {
             warning="INFO"; prefix="Info (not required on the fixed build): "
-            result("OK","Firmware meets the CVE-2026-88779 fixed build; the SAML request workaround is an interim measure until that build and is not required. The workaround inventory below is informational.")
+            result("INFO","CVE-2026-88779 fixed build assessed; the SAML request workaround is not required. Any policy details below are informational.")
         }
-        if(!count) result(warning,prefix "No responder policy matching the /cgi/samlauth + SAMLResponse (or /saml/login + SAMLRequest) expression and DROP action was found in saved configuration. Verify the current Citrix mitigation and save the configuration.")
+        if(!count && fixed!="YES") result(warning,prefix "No responder policy matching the /cgi/samlauth + SAMLResponse (or /saml/login + SAMLRequest) expression and DROP action was found in saved configuration. Verify the current Citrix mitigation and save the configuration.")
         for(name in definitions) {
             if(valid[name]) result("INFO",name " matches a SAML endpoint/body-field pattern and DROP action. The full policy expression is not printed; verify it against current Citrix guidance.")
             else result(warning,prefix name " is defined but does not contain the expected selected expression/action markers.")
         }
-        total=0; covered=0; missing=0
+        total=0; covered=0; missing=0; missing_names=""
         for(key in servers) {
-            total++; ok=0; matched=""
-            for(name in definitions) if(valid[name] && bindings[key SUBSEP name]) {ok=1; matched=name; break}
+            total++; ok=0
+            for(name in definitions) if(valid[name] && bindings[key SUBSEP name]) {ok=1; break}
             if(ok) {
                 covered++
-                result("OK",servers[key] ": " matched " is defined with recognized structure and an enabled AAA_REQUEST binding in saved configuration.")
             } else {
                 missing++
-                result(warning,prefix servers[key] " has no enabled AAA_REQUEST binding to a recognized policy with the selected structure. Check the required frontend binding.")
+                if(missing_names=="") missing_names=servers[key]
+                else missing_names=missing_names ", " servers[key]
             }
         }
-        if(total && !missing) result("OK","Recognized SAML workaround coverage found for all " total " saved Authentication/VPN vServers.")
+        if(total && !missing) result("OK","Recognized SAML workaround policy is bound with AAA_REQUEST to all " total " saved Authentication/VPN vServers.")
         else if(!total) result(fixed=="YES" ? "INFO" : "CHECK","No Authentication/VPN vServers were found; frontend binding coverage cannot be established.")
-        else result(warning,(fixed=="YES" ? prefix : "") "SAML workaround coverage incomplete: " covered " of " total " saved Authentication/VPN vServers have a recognized enabled AAA_REQUEST binding.")
+        else result(warning,(fixed=="YES" ? prefix : "") "SAML workaround policy is bound to " covered " of " total " saved Authentication/VPN vServers. Missing bindings: " missing_names ".")
         if(count) {
             if(responder_enabled) result("OK","RESPONDER feature enablement is present in the saved configuration.")
-            else result(warning,prefix "A matching SAML workaround policy is present, but 'enable ns feature RESPONDER' is not recorded in the saved configuration. Verify the live feature state with 'show ns feature'; a bound policy is ineffective if Responder is disabled.")
+            else result(warning,prefix "A matching SAML workaround policy is present, but the command enable ns feature RESPONDER is not recorded in the saved configuration. Verify live state with show ns feature; a bound policy is ineffective if Responder is disabled.")
         }
         result("INFO","Scope: saved configuration only; selected structure is not exact expression validation. Verify current Support instructions, priorities, effective live flow and legitimate sign-ins. Global bindings are not counted as AAA_REQUEST coverage.")
     }
@@ -2132,8 +2133,8 @@ gdl_counter_state() {
 }
 
 subsection 'CVE-2026-88779: Global Deny List signatures and AAA_REQUEST statistics'
-printf '%s\n' 'Additional mitigation checks from the supplied Citrix Community guidance; these do not replace the fixed-build assessment above.'
-printf '%s\n' 'Console service, or on-premises Console with Cloud Connect, and Virtual patching Enabled are required. Local signatures/statistics alone do not verify these Console settings.'
+printf '%s\n' 'Checks the supplemental Global Deny List mitigation for affected standard builds; it does not replace firmware remediation.'
+printf '%s\n' 'Console service (or on-premises Console with Cloud Connect) and Virtual patching Enabled are prerequisites; local output cannot verify those Console settings.'
 GDL_SCOPE=UNKNOWN
 if [ -r "$CONFIG" ] && [ "${SAML_DOS_SP:-0}" -eq 0 ] && [ "${SAML_DOS_IDP:-0}" -eq 0 ]; then
     GDL_SCOPE=NO_SAML
@@ -2152,10 +2153,9 @@ elif [ -n "${FW_FAMILY-}" ] && [ -n "${FW_BUILD-}" ]; then
         else GDL_SCOPE=OUTSIDE_RANGE; fi
     fi
 fi
-printf 'Reported mitigation scope: %s\n' "$GDL_SCOPE"
 case "$GDL_SCOPE" in
-    NO_SAML) status OK 'No SAML SP/IdP prerequisite found in saved configuration; this CVE-specific Global Deny List mitigation is not required by the scanned configuration.' ;;
-    FIXED) status OK 'Firmware meets the CVE-2026-88779 fixed threshold; Global Deny List mitigation is not a prerequisite for that firmware result.' ;;
+    NO_SAML) : ;;
+    FIXED) printf '%s\n' '[INFO] Global Deny List interim mitigation is not required on the assessed fixed build.' ;;
     *)
         case "$GDL_SCOPE" in
             SUPPORTED_RANGE) printf '%s\n' 'Build is in the reported standard-version mitigation range. Verify signature version >=24 and Console prerequisites until updating.' ;;
@@ -2216,8 +2216,7 @@ esac
 
 if [ "$RUNNING_ON_ADC" = YES ]; then
 section '3. Host integrity and persistence'
-subsection 'Purpose and follow-up'
-printf '%s\n' 'Purpose: review reboot/core history, install timing, startup/persistence locations, user-owned processes, shell permissions, and selected SUID/SGID files.'
+printf '%s\n' 'Reviews reboot/core history, install timing, startup/persistence locations, user-owned processes, shell permissions, and selected SUID/SGID files.'
 printf '%s\n' 'For each [CHECK]: compare path, owner, mode, hash, and timestamp with a trusted appliance on the same build; correlate with installns_state, change records, and HA peer evidence. Preserve unexpected files before changing them.'
 printf '\n--- Firmware installation directory / possible review window ---\n'
 if [ -d /var/nsinstall ]; then
@@ -2997,8 +2996,7 @@ if reference_hash_build_supported; then
     fi
 fi
 section '4. Web configuration and served-file integrity'
-subsection 'Purpose and follow-up'
-printf '%s\n' 'Purpose: inspect httpd.conf indicators, web-facing files, known webshell/payload markers, custom language files, and recent file changes.'
+printf '%s\n' 'Inspects httpd.conf indicators, web-facing files, known webshell/payload markers, custom language files, and recent file changes.'
 printf '%s\n' 'For each [CHECK]: validate the exact file and timestamp against the firmware install/change window, compare hashes with a trusted same-build node, and inspect suspicious content from a preserved copy. A normal vendor package or upgrade timestamp can explain a match.'
 printf '%s\n' 'Request-path hits are not automatically malicious: check the request date, source address, method, response, and whether the requested path is a normal NetScaler resource. Prior-year scanner noise should stay classified as historical unless correlated evidence says otherwise.'
 subsection 'httpd.conf metadata and indicators'
@@ -3632,8 +3630,7 @@ else
 fi
 
 section '5. Log coverage and event correlation'
-subsection 'Purpose and follow-up'
-printf '%s\n' 'Purpose: establish which retained logs overlap the suspected pre-patch period, then search for selected HTTP, authentication, DTLS, and system-event indicators.'
+printf '%s\n' 'Establishes retained-log coverage for the suspected pre-patch period, then searches for selected HTTP, authentication, DTLS, and system-event indicators.'
 printf '%s\n' 'Time handling: the CVE-2026-88771 campaign review begins with the reported activity window shown above and ends at the verified update time. Older path hits (for example, routine scans from 2025) are historical context, not evidence of this campaign by themselves.'
 printf '%s\n' 'For a hit: record the original timestamp and source, correlate HTTP and authentication entries with file/config changes, and preserve the raw logs. A missing match is meaningful only for the periods and log formats actually retained.'
 printf '\n--- Log retention and pre-patch coverage ---\n'
@@ -3858,29 +3855,23 @@ if [ "$SCANNER_PROBE_HITS" -gt 0 ]; then
 else
     status OK 'No scanner-probe string found in the retained candidate authentication/system logs. Coverage depends on log format and retention.'
 fi
-subsection 'PPE/pitboss log injection and two-stage correlation'
-PITBOSS_LINES=$(zgrep -hE -i 'pitboss PPE (missed too many heartbeats|unexpectedly died)[[:space:]]?NSPPE(-[0-9]+)?[^[:cntrl:]]*(;|%3[bB]|`|%60|\$\(|\$\{IFS\}|%24%7BIFS%7D)' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | chrono_sort | tail -40)
-if [ -n "$PITBOSS_LINES" ]; then
-    status ACTION 'System/authentication-log line matches a publicly reported PPE trigger (missed heartbeats or unexpectedly died) followed by shell syntax. This records an exploit attempt; it does not prove the line was later processed or that a command ran. Preserve and correlate it:'
-    printf '%s\n' "$PITBOSS_LINES"
-    printf '%s\n' 'GEIGER: newest 40 matching lines in time order; the complete summary by payload follows below.'
-elif [ "$SYS_IOC_LOGS_FOUND" -eq 0 ]; then
-    status CHECK 'No readable ns.log/messages/notice/nsvpn files found; the authentication-trigger check has no coverage.'
-else
-    status OK 'No selected PPE-trigger (missed heartbeats or unexpectedly died) plus shell-syntax pattern found in retained ns.log/messages/notice/nsvpn files.'
-fi
-if [ -n "$PITBOSS_LINES" ] && [ -n "$INDEX_LINES" ]; then
-    status ACTION 'Both selected stages of the publicly described log chain are present. Raise incident priority and correlate timestamps with httpd.conf changes, webshell/payload artifacts, and system events. Available log matches cannot confirm whether the background helper processed the trigger or whether a command executed.'
-elif [ -n "$PITBOSS_LINES" ]; then
-    status CHECK 'The authentication trigger was found without an INDEX: token in available HTTP logs. Review log format, coverage, and other delivery paths.'
-elif [ -n "$INDEX_LINES" ]; then
-    status CHECK 'An INDEX: token was found without the selected authentication trigger. Review decoded text and correlate its timestamp with authentication logs and resulting files.'
-fi
-
-# GEIGER: complete attempt summary, source IPs, execution traces and time order
-# (points 1-3) instead of judging the attack from the newest 40 lines above.
-progress 'Attack logs: injection summary and execution traces (GEIGER)'
+# GEIGER is the single detailed report for PPE/pitboss injection attempts,
+# source correlation, execution traces, and timeline. Do not print the same
+# authentication-log lines again in a separate subsection.
+progress 'Attack logs: CVE-2026-88771 attempt, execution and timeline analysis'
 geiger_analysis injection
+
+subsection 'Two-stage log-chain correlation'
+PPE_TRIGGER_COUNT=$(zgrep -hE -i '(pitboss PPE (missed too many heartbeats|unexpectedly died)[[:space:]]?NSPPE(-[0-9]+)?|pitboss[[:space:]]+NSPPE(-[0-9]+)?)[^[:cntrl:]]*(;|%3[bB]|`|%60|\$\(|\$\{IFS\}|%24%7BIFS%7D)' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | wc -l | tr -d ' ')
+if [ "${PPE_TRIGGER_COUNT:-0}" -gt 0 ] && [ -n "$INDEX_PAYLOADS" ]; then
+    status ACTION 'Both a PPE/pitboss shell-injection pattern and an INDEX: Base64 candidate occur in retained logs. Treat this as a combined attack-chain lead, not proof the events are the same request or that code executed. The GEIGER and INDEX sections contain the evidence; raw lines are not repeated here.'
+elif [ "${PPE_TRIGGER_COUNT:-0}" -gt 0 ]; then
+    status CHECK 'A PPE/pitboss shell-injection pattern was found, but no INDEX: Base64 candidate was found in the searched HTTP logs. Review the GEIGER attempt summary and log coverage; other delivery paths are possible.'
+elif [ -n "$INDEX_PAYLOADS" ]; then
+    status CHECK 'An INDEX: Base64 candidate was found without the selected PPE/pitboss pattern. Review its inert decoded preview and correlate it with the GEIGER timeline and available authentication logs.'
+else
+    status OK 'Neither selected stage of this two-stage log-chain pattern was found in retained logs. This result is limited by log coverage, formats, and retention.'
+fi
 
 
 subsection 'Multi-signal authentication-log injection without a PPE trigger'
@@ -3888,6 +3879,7 @@ subsection 'Multi-signal authentication-log injection without a PPE trigger'
 # Audit/scanner command echoes are excluded. Counts avoid exposing usernames/secrets.
 LOGIN_CHAIN_COUNT=$(zgrep -hEi 'LOGIN_FAILED|AAA LOGIN REQ|aaad_authenticate_req|Could not match login claims|AAAD API: sending login req|AAAD RESP: received resp' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null |
     grep -Eiv 'CMD_EXECUTED|CLI CMD|deyda-netscaler|netscaler-ioc-check' |
+    grep -Eiv 'pitboss[^[:cntrl:]]*NSPPE(-[0-9]+)?' |
     grep -Ei '(\$\{?IFS\}?|%24(%7[bB])?IFS|base64[^[:cntrl:]]*(-d|--decode)|b64decode)' |
     grep -Ei '(/var/log/htt|%2[fF]var%2[fF]log%2[fF]htt|\|[[:space:]]*(sh|bash)|%7[cC][[:space:]]*(sh|bash))' | wc -l | tr -d ' ')
 if [ "$LOGIN_CHAIN_COUNT" -gt 0 ]; then
@@ -3971,18 +3963,74 @@ else
     status OK 'No 138.199.60.0/24 address found in the selected retained logs. This is limited to searched files and retention.'
 fi
 subsection 'Authentication endpoint requests and payload combinations'
-EXPLOIT_PATH_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html|/logon/LogonPoint/Authentication/GetUserName)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -40)
+EXPLOIT_PATH_HITS=$(zgrep -E -i -n '(/nitro/v1/config/login|/nf/auth/(doAuthentication|getAuthenticationRequirements)[.]do|/vpn/index[.]html|/logon/LogonPoint/(index[.]html|tmindex[.]html|Authentication/GetUserName)|/cgi/login|/p/u/do(Authentication|Logon)[.]do)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -40)
+EXPLOIT_PATH_COUNT=$(zgrep -E -i -c '(/nitro/v1/config/login|/nf/auth/(doAuthentication|getAuthenticationRequirements)[.]do|/vpn/index[.]html|/logon/LogonPoint/(index[.]html|tmindex[.]html|Authentication/GetUserName)|/cgi/login|/p/u/do(Authentication|Logon)[.]do)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | awk -F: '{n += $NF} END {print n+0}')
+AUTH_POISON_HTTP_HITS=$(zgrep -E -i -n '(/nitro/v1/config/login|/nf/auth/(doAuthentication|getAuthenticationRequirements)[.]do|/vpn/index[.]html|/logon/LogonPoint/(index[.]html|tmindex[.]html|Authentication/GetUserName)|/cgi/login|/p/u/do(Authentication|Logon)[.]do)[^[:cntrl:]]*(pitboss|NSPPE|PPE unexpectedly died|missed too many heartbeats|%3[bB]|%60|\$\{IFS\}|curl[[:space:]]|wget[[:space:]]|fetch[[:space:]])' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -30)
 if [ -n "$EXPLOIT_PATH_HITS" ]; then
-    status CHECK 'Requests to endpoints observed in public honeypot/research reporting found. These are legitimate NetScaler paths; the requests alone are not IOCs. Review any logged username/body/User-Agent for shell metacharacters or payloads and correlate with auth/system logs:'
-    printf '%s\n' "$EXPLOIT_PATH_HITS"
+    if [ -n "$AUTH_POISON_HTTP_HITS" ]; then
+        status OK "$EXPLOIT_PATH_COUNT request line(s) to monitored authentication endpoints inventoried. Routine endpoint use is expected; up to 30 recent suspicious matches are shown below, with other overlapping copies suppressed."
+    else
+        status OK "$EXPLOIT_PATH_COUNT request line(s) to monitored authentication endpoints inventoried; no selected shell/log-poisoning marker found. Endpoint use alone is expected and is not an IOC."
+    fi
 else
     status OK 'No requests to selected public exploit/authentication paths found in available HTTP logs; this is limited by log retention and format.'
 fi
-AUTH_POISON_HTTP_HITS=$(zgrep -E -i -n '(/nf/auth/doAuthentication[.]do|/cgi/login|/p/u/doLogon[.]do|/logon/LogonPoint/tmindex[.]html|/logon/LogonPoint/Authentication/GetUserName)[^[:cntrl:]]*(pitboss|NSPPE|PPE unexpectedly died|missed too many heartbeats|%3[bB]|%60|\$\{IFS\}|curl[[:space:]]|wget[[:space:]]|fetch[[:space:]])' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -30)
 if [ -n "$AUTH_POISON_HTTP_HITS" ]; then
     status ACTION 'A logged exploit-path request also contains a public log-poisoning trigger or shell/download marker. Review the full request and correlate with ns.log/messages and file artifacts; this indicates an attempt, not automatically successful execution:'
     printf '%s\n' "$AUTH_POISON_HTTP_HITS"
 fi
+
+subsection 'SOCRadar CVE-2026-88771 C2, delayed execution, and agent artifacts'
+printf '%s\n' 'SOCRadar reports a separate automated C2 operation. A matching login/log line indicates an attempt; a C2 address/path or agent artifact is a higher-priority lead, but none alone proves command execution or data theft.'
+SOCRADAR_LOGS_FOUND=0
+for f in /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/auth.log* /var/log/sh.log* /var/log/bash.log* /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* /var/log/named* /var/log/dns*; do
+    [ -f "$f" ] && [ -r "$f" ] && SOCRADAR_LOGS_FOUND=1
+done
+SOCRADAR_TRIGGER_HITS=$(zgrep -E -i -n 'pitboss[[:space:]]+NSPPE(-[0-9]+)?;[^[:cntrl:]]*(curl|wget|fetch|nslookup|%24%7BIFS%7D|\$\{IFS\})[^[:cntrl:]]*;#[[:space:]]*unexpectedly died|pitboss[[:space:]]+NSPPE(-[0-9]+)?;[^[:cntrl:]]*;#[[:space:]]*unexpectedly died' \
+    /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/auth.log* /var/log/sh.log* /var/log/bash.log* /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -30)
+if [ -n "$SOCRADAR_TRIGGER_HITS" ]; then
+    SOCRADAR_TRIGGER_LINES=$(printf '%s\n' "$SOCRADAR_TRIGGER_HITS" | wc -l | tr -d ' ')
+    status ACTION "SOCRadar-style pitboss NSPPE-00;...;# unexpectedly died pattern found in up to 30 recent log lines ($SOCRADAR_TRIGGER_LINES shown). The full injection evidence is grouped in the CVE-2026-88771 attack-chain analysis above; this cross-check does not repeat raw log entries."
+elif [ "$SOCRADAR_LOGS_FOUND" -eq 0 ]; then
+    status CHECK 'No readable candidate logs were available for the SOCRadar-specific injection-pattern check.'
+else
+    status OK 'No SOCRadar-specific pitboss NSPPE-00;...;# unexpectedly died pattern found in the retained candidate logs. Other encodings and removed logs are outside coverage.'
+fi
+
+SOCRADAR_C2_HITS=$(zgrep -E -i -n '(^|[^0-9.])45[.]143[.]130[.]195([^0-9.]|$)|/s/[[:xdigit:]]{8}([^[:alnum:]_]|$)|/a/[[:xdigit:]]{8}([^[:alnum:]_]|$)|/p/[[:xdigit:]]{8}[?]|/c/[[:xdigit:]]{8}([^[:alnum:]_]|$)|/r/[[:xdigit:]]{8}[?]|p1[.]oob[.]45[.]143[.]130[.]195' \
+    /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/auth.log* /var/log/sh.log* /var/log/bash.log* /var/log/named* /var/log/dns* 2>/dev/null | chrono_sort | tail -40)
+if [ -n "$SOCRADAR_C2_HITS" ]; then
+    status ACTION 'SOCRadar-reported C2 address, DNS beacon, or callback-path indicator found in retained logs. This is a high-priority lead, not proof by itself that the agent ran or a transfer succeeded. Preserve evidence and verify origin, direction, destination port, and timestamps: '
+    printf '%s\n' "$SOCRADAR_C2_HITS" | cut -c1-360
+elif [ "$SOCRADAR_LOGS_FOUND" -eq 0 ]; then
+    status CHECK 'No readable candidate logs were available for the SOCRadar C2 indicator check.'
+else
+    status OK 'No SOCRadar C2 address, DNS beacon, or selected callback-path indicator found in retained candidate logs. Historical egress may only exist in external firewall, DNS, or proxy telemetry.'
+fi
+
+NSAGENT_FILES=$(find /tmp /var/tmp -maxdepth 3 -type f -name '.nsagent' -print 2>/dev/null | head -30)
+NSAGENT_PROCESSES=$(ps auxww 2>/dev/null | grep -E '[ /]tmp/[.]nsagent([[:space:]]|$)|[ /]var/tmp/[.]nsagent([[:space:]]|$)' | grep -v '[g]rep')
+if [ -n "$NSAGENT_FILES" ] || [ -n "$NSAGENT_PROCESSES" ]; then
+    status ACTION 'The SOCRadar-reported .nsagent file or process was found under a temporary path. Preserve the file, metadata, process and socket evidence; do not execute or delete it.'
+    [ -n "$NSAGENT_FILES" ] && printf 'Files:\n%s\n' "$NSAGENT_FILES"
+    [ -n "$NSAGENT_PROCESSES" ] && printf 'Processes:\n%s\n' "$NSAGENT_PROCESSES"
+else
+    status OK 'No /tmp/.nsagent or /var/tmp/.nsagent file/process found in the checked scope. Renamed, deleted, or differently staged agents are outside this filename check.'
+fi
+
+if command -v sockstat >/dev/null 2>&1; then
+    SOCRADAR_SOCKET_HITS=$(sockstat -4 -c 2>/dev/null | grep -E '(^|[[:space:]])45[.]143[.]130[.]195:(8899|53)([[:space:]]|$)')
+    if [ -n "$SOCRADAR_SOCKET_HITS" ]; then
+        status ACTION 'A current IPv4 client socket references the SOCRadar-reported C2 address on port 8899 or 53. Preserve PID/socket details and investigate immediately; this is only a point-in-time socket snapshot:'
+        printf '%s\n' "$SOCRADAR_SOCKET_HITS"
+    else
+        status CHECK 'No current sockstat connection to 45.143.130[.]195 on ports 8899/53 was observed. This point-in-time check cannot rule out earlier connections or DNS activity.'
+    fi
+else
+    status CHECK 'sockstat is unavailable; current SOCRadar C2 socket state was not checked.'
+fi
+printf '%s\n' 'Correlation guidance: SOCRadar attributes delayed processing to admautoregd and reports a possible delay of up to 24 hours or processing after a reboot. For each matching injection, review HTTP, shell, DNS, firewall/proxy, reboot and file/process evidence through the following 24 hours. This report identifies co-occurring indicators but does not infer that time relationship across all external telemetry.'
+
 subsection 'VPN icon requests combined with encoded PHP markers'
 ICO_STAGE_HITS=$(zgrep -E -i -n '/vpn/media/[^[:space:]]+[.]ico[^[:cntrl:]]*PD9[A-Za-z0-9+/=]{12,}|PD9[A-Za-z0-9+/=]{12,}[^[:cntrl:]]*/vpn/media/[^[:space:]]+[.]ico' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -30)
 if [ -n "$ICO_STAGE_HITS" ]; then
@@ -4212,8 +4260,7 @@ status CHECK 'Firewall, DNS, SMB/LDAP/Kerberos/RDP, traffic-volume, and internal
 
 
 section '6. Post-scan validation'
-subsection 'Purpose and follow-up'
-printf '%s\n' 'Purpose: complete vendor-supported integrity validation that this read-only helper does not perform.'
+printf '%s\n' 'Complete these vendor-supported validation steps separately; this read-only helper does not perform them.'
 subsection 'Firewall containment reminder: reported payload IP'
 status CHECK 'BLOCKING RECOMMENDATION: block 213.209.159.55 on upstream firewalls for inbound access to public NetScaler VIPs and outbound connections from the appliance (NSIP/SNIP, including TCP 443). Validate and document the rule with the security team; this script cannot inspect or confirm upstream firewall enforcement.'
 printf '%s\n' 'Context: the IP is a reported payload destination. The operator-provided community comment also describes it as an incoming attack source; that attribution is not independently verified here. An IP reference inside a crafted username does not identify the incoming request source.'
@@ -4240,96 +4287,89 @@ These are response reminders, not automated actions. Follow your incident-respon
 Citrix guidance: https://support.citrix.com/external/article/CTX694799/steps-to-take-if-netscaler-adc-is-suspec.html
 IRGUIDE
 
-section '8. Next actions'
+# Put a concise, scan-derived summary before the detailed sections. Exact
+# numbered config rows and exact log records repeated across different
+# subsections are printed once; repeated occurrences within one log check stay.
+# The overview names affected report areas only; evidence and recommendations
+# remain in their detailed section.
+DEDUP_TMP=$(mktemp "${OUT}.dedup.XXXXXX" 2>/dev/null)
+DEDUP_COUNT_TMP=$(mktemp "${OUT}.dedupcount.XXXXXX" 2>/dev/null)
+DUPLICATE_LOG_LINES=0
+if [ -n "$DEDUP_TMP" ] && [ -n "$DEDUP_COUNT_TMP" ]; then
+    if awk -v count_file="$DEDUP_COUNT_TMP" '
+        function is_config(s) {return s ~ /^[0-9]+:(add|set|bind|unbind|rm|delete|enable|disable) /}
+        function is_log(s) {
+            return s ~ /^\/var\/(log|nslog)\/[^[:space:]]+:[0-9]+:/ ||
+                   s ~ /^[0-9]+:(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[[:space:]]/ ||
+                   s ~ /^[0-9]+:[0-9]{4}-[0-9]{2}-[0-9]{2}[ T]/ ||
+                   s ~ /^[0-9]+:[0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}[[:space:]]/}
+        /^===== / {major=$0; minor=""}
+        /^--- / {minor=$0}
+        {
+            scope=major " " minor
+            if (is_config($0)) {
+                if (seen_config[$0]++) next
+            } else if (is_log($0)) {
+                if (($0 in first_scope) && first_scope[$0] != scope) {suppressed++; next}
+                if (!($0 in first_scope)) first_scope[$0]=scope
+            }
+            print
+        }
+        END {print suppressed+0 > count_file}
+    ' "$OUT" > "$DEDUP_TMP"; then
+        mv "$DEDUP_TMP" "$OUT"
+        DUPLICATE_LOG_LINES=$(cat "$DEDUP_COUNT_TMP" 2>/dev/null)
+        rm -f "$DEDUP_COUNT_TMP"
+    else
+        rm -f "$DEDUP_TMP" "$DEDUP_COUNT_TMP"
+    fi
+else
+    [ -n "$DEDUP_TMP" ] && rm -f "$DEDUP_TMP"
+    [ -n "$DEDUP_COUNT_TMP" ] && rm -f "$DEDUP_COUNT_TMP"
+fi
 ACTION_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[ACTION\]/{n++} END{print n+0}' "$OUT")
 CHECK_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[CHECK\]/{n++} END{print n+0}' "$OUT")
-OK_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[OK\]/{n++} END{print n+0}' "$OUT")
-if [ "$ACTION_COUNT" -gt 0 ]; then
-    printf '%s\n' '1. Preserve matching files, raw logs, and available core dumps. Record appliance time/timezone and do not clean up or restart before evidence is secured.'
-    printf '%s\n' '2. Correlate each hit across HTTP access/error logs, ns.log/messages/notice/nsvpn, file metadata, firewall egress records, and approved change records. Escalate to incident response.'
-else
-    printf '%s\n' '1. No selected high-priority pattern was reported. This does not exclude activity outside scanned paths, formats, or retention.'
-fi
-if [ "$CHECK_COUNT" -gt 0 ]; then
-    printf '%s\n' '3. Resolve CHECK items against same-build baselines, change records, and (for HA) the peer node. Record the evidence and disposition.'
-fi
-printf '%s\n' '4. Confirm log coverage reaches the relevant pre-patch period; document gaps. Missing or rotated logs are not a clean result.'
-printf '%s\n' '5. Run Citrix/NetScaler File Integrity Monitoring or the Console advisory scan separately and retain its results.'
-
-section '9. Summary of checks and actions'
-SUMMARY_ACTION_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[ACTION\]/{n++} END{print n+0}' "$OUT")
-SUMMARY_CHECK_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[CHECK\]/{n++} END{print n+0}' "$OUT")
-SUMMARY_OK_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[OK\]/{n++} END{print n+0}' "$OUT")
-printf '\nChecks covered in this report:\n'
-printf '%s\n' '  - Firmware/CVE applicability and saved SAML workaround/policy bindings.'
-printf '%s\n' '  - System integrity and persistence: reboot/core history, shell permissions, privileged files, startup files, cron jobs, and administrative account configuration.'
-printf '%s\n' '  - Web artifacts/configuration: PHP handlers and aliases (including .ico and LogonUISimple/.local_journal patterns), .local_journal, nsgtrust.deb sample hash, VPN staging packages, and customsnmpd.'
-printf '%s\n' '  - Attack evidence: retained HTTP/system/authentication logs, exploit-like command strings, nsaaad/Pitboss events, payload/callback indicators, and log-retention coverage.'
-if [ "$RUNNING_ON_ADC" = YES ]; then
-    printf '%s\n' '  - Appliance-only checks ran against this ADC; external firewall/NetScaler Console telemetry and vendor File Integrity Monitoring remain separate evidence sources.'
-else
-    printf '%s\n' '  - Exported-config mode only: appliance files, processes, logs, cron state, and reboot history were not scanned.'
-fi
-printf '\nResult counts: ACTION=%s, CHECK=%s, OK=%s. These are message counts, not a risk score.\n' "$SUMMARY_ACTION_COUNT" "$SUMMARY_CHECK_COUNT" "$SUMMARY_OK_COUNT"
-if [ "$SUMMARY_ACTION_COUNT" -gt 0 ]; then
-    printf '\nImmediate actions for ACTION findings:\n'
-    printf '%s\n' '  1. Preserve the affected files, raw logs, support bundle, and available core dumps. Do not clean up or restart before evidence preservation is coordinated.'
-    printf '%s\n' '  2. Correlate timestamps with HTTP/authentication logs, nsaaad/Pitboss events, account/config changes, and outbound firewall records; escalate to incident response and Citrix support.'
-    printf '%s\n' '  3. If compromise is confirmed, isolate and rebuild from trusted media/configuration; rotate secrets and credentials stored on or used through the appliance and revoke affected certificates.'
-elif [ "$SUMMARY_CHECK_COUNT" -gt 0 ]; then
-    printf '\nActions for CHECK findings:\n'
-    printf '%s\n' '  1. Resolve each item against a trusted same-build baseline, approved change records, and the HA peer where applicable.'
-    printf '%s\n' '  2. Confirm that logs cover the pre-patch period. Check external egress/firewall and Console/FIM data for evidence not available locally.'
-else
-    printf '\n%s\n' 'No selected ACTION or CHECK result was reported in the scanned scope. This is not proof that the appliance is clean; confirm log retention and external telemetry.'
-fi
-
-# Put a concise, scan-derived summary before the detailed sections while
-# preserving every detailed check and raw evidence line in its original order.
 SUMMARY_TMP=$(mktemp "${OUT}.summary.XXXXXX" 2>/dev/null)
 REPORT_TMP=$(mktemp "${OUT}.final.XXXXXX" 2>/dev/null)
 if [ -n "$SUMMARY_TMP" ] && [ -n "$REPORT_TMP" ]; then
     {
-        printf '===== Executive summary =====\n'
-        printf 'Finding-message counts: ACTION=%s, CHECK=%s, OK=%s. Counts are not a risk score.\n' "$ACTION_COUNT" "$CHECK_COUNT" "$OK_COUNT"
+        printf '===== Assessment overview =====\n'
+        printf 'OUTCOME: '
         if [ "$ACTION_COUNT" -gt 0 ]; then
-            printf '%s\n' 'Assessment: selected high-priority indicators were found. They require investigation; they do not by themselves prove successful command execution or compromise.'
+            printf '%s\n' 'INVESTIGATION REQUIRED — selected high-priority indicators matched; this alone does not prove successful execution or compromise.'
         elif [ "$CHECK_COUNT" -gt 0 ]; then
-            printf '%s\n' 'Assessment: no selected ACTION indicator was reported, but CHECK items and scan-coverage limits remain to be resolved.'
+            printf '%s\n' 'MANUAL REVIEW REQUIRED — no selected ACTION indicator matched, but CHECK items or coverage gaps remain.'
         else
-            printf '%s\n' 'Assessment: no selected ACTION or CHECK result was reported in the scanned scope. This is not proof that the appliance is clean.'
+            printf '%s\n' 'NO SELECTED FINDINGS — this is not proof that the appliance is clean; verify scan coverage and external telemetry.'
         fi
-        if [ "$FW_PATCHED" = YES ]; then
-            printf 'Firmware: %s meets the applicable fixed-build threshold assessed by this script. This does not rule out earlier compromise.\n' "${CURRENT_INPUT:-detected build}"
-        elif [ "$FW_PATCHED" = NO ]; then
-            printf 'Firmware: %s is below the applicable fixed-build threshold; update is a priority.\n' "${CURRENT_INPUT:-detected build}"
-        else
-            printf 'Firmware: fixed-build status is UNKNOWN; verify the running build before drawing a conclusion.\n'
-        fi
-        printf 'Enhanced ISN: %s (source: %s).\n' "${ISN_STATE:-UNKNOWN}" "${ISN_SOURCE:-unknown}"
-        if [ "${GEIGER_SAML_FIXED-UNKNOWN}" = YES ]; then
-            printf '%s\n' 'SAML workaround: this build meets the CVE-2026-88779 fixed threshold; responder-policy coverage is informational and not required for that CVE.'
-        elif [ "${GEIGER_SAML_FIXED-UNKNOWN}" = NO ]; then
-            printf '%s\n' 'SAML workaround: review the policy and binding results below; interim mitigation may be required on an affected build.'
+        if [ "${DUPLICATE_LOG_LINES:-0}" -gt 0 ]; then
+            printf 'Exact log-evidence rows repeated across subsections: %s suppressed; the first copy is retained.\n' "$DUPLICATE_LOG_LINES"
         fi
         if [ "$ACTION_COUNT" -gt 0 ]; then
-            printf '\nPriority finding areas (details remain in the sections below):\n'
+            printf '\nACTION FOUND IN\n'
             awk '
-                function clean(s) {sub(/^===== /,"",s); sub(/ =====$/, "", s); sub(/^--- /,"",s); sub(/ ---$/, "", s); return s}
-                /^===== / {major=$0; minor=""; next}
-                /^--- / {minor=$0; next}
-                /^\[ACTION\]/ {
-                    title=clean(major)
-                    if(minor!="") title=title " / " clean(minor)
-                    if(title=="") title="General checks"
-                    if(!seen[title]++) print "  - " title
-                }
+                {sub(/\r$/, "")}
+                /^===== 1[.] Platform and uptime =====$/ {scan=1; next}
+                !scan {next}
+                /^===== / {major=$0; sub(/^===== /,"",major); sub(/ =====$/,"",major); next}
+                /^\[ACTION\]/ && major!="" && !seen[major]++ {print "  - " major}
             ' "$OUT"
         fi
-        printf '\n%s\n' 'Read the coverage and time-range notes before treating a no-hit result as meaningful.'
+        if [ "$CHECK_COUNT" -gt 0 ]; then
+            printf '\nMANUAL REVIEW NEEDED IN\n'
+            awk '
+                {sub(/\r$/, "")}
+                /^===== 1[.] Platform and uptime =====$/ {scan=1; next}
+                !scan {next}
+                /^===== / {major=$0; sub(/^===== /,"",major); sub(/ =====$/,"",major); next}
+                /^\[CHECK\]/ && major!="" && !seen[major]++ {print "  - " major}
+            ' "$OUT"
+        fi
+        printf '\n%s\n' 'The lists above point to report sections; each finding, evidence item, and recommended response is detailed once in its section below.'
         printf '\n'
     } > "$SUMMARY_TMP"
     awk -v summary="$SUMMARY_TMP" '
+        {sub(/\r$/, "")}
         /^===== How to read this report =====$/ {
             while ((getline line < summary) > 0) print line
             close(summary)
