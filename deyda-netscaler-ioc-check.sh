@@ -2,7 +2,7 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.74
+# Version: 9.75
 #
 # GEIGER detection enhancements are integrated into the read-only checks below.
 # Optional campaign start override: GEIGER_CAMPAIGN_START=YYYY-MM-DD.
@@ -31,6 +31,10 @@
 # plus the Gotham-reported 138.199.60.0/24 range (CHECK-only; shared VPN/hosting range).
 # These leads were reviewed from the supplied public community checker v1.13;
 # the detection logic here is independently implemented and is not vendor IoC coverage.
+# Additional campaign indicators: eSentire's multi-cluster CVE-2026-88771 analysis
+# (nsgtrust.deb sample hash, PHP handling of .ico, .local_journal webshell, and
+# account changes in saved configuration):
+# https://www.esentire.com/blog/more-shells-than-a-seafood-buffet-tracking-citrix-netscaler-exploitation-activities-cve-2026-88771
 #
 # Publisher
 #   Deyda Consulting GmbH
@@ -119,7 +123,7 @@
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 export PATH
 umask 077
-SCRIPT_VERSION='9.74'
+SCRIPT_VERSION='9.75'
 # GEIGER: identify this script by its resolved path, not by an assumed file name.
 GEIGER_SELF_PATH=$(realpath "$0" 2>/dev/null)
 [ -n "$GEIGER_SELF_PATH" ] || GEIGER_SELF_PATH=$(cd "$(dirname "$0")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename "$0")")
@@ -1907,6 +1911,63 @@ else
     status CHECK 'Saved configuration is unreadable; administrative-account and EPA configuration inventory could not run.'
 fi
 
+subsection 'Historical system-user changes in saved ns.conf copies'
+printf '%s\n' 'Compare current system-user names with retained ns.conf backups. This can reveal account additions/removals that an installer later deleted from the current config; names only are compared, and credentials are never read or printed.'
+if [ -r "$CONFIG" ]; then
+    CURRENT_USER_NAMES=$(awk '
+        tolower($0) ~ /^[[:space:]]*add[[:space:]]+system[[:space:]]+user[[:space:]]+/ {
+            s=$0; sub(/^[[:space:]]*[Aa][Dd][Dd][[:space:]]+[Ss][Yy][Ss][Tt][Ee][Mm][[:space:]]+[Uu][Ss][Ee][Rr][[:space:]]+/,"",s)
+            sub(/[[:space:]].*$/,"",s); gsub(/^"|"$/,"",s); if(s!="") print tolower(s)
+        }' "$CONFIG" 2>/dev/null | sort -u)
+    USER_HISTORY_FILES=''
+    for f in /flash/nsconfig/ns.conf.[0-4] /flash/nsconfig/ns.conf.bak /nsconfig/ns.conf.[0-4] /nsconfig/ns.conf.bak; do
+        [ -r "$f" ] || continue
+        USER_HISTORY_FILES="${USER_HISTORY_FILES}${USER_HISTORY_FILES:+
+}$f"
+    done
+    if [ -n "$USER_HISTORY_FILES" ]; then
+        USER_HISTORY_DIFFS=''
+        USER_HISTORY_COMPARED=0
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            USER_HISTORY_COMPARED=$((USER_HISTORY_COMPARED + 1))
+            HIST_USER_NAMES=$(awk '
+                tolower($0) ~ /^[[:space:]]*add[[:space:]]+system[[:space:]]+user[[:space:]]+/ {
+                    s=$0; sub(/^[[:space:]]*[Aa][Dd][Dd][[:space:]]+[Ss][Yy][Ss][Tt][Ee][Mm][[:space:]]+[Uu][Ss][Ee][Rr][[:space:]]+/,"",s)
+                    sub(/[[:space:]].*$/,"",s); gsub(/^"|"$/,"",s); if(s!="") print tolower(s)
+                }' "$f" 2>/dev/null | sort -u)
+            DIFF=$(awk '
+                $0=="__CURRENT_USERS__" {current=1; next}
+                NF {if(current) now[$0]=1; else old[$0]=1}
+                END {
+                    for(u in now) if(!(u in old)) print "CURRENT_ONLY: " u
+                    for(u in old) if(!(u in now)) print "BACKUP_ONLY: " u
+                }' <<EOF_USERS
+$HIST_USER_NAMES
+__CURRENT_USERS__
+$CURRENT_USER_NAMES
+EOF_USERS
+            )
+            if [ -n "$DIFF" ]; then
+                USER_HISTORY_DIFFS="${USER_HISTORY_DIFFS}${USER_HISTORY_DIFFS:+
+}Compared with $f:
+$DIFF"
+            fi
+        done <<EOF_USER_FILES
+$USER_HISTORY_FILES
+EOF_USER_FILES
+        if [ -n "$USER_HISTORY_DIFFS" ]; then
+            status CHECK 'System-user names differ between current ns.conf and retained historical copies. This is an investigation lead only; normal administration can add or remove accounts. Correlate with audit logs, approved changes, and baseline timing:'
+            printf '%s\n' "$USER_HISTORY_DIFFS"
+        else
+            status OK "System-user names match across the $USER_HISTORY_COMPARED readable retained ns.conf backup file(s). This comparison cannot detect accounts absent from all retained copies or changes before the oldest copy."
+        fi
+    else
+        status CHECK 'No readable ns.conf.0-.4 or ns.conf.bak copy found; account additions/removals later erased from the current config cannot be assessed from local saved-config history.'
+    fi
+else
+    status CHECK 'Current saved ns.conf is unreadable; historical account-name comparison could not run.'
+fi
 
 subsection 'SAML request workaround: saved policy and binding inventory'
 # Parse names and bindings without exposing proprietary policy expressions.
@@ -2963,8 +3024,8 @@ for f in /etc/httpd.conf /nsconfig/httpd.conf /netscaler/httpd.conf; do
         fi
         if [ -r "$f" ]; then
             hits=$(grep -E -i -n 'b64decode|base64|LogonPoint/custom|/bin/sh|/\.ctxs|receiver[.]min|^[[:space:]]*(Alias|AliasMatch)[[:space:]].*(receiver|\.ctxs)|^[[:space:]]*(php_flag|php_admin_flag)[[:space:]]+engine[[:space:]]+on|^[[:space:]]*php_engine[[:space:]]+on|^[[:space:]]*(AddHandler|SetHandler)[[:space:]].*php' "$f" 2>/dev/null)
-            MANDIANT_HTTPD_HITS=$(grep -E -i -n '^[[:space:]]*(AddType|AddHandler|SetHandler)[[:space:]].*application/x-httpd-php.*[.](deb|sig|rpm|tgz|html)([[:space:]]|$)|^[[:space:]]*AliasMatch[[:space:]].*/vpn/(media|theme|images)/.*(/vpn/scripts/linux|/gui/vpn/scripts/linux|/ns_gui/vpn/scripts/linux)|^[[:space:]]*Alias(Match)?[[:space:]].*LogonUISimple[.]html[.]style[.]min[.]css.*[.]local_journal' "$f" 2>/dev/null)
-            if [ -n "$MANDIANT_HTTPD_HITS" ]; then status ACTION 'Non-standard PHP handler or VPN web-path alias matching publicly reported persistence patterns found; preserve httpd.conf and compare with a trusted same-build baseline:'; echo "$MANDIANT_HTTPD_HITS"; fi
+            MANDIANT_HTTPD_HITS=$(grep -E -i -n '^[[:space:]]*(AddType|AddHandler|SetHandler)[[:space:]].*application/x-httpd-php.*[.](deb|sig|rpm|tgz|html)([[:space:]]|$)|^[[:space:]]*(AddType|AddHandler|SetHandler)[[:space:]]+[^#]*php[^#]*[.]ico([[:space:]]|$)|^[[:space:]]*AliasMatch[[:space:]].*/vpn/(media|theme|images)/.*(/vpn/scripts/linux|/gui/vpn/scripts/linux|/ns_gui/vpn/scripts/linux)|^[[:space:]]*Alias(Match)?[[:space:]].*LogonUISimple[.]html[.]style[.]min[.]css.*[.]local_journal' "$f" 2>/dev/null)
+            if [ -n "$MANDIANT_HTTPD_HITS" ]; then status ACTION 'Non-standard PHP handler or VPN/web-path alias matching publicly reported persistence patterns found (including PHP handling for .ico); preserve httpd.conf and compare with a trusted same-build baseline:'; echo "$MANDIANT_HTTPD_HITS"; fi
             if [ -n "$hits" ]; then status CHECK 'Potential webshell alias, PHP-enabling directive, encoded-command, or payload-related configuration indicator found; compare with a trusted same-build baseline and preserve unexpected changes:'; echo "$hits"; else status OK 'No selected webshell aliases, PHP-enabling directives, encoded-command, or payload indicators found. Standard NetScaler PHP mappings and php_flag engine off are not treated as indicators by themselves.'; fi
         else
             status CHECK "$f exists but is not readable; indicator search could not be performed."
@@ -3070,12 +3131,28 @@ if [ -n "$STAGING_FILES" ]; then
     STAGING_REVIEW_UNKNOWN=0
     STAGING_REFERENCE_MATCHES=0
     STAGING_REFERENCE_MISMATCHES=0
+    STAGING_MALICIOUS_MATCHES=0
     STAGING_CANDIDATE_PATHS=$(printf '%s\n' "$STAGING_FILES" | awk '/^\// {print}' | sort -u)
     for f in $STAGING_CANDIDATE_PATHS; do
         [ -f "$f" ] || continue
         ls -l "$f" 2>/dev/null
         EXPECTED_HASH=''
         case "$f" in
+            /var/netscaler/gui/vpn/scripts/linux/nsgtrust.deb|/netscaler/ns_gui/vpn/scripts/linux/nsgtrust.deb)
+                EXPECTED_HASH='7add390ceee4a1373211b3e340451b34f08965fc4d805f94c9b8cebdc0775774'
+                ACTUAL_HASH=$(sha256_of "$f")
+                if [ -n "$ACTUAL_HASH" ] && [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ]; then
+                    printf 'SHA-256 observed:  %s\n' "$ACTUAL_HASH"
+                    printf 'SHA-256 sample:    %s\n' "$EXPECTED_HASH"
+                    status ACTION "$f matches the nsgtrust.deb PHP-webshell sample hash published by eSentire. Preserve the file and evidence; investigate for successful execution and lateral activity."
+                    STAGING_MALICIOUS_MATCHES=$((STAGING_MALICIOUS_MATCHES + 1))
+                else
+                    STAGING_REVIEW_UNKNOWN=1
+                    printf 'SHA-256 observed:  %s\n' "${ACTUAL_HASH:-unavailable}"
+                    printf 'SHA-256 sample:    %s\n' "$EXPECTED_HASH"
+                    status CHECK "$f has the reported nsgtrust.deb name, but its hash does not match the cited sample (or could not be calculated). Review content, provenance, owner, and timestamps; variants are not excluded."
+                fi
+                continue ;;
             /var/netscaler/gui/vpn/scripts/linux/nsgclient18_64.deb|/netscaler/ns_gui/vpn/scripts/linux/nsgclient18_64.deb)
                 EXPECTED_HASH='c802dc70e762245150a2741816a4b9b299fb8762ace8f56868ba2f66ae2b1b10' ;;
             /var/netscaler/gui/vpn/scripts/linux/nsginstaller64.deb|/netscaler/ns_gui/vpn/scripts/linux/nsginstaller64.deb)
@@ -3103,9 +3180,10 @@ if [ -n "$STAGING_FILES" ]; then
             status ACTION "Webshell/tunneler behavior strings found in $f; preserve it and investigate as a potential compromise artifact."
         fi
     done
-    if [ "$STAGING_REVIEW_UNKNOWN" -eq 0 ] && [ "$STAGING_REFERENCE_MISMATCHES" -eq 0 ] && [ "$STAGING_REFERENCE_MATCHES" -eq "$(printf '%s\n' "$STAGING_CANDIDATE_PATHS" | wc -l | tr -d ' ')" ] && [ "$STAGING_REFERENCE_MATCHES" -gt 0 ]; then
+    STAGING_CLASSIFIED=$((STAGING_REFERENCE_MATCHES + STAGING_MALICIOUS_MATCHES))
+    if [ "$STAGING_REVIEW_UNKNOWN" -eq 0 ] && [ "$STAGING_REFERENCE_MISMATCHES" -eq 0 ] && [ "$STAGING_CLASSIFIED" -eq "$(printf '%s\n' "$STAGING_CANDIDATE_PATHS" | wc -l | tr -d ' ')" ] && [ "$STAGING_REFERENCE_MATCHES" -gt 0 ] && [ "$STAGING_MALICIOUS_MATCHES" -eq 0 ]; then
         status OK 'Every VPN staging file found matches a known package hash in the internal 14.1-73.37 / 14.1-73.41 reference set; presence alone is expected on this reference build. The hashes are not Citrix-published.'
-    else
+    elif [ "$STAGING_REVIEW_UNKNOWN" -gt 0 ] || [ "$STAGING_REFERENCE_MISMATCHES" -gt 0 ]; then
         status CHECK 'VPN staging inventory includes an unknown, unverified, or hash-mismatching file; validate it against a trusted same-build baseline.'
     fi
 elif [ "$STAGING_PATHS_FOUND" -eq 0 ]; then
@@ -3129,7 +3207,11 @@ PITSCALER_ARTIFACTS=$( { find /var/netscaler /var/vpn /var/python /tmp -type f \
 if [ -n "$PITSCALER_ARTIFACTS" ]; then
     while IFS= read -r f; do
         [ -f "$f" ] || continue
-        if [ "$f" = /var/python/bin/customsnmpd ]; then
+        if [ "$f" = /var/netscaler/logon/LogonPoint/.local_journal ]; then
+            status ACTION "The exact .local_journal webshell path reported by eSentire exists. Preserve metadata/hash and the appliance evidence; investigate execution, access logs, and connected systems. Filename alone does not prove execution."
+            ls -ln "$f" 2>/dev/null
+            printf 'SHA-256: %s\n' "$(sha256_of "$f")"
+        elif [ "$f" = /var/python/bin/customsnmpd ]; then
             printf '\nInventory: %s — hash classification is reported under Host integrity / Vendor Python files and customsnmpd integrity baseline.\n' "$f"
         else
             status CHECK "Reported artifact name found: $f. A name alone is not proof; verify content, owner, timestamp and same-build hash."
@@ -4173,6 +4255,34 @@ if [ "$CHECK_COUNT" -gt 0 ]; then
 fi
 printf '%s\n' '4. Confirm log coverage reaches the relevant pre-patch period; document gaps. Missing or rotated logs are not a clean result.'
 printf '%s\n' '5. Run Citrix/NetScaler File Integrity Monitoring or the Console advisory scan separately and retain its results.'
+
+section '9. Summary of checks and actions'
+SUMMARY_ACTION_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[ACTION\]/{n++} END{print n+0}' "$OUT")
+SUMMARY_CHECK_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[CHECK\]/{n++} END{print n+0}' "$OUT")
+SUMMARY_OK_COUNT=$(awk '/^===== 1[.] Platform and uptime =====/{scan=1; next} scan && /^\[OK\]/{n++} END{print n+0}' "$OUT")
+printf '\nChecks covered in this report:\n'
+printf '%s\n' '  - Firmware/CVE applicability and saved SAML workaround/policy bindings.'
+printf '%s\n' '  - System integrity and persistence: reboot/core history, shell permissions, privileged files, startup files, cron jobs, and administrative account configuration.'
+printf '%s\n' '  - Web artifacts/configuration: PHP handlers and aliases (including .ico and LogonUISimple/.local_journal patterns), .local_journal, nsgtrust.deb sample hash, VPN staging packages, and customsnmpd.'
+printf '%s\n' '  - Attack evidence: retained HTTP/system/authentication logs, exploit-like command strings, nsaaad/Pitboss events, payload/callback indicators, and log-retention coverage.'
+if [ "$RUNNING_ON_ADC" = YES ]; then
+    printf '%s\n' '  - Appliance-only checks ran against this ADC; external firewall/NetScaler Console telemetry and vendor File Integrity Monitoring remain separate evidence sources.'
+else
+    printf '%s\n' '  - Exported-config mode only: appliance files, processes, logs, cron state, and reboot history were not scanned.'
+fi
+printf '\nResult counts: ACTION=%s, CHECK=%s, OK=%s. These are message counts, not a risk score.\n' "$SUMMARY_ACTION_COUNT" "$SUMMARY_CHECK_COUNT" "$SUMMARY_OK_COUNT"
+if [ "$SUMMARY_ACTION_COUNT" -gt 0 ]; then
+    printf '\nImmediate actions for ACTION findings:\n'
+    printf '%s\n' '  1. Preserve the affected files, raw logs, support bundle, and available core dumps. Do not clean up or restart before evidence preservation is coordinated.'
+    printf '%s\n' '  2. Correlate timestamps with HTTP/authentication logs, nsaaad/Pitboss events, account/config changes, and outbound firewall records; escalate to incident response and Citrix support.'
+    printf '%s\n' '  3. If compromise is confirmed, isolate and rebuild from trusted media/configuration; rotate secrets and credentials stored on or used through the appliance and revoke affected certificates.'
+elif [ "$SUMMARY_CHECK_COUNT" -gt 0 ]; then
+    printf '\nActions for CHECK findings:\n'
+    printf '%s\n' '  1. Resolve each item against a trusted same-build baseline, approved change records, and the HA peer where applicable.'
+    printf '%s\n' '  2. Confirm that logs cover the pre-patch period. Check external egress/firewall and Console/FIM data for evidence not available locally.'
+else
+    printf '\n%s\n' 'No selected ACTION or CHECK result was reported in the scanned scope. This is not proof that the appliance is clean; confirm log retention and external telemetry.'
+fi
 
 # Put a concise, scan-derived summary before the detailed sections while
 # preserving every detailed check and raw evidence line in its original order.
