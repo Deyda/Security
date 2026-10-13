@@ -2,7 +2,7 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.82
+# Version: 9.84
 #
 # GEIGER detection enhancements are integrated into the read-only checks below.
 # Optional campaign start override: GEIGER_CAMPAIGN_START=YYYY-MM-DD.
@@ -29,7 +29,10 @@
 # its -WR activation/callhome traces, scoped helper-hash references, web-served
 # archive magic bytes, and cron commands that may erase evidence. No payload
 # content is executed; hashes from independent analysis are not Citrix checksums.
-# v9.82: added internal clean-appliance hash references for standard 14.1-73.46
+# v9.84: saved/running authentication configuration drift check; read-only live
+# query with timeout or explicit capture. No raw configuration is reported.
+# Corrected latest operator hash baseline to standard 13.1-64.24.
+# v9.82: added internal clean-appliance hash references for standard 13.1-64.24
 # from the operator-supplied reference capture. These are not Citrix-published
 # checksums or universal baselines.
 # Additional leads: operator-supplied Gotham advisory/checker package (2026-10-02).
@@ -122,7 +125,13 @@
 #   Obtain the reference from a trusted, identical firmware build; never infer it from an
 #   appliance under investigation. Internal /var/python/bin and /var/configd_devno values
 #   below use internal samples from clean 14.1-73.37, 14.1-73.41, and
-#   14.1-73.46 appliances; these are not Citrix-published checksums.
+#   13.1-64.24 appliances; these are not Citrix-published checksums.
+#
+# Optional full running-config capture for authentication drift:
+#   DEYDA_RUNNING_CONFIG_FILE=/path/to/running-config.txt
+#   Capture "show ns runningConfig" without -withDefaults on the same node and
+#   partition as ns.conf. Protect this file: it can contain secrets. Capture
+#   input is not live verification. Without it a read-only 15s query is attempted.
 #
 # Optional CLI captures for the additional Global Deny List assessment:
 #   DEYDA_GDL_SIGNATURES_FILE=/path/to/signatures.txt
@@ -141,7 +150,7 @@
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 export PATH
 umask 077
-SCRIPT_VERSION='9.82'
+SCRIPT_VERSION='9.84'
 # GEIGER: identify this script by its resolved path, not by an assumed file name.
 GEIGER_SELF_PATH=$(realpath "$0" 2>/dev/null)
 [ -n "$GEIGER_SELF_PATH" ] || GEIGER_SELF_PATH=$(cd "$(dirname "$0")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename "$0")")
@@ -237,7 +246,7 @@ reference_hash_build() {
     printf '%s\n' "${CURRENT_INPUT-}" | grep -Eiq 'FIPS|NDcPP' && return 1
     _hash_reference_build=$(printf '%s\n' "${CURRENT_INPUT-}" | sed -nE 's/.*(14[.]1|13[.]1)[^0-9]*([0-9]+[.][0-9]+).*/\1-\2/p' | head -1)
     case "$_hash_reference_build" in
-        14.1-73.37|14.1-73.41|14.1-73.46) printf '%s' "$_hash_reference_build" ;;
+        14.1-73.37|14.1-73.41|13.1-64.24) printf '%s' "$_hash_reference_build" ;;
         *) return 1 ;;
     esac
 }
@@ -1526,7 +1535,7 @@ reference_suid_1417337() {
             case "$(reference_hash_build)" in
                 14.1-73.37) check_1417337_reference "$1" '5b76771117eacc288a42de079a719402e26528e997cfa82241c4d7a842eba5d2' ;;
                 14.1-73.41) check_1417337_reference "$1" '7aa41973005e4f74eab7fc630d49fc5d96afc16edd786f9c22ca3d8cd993bb75' ;;
-                14.1-73.46) check_1417337_reference "$1" '37f0cdff01c6a6f6b431d9bd2d63960b88a4565f8fbfae7c3df884abe7a29f1f' ;;
+                13.1-64.24) check_1417337_reference "$1" '37f0cdff01c6a6f6b431d9bd2d63960b88a4565f8fbfae7c3df884abe7a29f1f' ;;
             esac
             ;;
     esac
@@ -2146,11 +2155,11 @@ else
     status CHECK 'Saved configuration unreadable; SAML workaround inventory unavailable.'
 fi
 
-# Query only two fixed read-only CLI commands. No credentials, input evaluation,
+# Query only allowlisted read-only CLI commands. No credentials, input evaluation,
 # arbitrary CLI commands, configuration writes or counter resets are used.
 gdl_read_cli() {
     case "$1" in
-        'show appfw signatures'|'stat denylist global AAA_REQUEST') ;;
+        'show appfw signatures'|'stat denylist global AAA_REQUEST'|'show ns runningConfig') ;;
         *) return 1 ;;
     esac
     [ "$RUNNING_ON_ADC" = YES ] || return 1
@@ -2164,6 +2173,113 @@ gdl_read_cli() {
         return 1
     fi
 }
+
+
+# Compare in memory; never spool or print the raw running configuration.
+saml_config_drift() {
+    perl - "$CONFIG" 3<&0 <<'DEYDA_DRIFT_PERL'
+use strict;
+use warnings;
+use Text::ParseWords qw(parse_line);
+my $saved_path = shift;
+sub result { print "$_[0]\t$_[1]\n"; }
+open my $saved_fh, '<', $saved_path or do {
+    result('CHECK', 'UNKNOWN: saved configuration is unreadable; authentication drift not assessed.'); exit;
+};
+my @saved = <$saved_fh>;
+close $saved_fh;
+open my $run_fh, '<&=3' or die "running descriptor unavailable\n";
+my @running = <$run_fh>;
+close $run_fh;
+if (!@running || grep { /(?:^\s*(?:ERROR:|ERROR\b|Invalid command|Permission denied|Not authorized)|--More--)/i } @running) {
+    result('CHECK', 'UNKNOWN: running configuration is empty, rejected or paginated; authentication drift not assessed.'); exit;
+}
+# Require a configuration anchor, not a success message or show-command echo.
+if (!grep { /^\s*set\s+ns\s+config\s+/i } @running) {
+    result('CHECK', 'UNKNOWN: running-config completeness cannot be established (set ns config anchor missing).'); exit;
+}
+sub parse {
+    my ($lines) = @_;
+    my (%rows, %roles);
+    for my $line (@$lines) {
+        next unless $line =~ /^\s*(?:add|set|bind|unbind|enable|disable)\s+/i;
+        my @t = parse_line('\s+', 0, $line);
+        die "unparseable configuration\n" unless @t;
+        my $prefix = lc join(' ', @t[0..($#t < 2 ? $#t : 2)]);
+        my $category;
+        if ($prefix =~ /^(?:add|set|bind|unbind) authentication /) {
+            $category = 'Authentication objects and bindings';
+        } elsif ($prefix =~ /^(?:add|set|bind|unbind) vpn (?:vserver|sessionaction|sessionpolicy|global)$/) {
+            $category = 'Gateway objects and bindings';
+        } elsif ($prefix =~ /^(?:add|set|bind|unbind) responder /) {
+            $category = 'Responder objects and bindings';
+        } elsif ($prefix =~ /^(?:enable|disable) ns feature$/) {
+            $category = 'Feature state';
+        } else { next; }
+        $roles{SP}++ if $prefix eq 'add authentication samlaction';
+        $roles{IdP}++ if $prefix eq 'add authentication samlidpprofile';
+        # Whitespace and quoting are normalized, while values remain case-sensitive.
+        # Option ordering is retained: textual drift requires manual validation.
+        my $key = join("\0", @t);
+        $rows{$category}{$key}++;
+    }
+    return (\%rows, \%roles);
+}
+my ($s, $sr, $r, $rr);
+eval { ($s,$sr)=parse(\@saved); ($r,$rr)=parse(\@running); 1 } or do {
+    result('CHECK','UNKNOWN: configuration tokenization failed; no drift conclusion.'); exit;
+};
+result('INFO', 'SAML objects (definitions, not effective exposure): saved SP=' . ($sr->{SP}//0) .
+    ', IdP=' . ($sr->{IdP}//0) . '; running SP=' . ($rr->{SP}//0) . ', IdP=' . ($rr->{IdP}//0) . '.');
+my %categories = map { $_=>1 } (keys %$s, keys %$r);
+my $different=0;
+for my $c (sort keys %categories) {
+    my ($saved_only,$running_only)=(0,0);
+    my %keys=map { $_=>1 } (keys %{$s->{$c}//{}}, keys %{$r->{$c}//{}});
+    for my $k (keys %keys) {
+        my $d=($s->{$c}{$k}//0)-($r->{$c}{$k}//0);
+        $saved_only += $d if $d>0;
+        $running_only -= $d if $d<0;
+    }
+    if ($saved_only || $running_only) {
+        $different++;
+        result('CHECK', "$c drift: saved-only commands=$saved_only; running-only commands=$running_only. Values and names withheld; inspect locally.");
+    }
+}
+result('OK','No textual drift in scanned authentication, Gateway, Responder and feature commands.') unless $different;
+result('INFO','Scope is this node/partition and capture time. Definitions do not prove active SAML exposure. Option ordering, defaults or secret encoding can produce textual differences; investigate before saving. Earlier CVE checks remain saved-config assessments.');
+DEYDA_DRIFT_PERL
+}
+
+subsection 'Saved versus running configuration: SAML and authentication drift'
+DRIFT_SOURCE=LIVE
+DRIFT_RC=0
+DRIFT_DATA=''
+if [ -n "${DEYDA_RUNNING_CONFIG_FILE-}" ]; then
+    DRIFT_SOURCE=CAPTURE
+    if [ -r "$DEYDA_RUNNING_CONFIG_FILE" ]; then
+        DRIFT_DATA=$(cat "$DEYDA_RUNNING_CONFIG_FILE" 2>/dev/null) || DRIFT_RC=1
+    else
+        DRIFT_RC=1
+    fi
+else
+    DRIFT_DATA=$(gdl_read_cli 'show ns runningConfig') || DRIFT_RC=1
+fi
+printf 'Evidence source: %s (same-node/partition provenance must be verified).\n' "$DRIFT_SOURCE"
+if [ "$DRIFT_SOURCE" = LIVE ] && [ "$DRIFT_RC" -eq 0 ]; then
+    # CLI completion marker guards against partial successful output.
+    printf '%s\n' "$DRIFT_DATA" | grep -Eq '^[[:space:]]*Done[[:space:]]*$' || DRIFT_RC=1
+fi
+if [ "$DRIFT_RC" -ne 0 ] || ! command -v perl >/dev/null 2>&1; then
+    status CHECK 'UNKNOWN: running configuration unavailable, query failed/timed out, or Perl missing. Saved SAML absence does not exclude runtime SAML.'
+else
+    # Pass raw bytes through a private inherited descriptor, not command arguments
+    # or the environment (large configurations can exceed exec argument limits).
+    printf '%s\n' "$DRIFT_DATA" | saml_config_drift | while IFS="$(printf '\t')" read -r DRIFT_LEVEL DRIFT_MESSAGE; do
+        if [ "$DRIFT_LEVEL" = INFO ]; then printf '%s\n' "$DRIFT_MESSAGE"; else status "$DRIFT_LEVEL" "$DRIFT_MESSAGE"; fi
+    done
+fi
+unset DRIFT_DATA
 
 # Deliberately restrict the version parser to the Default Signatures object;
 # a higher version on another object must not clear a stale default version.
@@ -2695,7 +2811,7 @@ for f in /nsconfig/rc.netscaler /nsconfig/nsafter.sh /flash/nsconfig/rc.netscale
                 case "$(reference_hash_build)" in
                     14.1-73.37) check_1417337_reference "$f" 'ab1aae7ba469c122ae16a992da9ddc4b12f81301b0b05d8eba2b379a06d56e54' ;;
                     14.1-73.41) check_1417337_reference "$f" '2c6d46cc538b48bf8d7e4ba0d598025114d554fd8a28c391c6290e9c7f98e0ee' ;;
-                    14.1-73.46) check_1417337_reference "$f" '1725ed493fde5361f84c6cd4f545b3815737cecf30b0cc75af20c44eb73cef8f' ;;
+                    13.1-64.24) check_1417337_reference "$f" '1725ed493fde5361f84c6cd4f545b3815737cecf30b0cc75af20c44eb73cef8f' ;;
                 esac
                 ;;
         esac
@@ -2838,7 +2954,7 @@ if [ -e /bin/sh ]; then
     case "$SHELL_REFERENCE_BUILD" in
         14.1-73.37) SHELL_EXPECTED_HASH='2c1310d7c4d7dfb1ef47b137be1eb572cc743cc609898ae38320963cc0578665' ;;
         14.1-73.41) SHELL_EXPECTED_HASH='8c121937b172124e5895e5296dff5227841b1f8d9a698489377b65e3adb309c7' ;;
-        14.1-73.46) SHELL_EXPECTED_HASH='6e10647b03ef1e7725ce369e2bc07f1cfa54dec406bc4d85452cd563b4036907' ;;
+        13.1-64.24) SHELL_EXPECTED_HASH='6e10647b03ef1e7725ce369e2bc07f1cfa54dec406bc4d85452cd563b4036907' ;;
         *) SHELL_EXPECTED_HASH='' ;;
     esac
     if [ -n "$SHELL_EXPECTED_HASH" ]; then
@@ -2968,7 +3084,7 @@ RECENT_SUID_EOF
                         case "$(reference_hash_build)" in
                             14.1-73.37) _expected='5b76771117eacc288a42de079a719402e26528e997cfa82241c4d7a842eba5d2' ;;
                             14.1-73.41) _expected='7aa41973005e4f74eab7fc630d49fc5d96afc16edd786f9c22ca3d8cd993bb75' ;;
-                            14.1-73.46) _expected='37f0cdff01c6a6f6b431d9bd2d63960b88a4565f8fbfae7c3df884abe7a29f1f' ;;
+                            13.1-64.24) _expected='37f0cdff01c6a6f6b431d9bd2d63960b88a4565f8fbfae7c3df884abe7a29f1f' ;;
                         esac
                         ;;
                 esac
@@ -3253,7 +3369,7 @@ if [ -n "$STAGING_FILES" ]; then
                 printf 'SHA-256 observed:  %s\n' "$ACTUAL_HASH"
                 printf 'SHA-256 reference: %s\n' "$EXPECTED_HASH"
                 if [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ]; then
-                    status OK "$f SHA-256 exactly matches the internal reference captured on clean 14.1-73.37, 14.1-73.41, and 14.1-73.46 reference appliances. Identical bytes are confirmed; the reference is not Citrix-published and does not establish provenance for this appliance."
+                    status OK "$f SHA-256 exactly matches the internal reference captured on clean 14.1-73.37, 14.1-73.41, and 13.1-64.24 reference appliances. Identical bytes are confirmed; the reference is not Citrix-published and does not establish provenance for this appliance."
                     STAGING_REFERENCE_MATCHES=$((STAGING_REFERENCE_MATCHES + 1))
                 else
             status CHECK "$f SHA-256 differs from the internal reference; inspect before disposition."
@@ -3270,7 +3386,7 @@ if [ -n "$STAGING_FILES" ]; then
     done
     STAGING_CLASSIFIED=$((STAGING_REFERENCE_MATCHES + STAGING_MALICIOUS_MATCHES))
     if [ "$STAGING_REVIEW_UNKNOWN" -eq 0 ] && [ "$STAGING_REFERENCE_MISMATCHES" -eq 0 ] && [ "$STAGING_CLASSIFIED" -eq "$(printf '%s\n' "$STAGING_CANDIDATE_PATHS" | wc -l | tr -d ' ')" ] && [ "$STAGING_REFERENCE_MATCHES" -gt 0 ] && [ "$STAGING_MALICIOUS_MATCHES" -eq 0 ]; then
-        status OK 'Every VPN staging file found matches a known package hash in the internal 14.1-73.37 / 14.1-73.41 / 14.1-73.46 reference set; presence alone is expected on these reference builds. The hashes are not Citrix-published.'
+        status OK 'Every VPN staging file found matches a known package hash in the internal 14.1-73.37 / 14.1-73.41 / 13.1-64.24 reference set; presence alone is expected on these reference builds. The hashes are not Citrix-published.'
     elif [ "$STAGING_REVIEW_UNKNOWN" -gt 0 ] || [ "$STAGING_REFERENCE_MISMATCHES" -gt 0 ]; then
         status CHECK 'VPN staging inventory includes an unknown, unverified, or hash-mismatching file; validate it against a trusted same-build baseline.'
     fi
@@ -3718,7 +3834,7 @@ if reference_hash_build_supported; then
                 CUSTOM_ASSET_EXPECTED_HASH='d914176fd50bd7f565700006a31aa97b79d3ad17cee20c8e5ff2061d5cb74817' ;;
             strings.zh-CN.json)
                 case "$(reference_hash_build)" in
-                    14.1-73.46) CUSTOM_ASSET_EXPECTED_HASH='d914176fd50bd7f565700006a31aa97b79d3ad17cee20c8e5ff2061d5cb74817' ;;
+                    13.1-64.24) CUSTOM_ASSET_EXPECTED_HASH='d914176fd50bd7f565700006a31aa97b79d3ad17cee20c8e5ff2061d5cb74817' ;;
                     *) CUSTOM_ASSET_EXPECTED_HASH='8eb95bcbc154530931e15fc418c8b1fe991095671409552099ea1aa596999ede' ;;
                 esac ;;
         esac
@@ -3746,7 +3862,7 @@ if reference_hash_build_supported; then
         done
     fi
 else
-    status CHECK 'These additional LogonPoint hashes are single-appliance 14.1-73.37, 14.1-73.41, and 14.1-73.46 references and were not compared because the running build is outside that exact scope.'
+    status CHECK 'These additional LogonPoint hashes are single-appliance 14.1-73.37, 14.1-73.41, and 13.1-64.24 references and were not compared because the running build is outside that exact scope.'
 fi
 
 section '5. Log coverage and event correlation'
