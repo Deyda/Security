@@ -1,8 +1,24 @@
 #!/bin/sh
 #
+#           ++
+#            +##+++                    ++++++
+#              ++#####+++              ++#++##              ##
+#                 +#########++          #+ +#+#+++ +#+#++#+## +#+#+
+#                   +############++    +++++  +++++####++++++++++++
+#                   +###########++                 +++
+#               ++###########++        +#++##             +        #+  + +#+
+#            ++#++##++##++++           ##    ++++++#+#+  ##  #+++ +# +#+ ++ +#+#+ ++#+
+#         +#+++#+++#++                 ++++++#+#+ #++#++++#++#+#++#++##++#++#++#++###++
+#          +#++##+                                                                +#+
+#           +#+
+# 
+#   DEYDA CONSULTING
+#   NetScaler IOC & CVE Check
+#   deyda-consulting.de
+#
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.87
+# Version: 9.88
 #
 # GEIGER detection enhancements are integrated into the read-only checks below.
 # Optional campaign start override: GEIGER_CAMPAIGN_START=YYYY-MM-DD.
@@ -29,6 +45,7 @@
 # its -WR activation/callhome traces, scoped helper-hash references, web-served
 # archive magic bytes, and cron commands that may erase evidence. No payload
 # content is executed; hashes from independent analysis are not Citrix checksums.
+# v9.88: original-logo ASCII branding in source and report headers.
 # v9.87: embedded 37660-file operator-supplied standard 14.1-73.46 manifest
 # plus two single-file references; external manifest takes precedence.
 # v9.86: align file-baseline collector limits to 50000 files and 128 MiB/file.
@@ -166,7 +183,7 @@
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 export PATH
 umask 077
-SCRIPT_VERSION='9.87'
+SCRIPT_VERSION='9.88'
 # GEIGER: identify this script by its resolved path, not by an assumed file name.
 GEIGER_SELF_PATH=$(realpath "$0" 2>/dev/null)
 [ -n "$GEIGER_SELF_PATH" ] || GEIGER_SELF_PATH=$(cd "$(dirname "$0")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename "$0")")
@@ -1600,7 +1617,25 @@ check_nslog_nextfile_state() {
 }
 FW_PATCHED=UNKNOWN
 
-printf 'Deyda Consulting NetScaler IOC and CVE triage report\n'
+# ASCII rendition sampled directly from the bundled original logo (alpha mask).
+cat <<'DEYDA_ASCII_LOGO'
+          ++
+           +##+++                    ++++++
+             ++#####+++              ++#++##              ##
+                +#########++          #+ +#+#+++ +#+#++#+## +#+#+
+                  +############++    +++++  +++++####++++++++++++
+                  +###########++                 +++
+              ++###########++        +#++##             +        #+  + +#+
+           ++#++##++##++++           ##    ++++++#+#+  ##  #+++ +# +#+ ++ +#+#+ ++#+
+        +#+++#+++#++                 ++++++#+#+ #++#++++#++#+#++#++##++#++#++#++###++
+         +#++##+                                                                +#+
+          +#+
+
+  DEYDA CONSULTING
+  NetScaler IOC & CVE Check
+  deyda-consulting.de
+DEYDA_ASCII_LOGO
+printf '\nDeyda Consulting NetScaler IOC and CVE triage report\n'
 printf 'Host: %s\nTime: %s\nScript version: %s\nScript path: %s\n\n' "$HOST" "$NOW" "$SCRIPT_VERSION" "$GEIGER_SELF_PATH"
 printf 'Prepared by: Deyda Consulting GmbH\nAuthor: Manuel Winkel\nWebsite: https://www.deyda-consulting.de\n\n'
 printf 'Related articles\n  DE: https://www.deyda.net/index.php/de/2026/08/28/netscaler-cve-checkliste-updates-sicherheitspruefung-und-incident-response/\n'
@@ -2379,7 +2414,7 @@ sub security_fingerprints {
 }
 my $isn='UNKNOWN';
 for my $line (@running) { $isn=uc($1) if $line =~ /^\s*set\s+ns\s+tcpparam\b.*?-enhancedISN\s+(ENABLED|DISABLED)\b/i; }
-my $metadata={schema=>'deyda-ioc-v1',script_version=>'9.87',build=>$build,evidence_source=>$source,runtime_saml=>$runtime_graph,enhanced_isn=>$isn,security_fingerprints=>security_fingerprints($r)};
+my $metadata={schema=>'deyda-ioc-v1',script_version=>'9.88',build=>$build,evidence_source=>$source,runtime_saml=>$runtime_graph,enhanced_isn=>$isn,security_fingerprints=>security_fingerprints($r)};
 if (my $peer_path=$ENV{DEYDA_HA_PEER_JSON}) {
     my $peer; my $ok=eval {open my $pf,'<',$peer_path or die;local $/;my $raw=<$pf>;die if length($raw)>32*1024*1024;$peer=decode_json($raw);die unless ref($peer) eq 'HASH' && ($peer->{schema}//'') eq 'deyda-ioc-v1';1};
     if (!$ok) {result('CHECK','UNKNOWN: HA peer JSON unreadable or unsupported.');}
