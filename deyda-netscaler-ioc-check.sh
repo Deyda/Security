@@ -18,7 +18,7 @@
 #
 # Deyda Consulting | NetScaler ADC Defensive Triage
 # Script:  deyda-netscaler-ioc-check.sh
-# Version: 9.88
+# Version: 9.90
 #
 # GEIGER detection enhancements are integrated into the read-only checks below.
 # Optional campaign start override: GEIGER_CAMPAIGN_START=YYYY-MM-DD.
@@ -45,6 +45,10 @@
 # its -WR activation/callhome traces, scoped helper-hash references, web-served
 # archive magic bytes, and cron commands that may erase evidence. No payload
 # content is executed; hashes from independent analysis are not Citrix checksums.
+# v9.90: fixed source Check-ID constants, same-node JSON report comparison,
+# and static authentication priority/goto/nextFactor review. No policy execution.
+# v9.89: per-run metadata-validated hash cache; Python-cache drift counts
+# remain CHECK without repetitive per-file lines; explicit report/JSON coverage.
 # v9.88: original-logo ASCII branding in source and report headers.
 # v9.87: embedded 37660-file operator-supplied standard 14.1-73.46 manifest
 # plus two single-file references; external manifest takes precedence.
@@ -150,6 +154,10 @@
 #   below use internal samples from clean 14.1-73.37, 14.1-73.41, and
 #   13.1-64.24 appliances; these are not Citrix-published checksums.
 #
+# Optional comparison report from a previous v9.90+ run on this same node:
+#   DEYDA_PREVIOUS_REPORT_JSON=/path/to/previous-report.json
+# Comparison groups use fixed Check-ID constants in source. Missing checks
+# are NOT_ASSESSED, never resolved. Group status is the highest finding status.
 # Optional v9.85 evidence (read-only, operator-approved, same deployment):
 #   DEYDA_HA_PEER_JSON=/path/to/peer-report.json (v9.85 report from the other node)
 #   Standard 14.1-73.46 uses the integrated operator test-device manifest by default.
@@ -183,7 +191,7 @@
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 export PATH
 umask 077
-SCRIPT_VERSION='9.88'
+SCRIPT_VERSION='9.90'
 # GEIGER: identify this script by its resolved path, not by an assumed file name.
 GEIGER_SELF_PATH=$(realpath "$0" 2>/dev/null)
 [ -n "$GEIGER_SELF_PATH" ] || GEIGER_SELF_PATH=$(cd "$(dirname "$0")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename "$0")")
@@ -1520,8 +1528,8 @@ fi
 
 exec > "$OUT" 2>&1
 
-section() { progress "$1"; printf '\n===== %s =====\n' "$1"; }
-subsection() { printf '\n--- %s ---\n' "$1"; }
+section() { progress "$1"; printf '\n===== %s =====\nCheck-ID: %s\n' "$1" "${2:-DEYDA-UNASSIGNED}"; }
+subsection() { printf '\n--- %s ---\nCheck-ID: %s\n' "$1" "${2:-DEYDA-UNASSIGNED}"; }
 status() { printf '\n[%s] %s\n' "$1" "$2"; }
 sha256_from_stream() {
     # Accept native FreeBSD SHA256(path)=digest and GNU digest-first output.
@@ -1533,14 +1541,46 @@ sha256_from_stream() {
         if(length(candidate)==64 && candidate !~ /[^0-9a-fA-F]/) {print tolower(candidate); exit}
     }'
 }
+# Private per-run cache shared by shell command substitutions and Perl checks.
+DEYDA_HASH_CACHE_DIR=$(mktemp -d "${OUT}.hashcache.XXXXXX" 2>/dev/null)
+export DEYDA_HASH_CACHE_DIR
+trap '[ -z "${DEYDA_HASH_CACHE_DIR-}" ] || rm -rf "$DEYDA_HASH_CACHE_DIR"' 0
 sha256_of() {
-    _hash_path=$1
-    if command -v sha256 >/dev/null 2>&1; then
-        sha256 "$_hash_path" 2>/dev/null | sha256_from_stream
+    if command -v perl >/dev/null 2>&1; then
+        perl - "$1" <<'DEYDA_HASH_PERL'
+use strict;use warnings;use Digest::SHA;
+
+sub cached_digest {
+    my ($path,$write_cache)=@_;
+    my @before=stat($path);return undef unless @before && -f $path;
+    my $signature=join(':',@before[0,1,7,9,10]);
+    my $dir=$ENV{DEYDA_HASH_CACHE_DIR};
+    my $key=Digest::SHA::sha256_hex($path);
+    my $cache=defined($dir) && -d $dir ? "$dir/$key":undef;
+    if ($cache && open(my $cf,'<',$cache)) {
+        my $line=<$cf>;close $cf;
+        if (defined($line) && $line =~ /^([0-9:]+) ([a-f0-9]{64})$/ && $1 eq $signature) {return $2;}
+    }
+    open my $fh,'<',$path or return undef;binmode $fh;
+    my @opened=stat($fh);
+    if (!@opened || $opened[0]!=$before[0] || $opened[1]!=$before[1]) {close $fh;return undef;}
+    my $hash=eval {Digest::SHA->new(256)->addfile($fh)->hexdigest};
+    my @after=stat($fh);close $fh;
+    return undef unless defined($hash) && @after && join(':',@after[0,1,7,9,10]) eq $signature;
+    # Reuse small existing caches; do not create 37660 cache files for the tree scan.
+    if ($cache && ($write_cache || -f $cache) && open(my $cf,'>',$cache)) {print $cf "$signature $hash";close $cf;}
+    return $hash;
+}
+
+my $hash=cached_digest($ARGV[0],1);print $hash if defined $hash;
+DEYDA_HASH_PERL
+    elif command -v sha256 >/dev/null 2>&1; then
+        sha256 "$1" 2>/dev/null | sha256_from_stream
     elif command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$_hash_path" 2>/dev/null | sha256_from_stream
+        sha256sum "$1" 2>/dev/null | sha256_from_stream
     fi
 }
+
 check_1417337_reference() {
     REFERENCE_MATCH=UNKNOWN
     _ref_path=$1
@@ -1654,7 +1694,7 @@ if [ "$RUNNING_ON_ADC" = YES ] && [ -n "$CONFIG_VERSION" ] && [ -n "$RUNTIME_FAM
 elif [ "$RUNNING_ON_ADC" = YES ] && [ -n "$CONFIG_VERSION" ] && [ -n "$CURRENT_INPUT" ] && [ "$CONFIG_VERSION" != "$CURRENT_INPUT" ] && [ "$VERSION_SOURCE" != 'operator-supplied version' ] && [ "$CURRENT_INPUT" = *-* ]; then
     status CHECK "Saved ns.conf header reports $CONFIG_VERSION while the running build source reports $CURRENT_INPUT. The saved header may be stale after upgrade."
 fi
-section 'How to read this report'
+section 'How to read this report' 'DEYDA-0001'
 cat <<'READ_GUIDE'
 [OK] means the selected pattern was not found in the source and time range the check scanned. It is not a clean bill of health.
 [CHECK] means the output needs human validation, usually against an approved change, a trusted same-build baseline, or a wider evidence source.
@@ -1663,7 +1703,7 @@ cat <<'READ_GUIDE'
 Identical numbered ns.conf evidence lines are printed only at their first occurrence, even if several CVE checks use that same configuration line.
 READ_GUIDE
 
-section '1. Platform and uptime'
+section '1. Platform and uptime' 'DEYDA-0002'
 if [ "$RUNNING_ON_ADC" = YES ]; then
     uname -a 2>&1
     uptime 2>&1
@@ -1684,7 +1724,7 @@ else
     status CHECK "Offline configuration mode: host checks and live ADC state are not available; config file is $CONFIG."
 fi
 
-section '2. Firmware and CVE applicability'
+section '2. Firmware and CVE applicability' 'DEYDA-0003'
 printf '%s\n' 'Compares the detected build with bulletin thresholds and inventories saved-config preconditions. Matching configuration on a fixed build is historical context; it does not establish whether earlier compromise occurred.'
 cat <<'NOTE'
 Citrix fixed-build thresholds stated in the bulletin:
@@ -1771,7 +1811,7 @@ if [ -r "$CONFIG" ]; then
         fi
     }
 
-    subsection 'CVE-2026-88772: DTLS enabled on Gateway or DTLS virtual server'
+    subsection 'CVE-2026-88772: DTLS enabled on Gateway or DTLS virtual server' 'DEYDA-0064'
     vpn_lines=$(grep -E -i '^add vpn vserver ' "$CONFIG" 2>/dev/null)
     dtls_lines=$(grep -E -i '^add [^#]*vserver .* DTLS([[:space:]]|$)' "$CONFIG" 2>/dev/null)
     if [ -n "$vpn_lines" ]; then
@@ -1810,13 +1850,13 @@ if [ -r "$CONFIG" ]; then
     fi
     if [ "$FW_PATCHED" = YES ]; then status OK 'For this bulletin, saved-config preconditions are remediated by the entered fixed build; verify live state only if investigating the pre-update exposure window.'; elif [ "$FW_PATCHED" = NO ]; then status CHECK 'Confirm DTLS state in running configuration; saved config may be stale and build is below threshold.'; else status CHECK 'Confirm DTLS state in running configuration and provide the firmware build; saved config may be stale.'; fi
 
-    subsection 'CVE-2026-88773: HTTP configuration enabled'
+    subsection 'CVE-2026-88773: HTTP configuration enabled' 'DEYDA-0065'
     scan_config 'HTTP or SSL LB/CS/VPN/AAA virtual servers' '^[[:space:]]*add (lb|cs|vpn|authentication) vserver .* (HTTP|SSL)([[:space:]]|$)' ACTION OK
     if [ "$FW_PATCHED" != YES ]; then
         status CHECK 'HTTP/SSL vServers can be relevant to this CVE on an unverified or below-threshold build. Confirm active state in the running configuration.'
     fi
 
-    subsection 'CVE-2026-88774: HTTP URL-based policy expressions'
+    subsection 'CVE-2026-88774: HTTP URL-based policy expressions' 'DEYDA-0066'
     printf '\n--- Common URL expression strings (partial text search) ---\n'
     URL_EXPRESSION_MATCHES=$(grep -E -i -n 'HTTP\.REQ\.URL|HTTP\.URL|HTTP\.REQ\.HOSTNAME' "$CONFIG" 2>/dev/null | head -100)
     if [ -n "$URL_EXPRESSION_MATCHES" ]; then
@@ -1830,17 +1870,17 @@ if [ -r "$CONFIG" ]; then
         status OK 'No common URL expression strings found in the saved configuration; this partial search does not cover every possible expression.'
     fi
 
-    subsection 'CVE-2026-88775: Gateway or AAA virtual server'
+    subsection 'CVE-2026-88775: Gateway or AAA virtual server' 'DEYDA-0067'
     scan_config 'VPN or authentication virtual servers' '^[[:space:]]*add (vpn|authentication) vserver ' ACTION OK
     if [ "$FW_PATCHED" != YES ]; then
         status CHECK 'Confirm whether matching Gateway/AAA vServers are active if the build is unverified or below threshold.'
     fi
 
-    subsection 'CVE-2026-88776: Oracle load-balancing virtual server'
+    subsection 'CVE-2026-88776: Oracle load-balancing virtual server' 'DEYDA-0068'
     scan_config 'Oracle LB virtual servers' '^[[:space:]]*add lb vserver .* ORACLE([[:space:]]|$)' ACTION OK
     if [ "$FW_PATCHED" != YES ]; then status CHECK 'Confirm any Oracle LB match is active if the build is unverified or below threshold.'; fi
 
-    subsection 'CVE-2026-88777: non-HTTP L7 / FTP / RTSP / DNS64 / NAT64 patterns'
+    subsection 'CVE-2026-88777: non-HTTP L7 / FTP / RTSP / DNS64 / NAT64 patterns' 'DEYDA-0069'
     scan_config 'FTP vServers, services, and monitors' '^[[:space:]]*add (lb|cs) vserver .* FTP([[:space:]]|$)|^[[:space:]]*add service .* FTP([[:space:]]|$)|^[[:space:]]*add lb monitor .* FTP(-EXTENDED)?([[:space:]]|$)' ACTION OK
     scan_config 'LSN groups and enabled FTP/RTSP ALG settings' '^[[:space:]]*add lsn group |^[[:space:]]*set lsn group .*-(ftp|rtspalg)[[:space:]]+ENABLED' ACTION OK
     scan_config 'DNS64 and NAT64 configuration' '^[[:space:]]*add lb vserver .* DNS .* -dns64 ENABLED|^[[:space:]]*add dns policy64 |^[[:space:]]*add nat64 ' ACTION OK
@@ -1850,7 +1890,7 @@ if [ -r "$CONFIG" ]; then
         status CHECK 'LSN groups may use FTP ALG by default; confirm per-group settings and whether DNS64 policy objects are bound to an active DNS vServer. Matches are clues, not proof of exposure.'
     fi
 
-    subsection 'CVE-2026-88778: Enhanced ISN Generation and supported vServer types'
+    subsection 'CVE-2026-88778: Enhanced ISN Generation and supported vServer types' 'DEYDA-0070'
     ISN_VSERVER_LINES=$(grep -E -i '^[[:space:]]*add (lb|cs|vpn|authentication|gslb|cr) vserver .* (HTTP|SSL|SSL_BRIDGE|TCP|SSL_TCP|FTP|NNTP|RTSP|RDP|DNS_TCP|DOT|SIP_TCP|SIP_SSL|DIAMETER|SSL_DIAMETER|MYSQL|MSSQL|ORACLE|SMPP|MQTT|MQTT_TLS|MONGO|MONGO_TLS|PROXY|SSL_PROXY|USER_TCP|USER_SSL_TCP)([[:space:]]|$)' "$CONFIG" 2>/dev/null | head -100)
     if [ -n "$ISN_VSERVER_LINES" ]; then
         printf '%s\n' "$ISN_VSERVER_LINES"
@@ -1871,7 +1911,7 @@ else
     status CHECK "Saved config $CONFIG is unavailable; perform all CVE precondition checks against the running configuration."
 fi
 
-subsection 'CVE-2026-88779: SAML SP or IdP denial of service (CTX697174)'
+subsection 'CVE-2026-88779: SAML SP or IdP denial of service (CTX697174)' 'DEYDA-0004'
 printf '%s\n' 'Memory overflow leading to denial of service; configured SAML SP or SAML IdP is the bulletin precondition.'
 printf '%s\n' 'Fixed minimums: standard 14.1 / 14.1 FIPS 73.41; standard 13.1 64.28; 13.1 FIPS/NDcPP 37.282.'
 printf '%s\n' 'Source: supplied CTX697174 bulletin dated 2026-10-04; verify the current vendor bulletin before changes.'
@@ -1912,7 +1952,7 @@ else
     status CHECK 'Saved configuration unreadable; CVE-2026-88779 SAML SP/IdP applicability could not be assessed.'
 fi
 
-subsection 'CVE-2026-107406: SAML SP/IdP memory overflow (CTX697191)'
+subsection 'CVE-2026-107406: SAML SP/IdP memory overflow (CTX697191)' 'DEYDA-0005'
 printf '%s\n' 'Critical, CVSS v4 9.5; CWE-119 memory overflow with potential RCE or DoS, according to Citrix community guidance.'
 printf '%s\n' 'The applicability depends on both the SAML role and firmware branch/build.'
 printf '%s\n' 'Standard fixed-build references used here: 14.1-73.46 and 13.1-64.29. FIPS/NDcPP fixed thresholds are not assumed by this check.'
@@ -1993,7 +2033,7 @@ access_control_inventory() {
         }
     }' "$1" | sort -u
 }
-subsection 'Administrative accounts and EPA configuration integrity'
+subsection 'Administrative accounts and EPA configuration integrity' 'DEYDA-0006'
 printf '%s\n' 'Purpose: review administrative persistence and authentication-policy changes, including extra accounts, privilege bindings, EPA default groups, and removed bindings. NO_AUTH is a group name, not proof of authentication bypass. Saved-config inventory cannot establish when or by whom a change occurred.'
 ACCESS_BASELINE=${DEYDA_CONFIG_BASELINE-}
 if [ -r "$CONFIG" ]; then
@@ -2038,7 +2078,7 @@ else
     status CHECK 'Saved configuration is unreadable; administrative-account and EPA configuration inventory could not run.'
 fi
 
-subsection 'Historical system-user changes in saved ns.conf copies'
+subsection 'Historical system-user changes in saved ns.conf copies' 'DEYDA-0007'
 printf '%s\n' 'Compare current system-user names with retained ns.conf backups. This can reveal account additions/removals that an installer later deleted from the current config; names only are compared, and credentials are never read or printed.'
 if [ -r "$CONFIG" ]; then
     CURRENT_USER_NAMES=$(awk '
@@ -2096,7 +2136,7 @@ else
     status CHECK 'Current saved ns.conf is unreadable; historical account-name comparison could not run.'
 fi
 
-subsection 'SAML request workaround: saved policy and binding inventory'
+subsection 'SAML request workaround: saved policy and binding inventory' 'DEYDA-0008'
 # Parse names and bindings without exposing proprietary policy expressions.
 # OK confirms selected saved-config structure/bindings, not exact vendor approval.
 # GEIGER: the request workaround is an interim measure until the CVE-2026-88779 fixed
@@ -2319,6 +2359,102 @@ result('OK','No textual drift in scanned authentication, Gateway, Responder and 
 result('INFO','Scope is this node/partition and capture time. Definitions do not prove active SAML exposure. Option ordering, defaults or secret encoding can produce textual differences; investigate before saving. Earlier CVE checks remain saved-config assessments.');
 
 # Build directed references; existence and reachability are separate evidence.
+
+# Static authentication binding-order review. Never execute or print policy rules.
+# NEXT/END/numeric goto act on matched policy evaluation; nextFactor is on success.
+# An earlier rule TRUE is not proof that its authentication action succeeds.
+sub policy_order {
+    my ($lines,$label)=@_;
+    my (%policy,%banks,%labels);
+    my ($warnings,$bindings,$printed)=(0,0,0);
+    my $emit=sub {
+        my ($msg)=@_;$warnings++;
+        result('CHECK',"$label policy-order: $msg") if $printed++<100;
+    };
+    for my $raw (@$lines) {
+        next unless $raw =~ /^\s*(add|set|bind)\s+authentication\s+/i;
+        $raw =~ s/[\r\n]+$//;
+        my @t=parse_line('\s+',0,$raw);next unless @t>=4;
+        my ($verb,$family,$type)=map {lc $_} @t[0..2];
+        my %options;
+        for(my $i=4;$i<@t;$i++) {
+            next unless defined($t[$i]) && $t[$i] =~ /^-/;
+            my $key=lc $t[$i];
+            $options{$key}=($i+1<@t && $t[$i+1]!~/^-/)?$t[$i+1]:'FLAG';
+        }
+        if ($type eq 'policy' && ($verb eq 'add'||$verb eq 'set')) {
+            my $entry=$policy{$t[3]}//={};
+            $entry->{rule}=lc($options{'-rule'}) if defined $options{'-rule'};
+            $entry->{action}=$options{'-action'} if defined $options{'-action'};
+        }
+        $labels{$t[3]}=1 if $verb eq 'add' && $type eq 'policylabel';
+        if ($verb eq 'bind' && ($type eq 'vserver'||$type eq 'policylabel')) {
+            my $name=$options{'-policyname'}//$options{'-policy'};next unless defined $name;
+            my $lane=join('/', $type,$t[3],uc($options{'-type'}//'DEFAULT'),
+                exists($options{'-secondary'})?'SECONDARY':'PRIMARY',
+                exists($options{'-groupextraction'})?'GROUP_EXTRACTION':'AUTH');
+            push @{$banks{$lane}},{policy=>$name,priority=>$options{'-priority'},
+                goto=>$options{'-gotopriorityexpression'},next=>$options{'-nextfactor'}};
+            $bindings++;
+        }
+    }
+    for my $bank(sort keys %banks) {
+        my $safe=safe_name($bank);
+        my @rows=@{$banks{$bank}};
+        my @valid=grep {defined($_->{priority}) && $_->{priority}=~/^\d+$/} @rows;
+        $emit->("bank=$safe has missing/unparsed priorities; ordering incomplete.") if @valid!=@rows;
+        @valid=sort {$a->{priority}<=>$b->{priority} || $a->{policy} cmp $b->{policy}} @valid;
+        my %seen_priority;my @earlier_end;
+        for my $b (@valid) {
+            my $name=safe_name($b->{policy});my $prio=$b->{priority};
+            my $pol=$policy{$b->{policy}};
+            my $goto=defined($b->{goto})?uc($b->{goto}):'DEFAULT_UNKNOWN';
+            my $display_goto=$goto=~/^(NEXT|END|\d+)$/?$goto:$goto eq 'DEFAULT_UNKNOWN'?$goto:'DYNAMIC_UNEVALUATED';
+            result('INFO',"$label binding bank=$safe policy=$name priority=$prio goto=$display_goto nextFactor=".
+                (defined($b->{next})?safe_name($b->{next}):'NONE').' (on successful authentication)') if $printed++<100;
+            $emit->("bank=$safe priority=$prio is used more than once; tie order needs validation.") if $seen_priority{$prio}++;
+            if (!$pol) {$emit->("bank=$safe policy=$name is classic, absent or unsupported; effective flow UNKNOWN.");next;}
+            if (!defined($b->{goto})) {$emit->("bank=$safe policy=$name goto is omitted; default/effective flow UNKNOWN.");}
+            elsif ($goto !~ /^(NEXT|END|\d+)$/) {$emit->("bank=$safe policy=$name uses a dynamic goto expression; not evaluated.");}
+            elsif ($goto=~/^\d+$/ && $goto<=$prio) {$emit->("bank=$safe policy=$name numeric goto=$goto does not advance priority; verify valid flow.");}
+            my $rule=$pol->{rule}//'unknown';
+            if ($rule eq 'false') {$emit->("bank=$safe policy=$name has literal FALSE; its selected matched-policy path cannot be taken.");}
+            elsif ($rule ne 'true') {$emit->("bank=$safe policy=$name rule depends on request/session data; no static effectiveness conclusion.");}
+            if (@earlier_end && $rule ne 'false') {
+                $emit->("bank=$safe policy=$name can be skipped when earlier literal-TRUE policy ".safe_name($earlier_end[0])." authenticates successfully and ends this bank. Not proof of unconditional shadowing.");
+            }
+            push @earlier_end,$b->{policy} if $rule eq 'true' && $goto eq 'END';
+            if (defined($b->{next}) && uc($b->{next}) ne 'NONE' && !exists $labels{$b->{next}}) {
+                $emit->("bank=$safe policy=$name references missing nextFactor label ".safe_name($b->{next}).'.');
+            }
+        }
+    }
+    # Detect nextFactor label cycles using a bounded path stack (no rule evaluation).
+    my %links;
+    for my $bank(keys %banks) {
+        my ($type,$name)=split m{/},$bank;
+        next unless $type eq 'policylabel';
+        for my $b(@{$banks{$bank}}) {push @{$links{$name}},$b->{next} if defined($b->{next}) && exists $labels{$b->{next}};}
+    }
+    my (%done,%active);my $steps=0;my $cycle=0;
+    for my $start(sort keys %labels) {
+        next if $done{$start};my @stack=([$start,0]);
+        while (@stack) {
+            if (++$steps>10000) {$emit->('nextFactor cycle review capped at 10000 traversal steps; UNKNOWN remaining flow.');@stack=();last;}
+            my ($name,$leave)=@{pop @stack};
+            if ($leave) {delete $active{$name};$done{$name}=1;next;}
+            if ($active{$name}) {$cycle++;$emit->('possible nextFactor cycle at label '.safe_name($name).'; evaluate success paths manually.');next;}
+            next if $done{$name};
+            $active{$name}=1;push @stack,[$name,1];
+            push @stack,map {[$_,0]} @{$links{$name}//[]};
+        }
+        last if $steps>10000;
+    }
+    result('CHECK',"$label policy-order: no selected authentication bindings found; effective SAML flow UNKNOWN.") unless $bindings;
+    result('INFO',"$label policy-order summary: selected bindings=$bindings, review items=$warnings, possible label cycles=$cycle. Output capped at 100 rows; global/group/classic flows and action success are not fully modeled. No mitigation effectiveness is asserted.");
+    return {bindings=>$bindings,review_items=>$warnings,possible_cycles=>$cycle};
+}
+
 sub graph {
     my ($lines,$label)=@_;
     my (%edge,%node,%saml,%roots,%disabled);
@@ -2333,7 +2469,10 @@ sub graph {
         $roots{$id}=1 if $family =~ /^(vpn|lb|cs)$/ && $type eq 'vserver' && $verb eq 'add';
         for(my $i=4;$i+1<@t;$i++) {
             my ($opt,$val)=(lc($t[$i]),$t[$i+1]);
-            $disabled{$id}=1 if $opt eq '-state' && uc($val) eq 'DISABLED';
+            if ($opt eq '-state') {
+                $disabled{$id}=1 if uc($val) eq 'DISABLED';
+                delete $disabled{$id} if uc($val) eq 'ENABLED';
+            }
             my $target;
             if ($opt eq '-authnprofile') { $target="authentication/authnprofile/$val"; }
             elsif ($opt eq '-authnvsname' || $opt eq '-authnserver') { $target="authentication/vserver/$val"; }
@@ -2370,7 +2509,8 @@ sub graph {
             ($reachable{$id}?'; roots='.join(',',map {safe_name($_)} @{$from{$id}}):''));
     }
     result('INFO',"$label graph follows direct policies, policy labels, nextFactor and auth profiles. Reachability is a candidate path, not proof of effective policy evaluation, listener exposure or successful authentication; classic/global/group and external-host flows need manual review.");
-    return {sp_defined=>scalar(grep {$_ eq 'SP'} values %saml),idp_defined=>scalar(grep {$_ eq 'IdP'} values %saml),referenced=>scalar(keys %reachable)};
+    my $order=policy_order($lines,$label);
+    return {policy_order=>$order,sp_defined=>scalar(grep {$_ eq 'SP'} values %saml),idp_defined=>scalar(grep {$_ eq 'IdP'} values %saml),referenced=>scalar(keys %reachable)};
 }
 my $saved_graph=graph(\@saved,'Saved');
 my $runtime_graph=graph(\@running,$source eq 'LIVE'?'Live':'Capture');
@@ -2414,7 +2554,7 @@ sub security_fingerprints {
 }
 my $isn='UNKNOWN';
 for my $line (@running) { $isn=uc($1) if $line =~ /^\s*set\s+ns\s+tcpparam\b.*?-enhancedISN\s+(ENABLED|DISABLED)\b/i; }
-my $metadata={schema=>'deyda-ioc-v1',script_version=>'9.88',build=>$build,evidence_source=>$source,runtime_saml=>$runtime_graph,enhanced_isn=>$isn,security_fingerprints=>security_fingerprints($r)};
+my $metadata={schema=>'deyda-ioc-v1',script_version=>'9.90',build=>$build,evidence_source=>$source,runtime_saml=>$runtime_graph,enhanced_isn=>$isn,security_fingerprints=>security_fingerprints($r)};
 if (my $peer_path=$ENV{DEYDA_HA_PEER_JSON}) {
     my $peer; my $ok=eval {open my $pf,'<',$peer_path or die;local $/;my $raw=<$pf>;die if length($raw)>32*1024*1024;$peer=decode_json($raw);die unless ref($peer) eq 'HASH' && ($peer->{schema}//'') eq 'deyda-ioc-v1';1};
     if (!$ok) {result('CHECK','UNKNOWN: HA peer JSON unreadable or unsupported.');}
@@ -2432,7 +2572,7 @@ if (open my $jf,'>',$json_path) {print $jf JSON::PP->new->canonical->pretty->enc
 DEYDA_DRIFT_PERL
 }
 
-subsection 'Saved versus running configuration: SAML and authentication drift'
+subsection 'Saved versus running configuration: SAML and authentication drift' 'DEYDA-0009'
 DRIFT_SOURCE=LIVE
 DRIFT_RC=0
 DRIFT_DATA=''
@@ -2496,7 +2636,7 @@ gdl_counter_state() {
     END { if(positive) print "ACTIVITY"; else if(seen) print "ZERO"; else print "UNPARSED" }'
 }
 
-subsection 'CVE-2026-88779: Global Deny List signatures and AAA_REQUEST statistics'
+subsection 'CVE-2026-88779: Global Deny List signatures and AAA_REQUEST statistics' 'DEYDA-0010'
 printf '%s\n' 'Checks the supplemental Global Deny List mitigation for affected standard builds; it does not replace firmware remediation.'
 printf '%s\n' 'Console service (or on-premises Console with Cloud Connect) and Virtual patching Enabled are prerequisites; local output cannot verify those Console settings.'
 GDL_SCOPE=UNKNOWN
@@ -2579,7 +2719,7 @@ case "$GDL_SCOPE" in
 esac
 
 if [ "$RUNNING_ON_ADC" = YES ]; then
-section '3. Host integrity and persistence'
+section '3. Host integrity and persistence' 'DEYDA-0011'
 printf '%s\n' 'Reviews reboot/core history, install timing, startup/persistence locations, user-owned processes, shell permissions, and selected SUID/SGID files.'
 printf '%s\n' 'For each [CHECK]: compare path, owner, mode, hash, and timestamp with a trusted appliance on the same build; correlate with installns_state, change records, and HA peer evidence. Preserve unexpected files before changing them.'
 printf '\n--- Firmware installation directory / possible review window ---\n'
@@ -2608,7 +2748,7 @@ else
     status CHECK '/var/nsinstall is unavailable; no install-time marker could be read.'
 fi
 
-subsection 'Recent reboot / shutdown history'
+subsection 'Recent reboot / shutdown history' 'DEYDA-0012'
 if command -v last >/dev/null 2>&1; then
     last -n 80 2>&1 | head -80
     status CHECK 'Correlate any unexpected reboot/cold-start time with HTTP access logs; no reboot entry is not proof that none occurred.'
@@ -2676,7 +2816,7 @@ else
     status CHECK 'No readable installns_state marker is available; the post-install file-change search could not run.'
 fi
 
-subsection 'Reported persistence account in saved configuration'
+subsection 'Reported persistence account in saved configuration' 'DEYDA-0013'
 PERSISTENCE_ACCOUNT_CONFIG=''
 for f in /nsconfig/ns.conf /flash/nsconfig/ns.conf /nsconfig/ns.conf.default; do
     [ -r "$f" ] || continue
@@ -2687,7 +2827,7 @@ if [ -n "$PERSISTENCE_ACCOUNT_CONFIG" ]; then
 else
     status OK 'No saved-config system-user entry named sec_monitor found in the checked configuration files. This does not cover transient/live-only accounts or other names.'
 fi
-subsection 'Administrative persistence payloads and temporary configuration exports'
+subsection 'Administrative persistence payloads and temporary configuration exports' 'DEYDA-0014'
 for f in /var/tmp/c1.txt /var/tmp/c2.txt /var/tmp/labels.txt; do
     if [ -e "$f" ]; then
         status CHECK "Observed payload-associated filename exists: $f. This generic name alone is not an IOC. Preserve and inspect origin, timestamp, owner, and content; configuration exports can contain secrets and are not printed here."
@@ -2726,7 +2866,7 @@ if [ "$ACCESS_PAYLOAD_COUNT" -gt 500 ]; then
     status CHECK 'Administrative-payload file search reached its 500-file limit; this partial scan does not cover all files in the selected directories.'
 fi
 
-subsection 'Targeted Perl implant and payload staging checks'
+subsection 'Targeted Perl implant and payload staging checks' 'DEYDA-0015'
 progress 'Host integrity: targeted Perl implant and payload staging checks'
 NSMON_PATH_FOUND=0
 for f in /var/tmp/.nsmon /var/tmp/.nsmon/nsmon.pl /var/tmp/.nsmon/.cfg /var/tmp/.nsmon/.state; do
@@ -2782,7 +2922,7 @@ for f in /v /tmp/v /var/tmp/v; do
     printf 'SHA-256: %s\n' "$(sha256_of "$f")"
 done
 
-subsection 'Reported .slap/.ux persistence and tunnel indicators'
+subsection 'Reported .slap/.ux persistence and tunnel indicators' 'DEYDA-0016'
 progress 'Host integrity: reported .slap/.ux persistence and tunnel indicators'
 printf '%s\n' 'Source: operator-supplied 380d56 sample-analysis screenshot and follow-up description; independently unverified. No incomplete hash is used. Names/ports are leads, not automatic proof of compromise.'
 SLAP_ARTIFACTS_FOUND=0
@@ -2862,7 +3002,7 @@ else
     status CHECK 'sockstat unavailable; sample-reported tunnel ports were not assessed.'
 fi
 
-subsection 'Cron and startup persistence'
+subsection 'Cron and startup persistence' 'DEYDA-0017'
 printf '%s\n' 'Inventory scheduled tasks and startup files. Existing entries are not automatically suspicious; validate ownership, commands, timestamps, and purpose against an approved same-build baseline.'
 
 printf '\n--- /etc/crontab ---\n'
@@ -2950,7 +3090,7 @@ else
     status OK '/var/cron/tabs directory is absent on this appliance.'
 fi
 
-subsection 'Scheduled deletion or truncation of forensic evidence'
+subsection 'Scheduled deletion or truncation of forensic evidence' 'DEYDA-0018'
 CRON_EVIDENCE_PATTERN='(rm|shred|truncate|find)[[:space:]].*(/var/log|/var/nslog|/var/core|/var/crash|ns[.]log|messages|httpaccess|httperror|core)([^[:alnum:]_]|$)|(^|[[:space:]])(>|>>)[[:space:]]*/var/(log|nslog|core|crash)(/|[[:space:]]|$)|cat[[:space:]]+/dev/null[[:space:]]*>'
 CRON_EVIDENCE_MATCHES=0
 for f in /etc/crontab /nsconfig/crontab /flash/nsconfig/crontab /var/cron/tabs/*; do
@@ -3117,7 +3257,7 @@ else
     status CHECK 'HA log coverage cannot be interpreted because the saved configuration was unavailable.'
 fi
 
-subsection 'Shell binaries and privilege-escalation artifacts'
+subsection 'Shell binaries and privilege-escalation artifacts' 'DEYDA-0019'
 if [ -e /bin/sh ]; then
     ls -l /bin/sh 2>&1
     ls -ln /bin/sh 2>&1
@@ -3170,7 +3310,7 @@ esac
 
 
 
-subsection 'Privileged-file inventory under /flash'
+subsection 'Privileged-file inventory under /flash' 'DEYDA-0020'
 if [ -d /flash ] && [ -r /flash ]; then
     FLASH_PRIVILEGED=$(find /flash -type f -user root \( -perm -4000 -o -perm -2000 \) -print 2>/dev/null | head -100)
     if [ -n "$FLASH_PRIVILEGED" ]; then
@@ -3192,7 +3332,7 @@ else
     status CHECK '/flash absent or unreadable; privileged-file inventory unavailable.'
 fi
 
-subsection 'Packet Engine open web and callhome files'
+subsection 'Packet Engine open web and callhome files' 'DEYDA-0021'
 if command -v lsof >/dev/null 2>&1; then
     PPE_OPEN_FILES=$(lsof -nP -c NSPPE -c nsppe 2>/dev/null)
     if [ -n "$PPE_OPEN_FILES" ]; then
@@ -3293,7 +3433,7 @@ else
 fi
 
 
-subsection 'Vendor Python files and customsnmpd integrity baseline'
+subsection 'Vendor Python files and customsnmpd integrity baseline' 'DEYDA-0022'
 CUSTOMSNMPD_FILE=/var/python/bin/customsnmpd
 if [ -f "$CUSTOMSNMPD_FILE" ]; then
     CUSTOMSNMPD_HASH=$(sha256_of "$CUSTOMSNMPD_FILE")
@@ -3371,7 +3511,7 @@ if reference_hash_build_supported; then
         status OK "All $PYTHON_REFERENCE_COUNT referenced Python files under /var/python/bin match the internal clean $(reference_hash_build) hashes; no additional .py files were found."
     fi
 fi
-subsection 'configd state-file metadata baseline'
+subsection 'configd state-file metadata baseline' 'DEYDA-0023'
 if reference_hash_build_supported; then
     if [ -f /var/configd_devno ]; then
         CONFIGD_DEVNO_META=$(ls -ln /var/configd_devno 2>/dev/null | awk 'NR==1{print $1 ":" $3 ":" $4 ":" $5}')
@@ -3384,11 +3524,11 @@ if reference_hash_build_supported; then
         status CHECK "/var/configd_devno is absent on this appliance, but was present on the internal $(reference_hash_build) reference; verify whether it is expected here and compare with a trusted peer."
     fi
 fi
-section '4. Web configuration and served-file integrity'
+section '4. Web configuration and served-file integrity' 'DEYDA-0024'
 printf '%s\n' 'Inspects httpd.conf indicators, web-facing files, known webshell/payload markers, custom language files, and recent file changes.'
 printf '%s\n' 'For each [CHECK]: validate the exact file and timestamp against the firmware install/change window, compare hashes with a trusted same-build node, and inspect suspicious content from a preserved copy. A normal vendor package or upgrade timestamp can explain a match.'
 printf '%s\n' 'Request-path hits are not automatically malicious: check the request date, source address, method, response, and whether the requested path is a normal NetScaler resource. Prior-year scanner noise should stay classified as historical unless correlated evidence says otherwise.'
-subsection 'httpd.conf metadata and indicators'
+subsection 'httpd.conf metadata and indicators' 'DEYDA-0025'
 FOUND_HTTPD=0
 for f in /etc/httpd.conf /nsconfig/httpd.conf /netscaler/httpd.conf; do
     if [ -e "$f" ]; then
@@ -3434,7 +3574,7 @@ elif [ "$HTTPD_CANDIDATES_FOUND" -eq 0 ]; then
 else
     status OK 'No selected receiver.min.css/receiver.v2.min.<hex>.css, .ctxs, or LogonUISimple/.local_journal alias patterns found in candidate httpd.conf files.'
 fi
-subsection 'Reported receiver variants and PHP handling of .deb files'
+subsection 'Reported receiver variants and PHP handling of .deb files' 'DEYDA-0026'
 SLAP_WEB_FOUND=0
 for f in /var/netscaler/logon/LogonPoint/custom/.slap.receiver /var/netscaler/logon/LogonPoint/custom/.ctxs.receiver /var/netscaler/logon/LogonPoint/custom/receiver.deb; do
     [ -f "$f" ] || continue
@@ -3503,7 +3643,7 @@ elif [ -d /var/netscaler ]; then
 else
     status CHECK '/var/netscaler is absent; the broad PHP/XHTML inventory could not run.'
 fi
-subsection 'VPN script staging and WHIPSHOT/SLAPSHOT artifacts'
+subsection 'VPN script staging and WHIPSHOT/SLAPSHOT artifacts' 'DEYDA-0027'
 STAGING_PATHS_FOUND=0
 STAGING_FILES=''
 for d in /var/netscaler/gui/vpn/scripts/linux /netscaler/ns_gui/vpn/scripts/linux /netscaler/gui/vpns/scripts/vista /netscaler/gui/vpns/scripts/mac /netscaler/ns_gui/vpns/scripts/vista /netscaler/ns_gui/vpns/scripts/mac; do
@@ -3589,7 +3729,7 @@ if [ "$UXD_ARTIFACT_FOUND" -eq 1 ]; then
 else
     status OK 'No .uxdport/.uxdlock artifacts found in /tmp or /var/tmp.'
 fi
-subsection 'Additional publicly reported persistence and staging artifacts'
+subsection 'Additional publicly reported persistence and staging artifacts' 'DEYDA-0028'
 PITSCALER_ARTIFACTS=$( { find /var/netscaler /var/vpn /var/python /tmp -type f \( -name '.local_journal' -o -name 'xua.html' -o -name 'update_result_*.tgz' -o -name 'customsnmpd' -o -name 'nsg64.deb' -o -name '1.py' \) -print 2>/dev/null; find /var/tmp/.nsmon -type f \( -name '.cfg' -o -name '.state' \) -print 2>/dev/null; } | head -100)
 if [ -n "$PITSCALER_ARTIFACTS" ]; then
     while IFS= read -r f; do
@@ -3670,7 +3810,7 @@ EOF_PLATYPUS_FILES
 else
     status OK 'No ns_*.pl files found under /netscaler.local. This only covers the scanned path.'
 fi
-subsection 'PHP and webshell content in customization trees'
+subsection 'PHP and webshell content in customization trees' 'DEYDA-0029'
 MISPLACED_PHP=$(grep -rlE '<\?[[:space:]]*php|passthru[[:space:]]*\(|NSC_TASS|CsrfToken' /var/netscaler/logon/LogonPoint/custom /var/vpn 2>/dev/null)
 if [ -n "$MISPLACED_PHP" ]; then
     status ACTION 'PHP/webshell-like code found in Gateway customization paths where it is unexpected; inspect contents and preserve evidence:'
@@ -3691,7 +3831,7 @@ else
     status OK 'No ns.conf/.F1.key/.F2.key copies found in the selected web-facing and temporary paths.'
 fi
 
-subsection 'Known webshell hashes in selected file trees'
+subsection 'Known webshell hashes in selected file trees' 'DEYDA-0030'
 KNOWN_WEBSHELL_HASHES='6f5a2a452a7901323abd21879c6cecccb47c06aeeaccb1b467212f3b11e4b1e7
 ed082f744f035035900f67edf438f2f7d0528ac501234f63d476d65273cdb9a1
 5ea5ea61e9062822bee3f66ef5ff47c217178d9e31936ad6daf10c5dfae44d12
@@ -3722,7 +3862,7 @@ if command -v sha256 >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1; th
 else
     status CHECK 'No SHA-256 utility is available; the selected public webshell hash checks could not run.'
 fi
-subsection 'Hidden .ctxs files and content indicators'
+subsection 'Hidden .ctxs files and content indicators' 'DEYDA-0031'
 CTX_RECEIVER_FILES=$(find /var/netscaler/logon /netscaler/ns_gui /var/vpn -type f -name '.ctxs*' -print 2>/dev/null)
 if [ -n "$CTX_RECEIVER_FILES" ]; then
     status ACTION 'Hidden .ctxs* file found in a web-facing path; investigate as a possible webshell and preserve evidence:'
@@ -3806,7 +3946,7 @@ else
     status OK 'No known exploit canary names or recent small files containing uid/gid command output were found in checked paths.'
 fi
 
-subsection 'Unexpected .dot files beneath LogonPoint/custom'
+subsection 'Unexpected .dot files beneath LogonPoint/custom' 'DEYDA-0032'
 DOT_COUNT=0
 for d in /var/netscaler/logon/LogonPoint/custom; do
     if [ -d "$d" ]; then
@@ -3860,7 +4000,7 @@ else
     status OK 'No matching web/application files with modification times within the last 14 days were found in the scanned paths.'
 fi
 
-subsection 'Archive content disguised as a web-served file'
+subsection 'Archive content disguised as a web-served file' 'DEYDA-0033'
 printf '%s\n' 'Checks file signatures only (gzip, tar, ZIP) in selected web-served trees; names and contents are not trusted as indicators by themselves.'
 ARCHIVE_MAGIC_FILES=$(find /var/netscaler/logon /netscaler/ns_gui /var/vpn /var/nsproflog /var/netscaler/gui /netscaler/gui /netscaler/portal \
     -type f \( -name '*.html' -o -name '*.htm' -o -name '*.json' -o -name '*.css' -o -name '*.js' -o -name '*.txt' \) \
@@ -4048,7 +4188,7 @@ else
     status CHECK 'These additional LogonPoint hashes are single-appliance 14.1-73.37, 14.1-73.41, and 13.1-64.24 references and were not compared because the running build is outside that exact scope.'
 fi
 
-section '5. Log coverage and event correlation'
+section '5. Log coverage and event correlation' 'DEYDA-0034'
 printf '%s\n' 'Establishes retained-log coverage for the suspected pre-patch period, then searches for selected HTTP, authentication, DTLS, and system-event indicators.'
 printf '%s\n' 'Time handling: the CVE-2026-88771 campaign review begins with the reported activity window shown above and ends at the verified update time. Older path hits (for example, routine scans from 2025) are historical context, not evidence of this campaign by themselves.'
 printf '%s\n' 'For a hit: record the original timestamp and source, correlate HTTP and authentication entries with file/config changes, and preserve the raw logs. A missing match is meaningful only for the periods and log formats actually retained.'
@@ -4091,7 +4231,7 @@ for pattern in /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/lo
 done
 status CHECK 'This script cannot query remote syslog, NetScaler Console, SIEM, AppFlow, Web Logging, firewall, or Active Directory event stores. Check those independently, document time ranges/timezones/retention, and correlate relevant events such as Windows 4624/4625.'
 status CHECK 'File modification times only estimate log retention. Inspect timestamps inside rotated logs and identify gaps, early rotation, truncation, and clock/timezone/NTP discrepancies before treating a no-hit result as meaningful.'
-subsection 'Reboot-related system log records'
+subsection 'Reboot-related system log records' 'DEYDA-0035'
 FOUND_REBOOT_LOG=0
 for f in /var/log/messages /var/log/ns.log /var/log/boot.log; do
     if [ -r "$f" ]; then
@@ -4104,7 +4244,7 @@ for f in /var/log/messages /var/log/ns.log /var/log/boot.log; do
 done
 [ "$FOUND_REBOOT_LOG" -eq 1 ] || status CHECK 'No readable candidate system logs were found at the paths checked.'
 
-subsection 'Authentication service (nsaaad) crashes and restart-limit events'
+subsection 'Authentication service (nsaaad) crashes and restart-limit events' 'DEYDA-0036'
 NSAAAD_LOG_COVERAGE=0
 for f in /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log*; do
     [ -f "$f" ] && [ -r "$f" ] && NSAAAD_LOG_COVERAGE=1
@@ -4131,7 +4271,7 @@ else
     status OK 'No nsaaad-named files returned from the retained core/crash inventory.'
 fi
 
-subsection 'HTTPD reload and signal events'
+subsection 'HTTPD reload and signal events' 'DEYDA-0037'
 HTTPD_RELOAD_LOGS=$(zgrep -E -i -n 'apachectl[[:space:]]+graceful|httpd[^[:cntrl:]]*(SIGHUP|SIGUSR1)|graceful[^[:cntrl:]]*(restart|reload)' /var/log/httperror* /var/log/messages* /var/log/ns.log* 2>/dev/null | chrono_sort | tail -40)
 if [ -n "$HTTPD_RELOAD_LOGS" ]; then
     status CHECK 'HTTPD graceful-reload or signal references found in retained logs; correlate with httpd.conf and web-file changes:'
@@ -4139,7 +4279,7 @@ if [ -n "$HTTPD_RELOAD_LOGS" ]; then
 else
     status OK 'No selected HTTPD graceful-reload/signal references found in the searched logs.'
 fi
-subsection 'CVE-2026-88772 DTLS and NSPPE event correlation'
+subsection 'CVE-2026-88772 DTLS and NSPPE event correlation' 'DEYDA-0038'
 DTLS_EVENT_LINES=$(zgrep -E -i -n 'SSL_HANDSHAKE_FAILURE.*DTLSv1[.]0.*Handshake failure-Internal Error' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | chrono_sort | tail -30)
 NSPPE_EVENT_LINES=$(zgrep -E -i -n 'orphan rings|pitboss[^[:cntrl:]]*NOT restarting NSPPE|NSPPE[^[:cntrl:]]*(exit|crash|signal|terminated)' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | chrono_sort | tail -50)
 if [ -n "$DTLS_EVENT_LINES" ]; then
@@ -4164,7 +4304,7 @@ else
     status OK 'No selected CVE-2026-88772 DTLS/NSPPE event patterns found in available ns.log/messages files. This covers only retained log content and does not rule out exploitation.'
 fi
 
-subsection 'Encoded-command references in HTTP and system logs'
+subsection 'Encoded-command references in HTTP and system logs' 'DEYDA-0039'
 LOG_COUNT=0
 MATCH_COUNT=0
 for d in /var/log /var/nslog; do
@@ -4208,7 +4348,7 @@ else
     status OK 'No INDEX: base64 token found in available HTTP access/error logs. This covers retained files and the searched format only.'
 fi
 
-subsection 'Tagged Base64 User-Agent candidates (including K: payloads)'
+subsection 'Tagged Base64 User-Agent candidates (including K: payloads)' 'DEYDA-0040'
 # Only inspect the User-Agent field of conventional combined Apache logs.
 # Decode into inert text, bound size and replace control characters; never eval.
 if [ "$HTTP_IOC_LOGS_FOUND" -eq 0 ]; then
@@ -4235,7 +4375,7 @@ else
     fi
 fi
 
-subsection 'Whole-User-Agent Base64 candidates'
+subsection 'Whole-User-Agent Base64 candidates' 'DEYDA-0041'
 progress 'Attack logs: whole-User-Agent Base64 candidates'
 # Common/combined Apache layout only: the last quoted field must be a Base64
 # token, >=40 characters. Bound decoding at 8192 encoded bytes, never execute it.
@@ -4263,7 +4403,7 @@ else
     status OK 'No whole-User-Agent Base64 candidate matched the selected common/combined access-log format. Custom formats, shorter blobs, URL-safe Base64, and error-log-only content are outside coverage.'
 fi
 
-subsection 'Authentication reconnaissance markers'
+subsection 'Authentication reconnaissance markers' 'DEYDA-0042'
 SYS_IOC_LOGS_FOUND=0
 for f in /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log*; do [ -f "$f" ] && [ -r "$f" ] && SYS_IOC_LOGS_FOUND=1; done
 # CERT-EU describes the authentication-log marker followed by shell syntax as
@@ -4280,7 +4420,7 @@ fi
 progress 'Attack logs: CVE-2026-88771 attempt, execution and timeline analysis'
 geiger_analysis injection
 
-subsection 'Two-stage log-chain correlation'
+subsection 'Two-stage log-chain correlation' 'DEYDA-0043'
 PPE_TRIGGER_COUNT=$(zgrep -hE -i '(pitboss PPE (missed too many heartbeats|unexpectedly died)[[:space:]]?NSPPE(-[0-9]+)?|pitboss[[:space:]]+NSPPE(-[0-9]+)?)[^[:cntrl:]]*(;|%3[bB]|`|%60|\$\(|\$\{IFS\}|%24%7BIFS%7D)' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | wc -l | tr -d ' ')
 if [ "${PPE_TRIGGER_COUNT:-0}" -gt 0 ] && [ -n "$INDEX_PAYLOADS" ]; then
     status ACTION 'Both a PPE/pitboss shell-injection pattern and an INDEX: Base64 candidate occur in retained logs. Treat this as a combined attack-chain lead, not proof the events are the same request or that code executed. The GEIGER and INDEX sections contain the evidence; raw lines are not repeated here.'
@@ -4292,7 +4432,7 @@ else
     status OK 'Neither selected stage of this two-stage log-chain pattern was found in retained logs. This result is limited by log coverage, formats, and retention.'
 fi
 
-subsection 'Deferred warm-restart log processing and helper integrity'
+subsection 'Deferred warm-restart log processing and helper integrity' 'DEYDA-0044'
 printf '%s\n' 'Separates crafted records written to logs from later helper execution. A trigger-shaped log entry is evidence of an attempt; it does not prove the helper ran or a command executed.'
 WARM_HELPER=/netscaler/ns_monuploadd_err.pl
 WARM_VULNERABLE_SHA256=fb7f574a4c185fa8e520c47280939ce22899243a0083ee7120b7300c43baca29
@@ -4344,7 +4484,7 @@ fi
 printf '%s\n' 'Scope note: the script reports counts, not attacker-controlled log lines. It does not automatically correlate timestamps across local/rotated logs and callhome; use the source logs and remote telemetry for that step.'
 
 
-subsection 'Multi-signal authentication-log injection without a PPE trigger'
+subsection 'Multi-signal authentication-log injection without a PPE trigger' 'DEYDA-0045'
 # Require authentication context and multiple independent execution-chain clues.
 # Audit/scanner command echoes are excluded. Counts avoid exposing usernames/secrets.
 LOGIN_CHAIN_COUNT=$(zgrep -hEi 'LOGIN_FAILED|AAA LOGIN REQ|aaad_authenticate_req|Could not match login claims|AAAD API: sending login req|AAAD RESP: received resp' /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null |
@@ -4364,7 +4504,7 @@ fi
 RECON_LOGS_FOUND=0
 for f in /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn*; do [ -f "$f" ] && [ -r "$f" ] && RECON_LOGS_FOUND=1; done
 
-subsection 'Unusual HTTP response and diagnostic-path requests'
+subsection 'Unusual HTTP response and diagnostic-path requests' 'DEYDA-0046'
 # Parse request, status and bytes as separate fields; a 404 alone is harmless.
 if [ "$RECON_LOGS_FOUND" -eq 0 ]; then
     status CHECK 'No readable candidate HTTP logs; unusual-response/diagnostic-path coverage unavailable.'
@@ -4389,7 +4529,7 @@ else
     fi
 fi
 
-subsection 'Reconnaissance: nsepa.deb and vp_probe_nonexist'
+subsection 'Reconnaissance: nsepa.deb and vp_probe_nonexist' 'DEYDA-0047'
 NSEPA_PROBES=$(zgrep -E -i -n 'nsepa[.]deb' /var/log/httpaccess* 2>/dev/null | grep -E '"[[:space:]]*206[[:space:]]+1([[:space:]]|$)' | chrono_sort | tail -20)
 VP_PROBE_HITS=$(zgrep -E -i -n 'vp_probe_nonexist' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -20)
 if [ -n "$NSEPA_PROBES" ]; then
@@ -4409,7 +4549,7 @@ else
     status OK 'No vp_probe_nonexist marker found in available HTTP access/error logs. This is limited to retained logs and the selected format.'
 fi
 
-subsection 'Evidence coverage: retained log timestamps and approved file baseline'
+subsection 'Evidence coverage: retained log timestamps and approved file baseline' 'DEYDA-0048'
 if command -v perl >/dev/null 2>&1; then
 perl - "$CURRENT_INPUT" <<'DEYDA_COVERAGE_PERL'
 use strict;
@@ -4419,6 +4559,29 @@ use Digest::SHA;
 use File::Find;
 use POSIX qw(strftime);
 use Time::Local qw(timelocal);
+
+sub cached_digest {
+    my ($path,$write_cache)=@_;
+    my @before=stat($path);return undef unless @before && -f $path;
+    my $signature=join(':',@before[0,1,7,9,10]);
+    my $dir=$ENV{DEYDA_HASH_CACHE_DIR};
+    my $key=Digest::SHA::sha256_hex($path);
+    my $cache=defined($dir) && -d $dir ? "$dir/$key":undef;
+    if ($cache && open(my $cf,'<',$cache)) {
+        my $line=<$cf>;close $cf;
+        if (defined($line) && $line =~ /^([0-9:]+) ([a-f0-9]{64})$/ && $1 eq $signature) {return $2;}
+    }
+    open my $fh,'<',$path or return undef;binmode $fh;
+    my @opened=stat($fh);
+    if (!@opened || $opened[0]!=$before[0] || $opened[1]!=$before[1]) {close $fh;return undef;}
+    my $hash=eval {Digest::SHA->new(256)->addfile($fh)->hexdigest};
+    my @after=stat($fh);close $fh;
+    return undef unless defined($hash) && @after && join(':',@after[0,1,7,9,10]) eq $signature;
+    # Reuse small existing caches; do not create 37660 cache files for the tree scan.
+    if ($cache && ($write_cache || -f $cache) && open(my $cf,'>',$cache)) {print $cf "$signature $hash";close $cf;}
+    return $hash;
+}
+
 my $build=shift;
 sub finding { print "\n[$_[0]] $_[1]\n"; }
 my $year=(localtime)[5]+1900;
@@ -4483,9 +4646,7 @@ for my $path ('/bin/sh','/netscaler/ns_monuploadd_err.pl') {
     my $entry=$manifest->{single_file_references}{$path};
     next unless ref($entry) eq 'HASH' && ($entry->{sha256}//'') =~ /^[a-fA-F0-9]{64}$/;
     if (!-f $path || -l $path) {finding('CHECK',"Single-file reference unavailable or symlinked: $path");next;}
-    open my $ref_fh,'<',$path or do {finding('CHECK',"Single-file reference unreadable: $path");next;};
-    binmode $ref_fh;
-    my $hash=eval {Digest::SHA->new(256)->addfile($ref_fh)->hexdigest};close $ref_fh;
+    my $hash=cached_digest($path,0);
     finding(defined($hash) && $hash eq lc($entry->{sha256})?'OK':'CHECK',"$path exact-build internal reference: ".(defined($hash) && $hash eq lc($entry->{sha256})?'hash matches':'differs or unavailable').'; not a vendor checksum or proof of compromise.');
 }
 my @roots=@{$manifest->{roots}};
@@ -4493,6 +4654,9 @@ for my $root (@roots) {
     if ($root !~ m{^/(?:netscaler(?:\.local)?|nsconfig|var/netscaler|var/python)(?:/[^\x00-\x1f]*)?$} || $root =~ m{(?:^|/)\.\.?(/|$)} || -l $root || !-d $root) {finding('CHECK','UNKNOWN: manifest root unsupported, missing or symlinked.');exit;}
 }
 my %observed;my ($scanned,$partial,$new,$changed,$missing)=(0,0,0,0,0);
+my ($variable_new,$variable_changed,$variable_missing)=(0,0,0);
+sub variable_path {return $_[0] =~ m{(?:^|/)(?:__pycache__)(?:/|$)|[.]py[co]$} ? 1:0;}
+
 my $inside=sub {my($f)=@_;return scalar grep {$f eq $_ || index($f,"$_/")==0} @roots;};
 for my $f(keys %{$manifest->{files}}) {
     if (!$inside->($f) || $f =~ /[\x00-\x1f]/ || $f =~ m{(?:^|/)\.\.?(/|$)} || $manifest->{files}{$f} !~ /^[a-fA-F0-9]{64}$/) {finding('CHECK','UNKNOWN: manifest file path/hash invalid or outside declared roots.');exit;}
@@ -4504,12 +4668,17 @@ eval {
         die "limit\n" if ++$scanned>50000;
         $observed{$f}=1;
         if (-s $f>128*1024*1024) {$partial++;return;}
-        open my $ff,'<',$f or do {$partial++;return}; binmode $ff;
-        my $hash=eval {Digest::SHA->new(256)->addfile($ff)->hexdigest};close $ff;
+        my $hash=cached_digest($f,0);
         if (!$hash) {$partial++;return;}
         my $kind;
         if (!exists $manifest->{files}{$f}) {$new++;$kind='NEW';}
         elsif (lc($manifest->{files}{$f}) ne $hash) {$changed++;$kind='CHANGED';}
+        if ($kind && variable_path($f)) {
+            if ($kind eq 'NEW') {$new--;$variable_new++;}
+            else {$changed--;$variable_changed++;}
+            # Still compared and counted: cache-shaped paths are never exempt from IoC checks.
+            return;
+        }
         if ($kind && $new+$changed<=100) {my $safe=$f;$safe =~ s/[^A-Za-z0-9_.\/-]/?/g;finding('CHECK',"$kind file relative to approved manifest: $safe");}
     }},@roots);1;
 } or $partial++;
@@ -4517,9 +4686,11 @@ for my $f(keys %{$manifest->{files}}) {
     if (!exists $observed{$f}) {
         if ($scanned>50000) {$partial++;next;}
         if (-e $f || -l $f) {$partial++;next;}
+        if (variable_path($f)) {$variable_missing++;next;}
         $missing++; if ($missing<=100) {my $safe=$f;$safe =~ s/[^A-Za-z0-9_.\/-]/?/g;finding('CHECK',"MISSING baseline file: $safe");}
     }
 }
+finding('CHECK',"Variable Python-cache baseline differences: new=$variable_new, changed=$variable_changed, missing=$variable_missing; retained as review counts, not declared benign. Non-cache scripts and customizations remain in detailed findings.") if $variable_new+$variable_changed+$variable_missing;
 finding(($partial||$new||$changed||$missing)?'CHECK':'OK',"Approved file baseline: scanned=$scanned, new=$new, changed=$changed, missing=$missing, incomplete=$partial. Scope is declared roots; provenance/approval remain operator assertions. Differences are not proof of compromise.");
 DEYDA_COVERAGE_PERL
 else
@@ -4527,7 +4698,7 @@ else
 fi
 
 
-subsection 'SAML reconnaissance: probe User-Agent, oversized requests, and reported source range'
+subsection 'SAML reconnaissance: probe User-Agent, oversized requests, and reported source range' 'DEYDA-0049'
 printf '%s\n' 'These community-reported patterns are hunting leads, not Citrix-published IoCs. A match needs timestamp, source, request, and authentication/crash correlation.'
 SAML_PROBE_HITS=$(zgrep -E -i -n '"probe/1"|"(GET|POST|HEAD) /(saml/login|cgi/samlauth)' /var/log/httpaccess* 2>/dev/null \
     | awk 'tolower($0) ~ /probe\/1/ || (tolower($0) ~ /"(get|post|head) \/(saml\/login|cgi\/samlauth)/ && length($0) > 2500)' \
@@ -4551,7 +4722,7 @@ elif [ "$RECON_LOGS_FOUND" -eq 0 ]; then
 else
     status OK 'No 138.199.60.0/24 address found in the selected retained logs. This is limited to searched files and retention.'
 fi
-subsection 'Authentication endpoint requests and payload combinations'
+subsection 'Authentication endpoint requests and payload combinations' 'DEYDA-0050'
 EXPLOIT_PATH_HITS=$(zgrep -E -i -n '(/nitro/v1/config/login|/nf/auth/(doAuthentication|getAuthenticationRequirements)[.]do|/vpn/index[.]html|/logon/LogonPoint/(index[.]html|tmindex[.]html|Authentication/GetUserName)|/cgi/login|/p/u/do(Authentication|Logon)[.]do)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -40)
 EXPLOIT_PATH_COUNT=$(zgrep -E -i -c '(/nitro/v1/config/login|/nf/auth/(doAuthentication|getAuthenticationRequirements)[.]do|/vpn/index[.]html|/logon/LogonPoint/(index[.]html|tmindex[.]html|Authentication/GetUserName)|/cgi/login|/p/u/do(Authentication|Logon)[.]do)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | awk -F: '{n += $NF} END {print n+0}')
 AUTH_POISON_HTTP_HITS=$(zgrep -E -i -n '(/nitro/v1/config/login|/nf/auth/(doAuthentication|getAuthenticationRequirements)[.]do|/vpn/index[.]html|/logon/LogonPoint/(index[.]html|tmindex[.]html|Authentication/GetUserName)|/cgi/login|/p/u/do(Authentication|Logon)[.]do)[^[:cntrl:]]*(pitboss|NSPPE|PPE unexpectedly died|missed too many heartbeats|%3[bB]|%60|\$\{IFS\}|curl[[:space:]]|wget[[:space:]]|fetch[[:space:]])' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -30)
@@ -4569,7 +4740,7 @@ if [ -n "$AUTH_POISON_HTTP_HITS" ]; then
     printf '%s\n' "$AUTH_POISON_HTTP_HITS"
 fi
 
-subsection 'SOCRadar CVE-2026-88771 C2, delayed execution, and agent artifacts'
+subsection 'SOCRadar CVE-2026-88771 C2, delayed execution, and agent artifacts' 'DEYDA-0051'
 printf '%s\n' 'SOCRadar reports a separate automated C2 operation. A matching login/log line indicates an attempt; a C2 address/path or agent artifact is a higher-priority lead, but none alone proves command execution or data theft.'
 SOCRADAR_LOGS_FOUND=0
 for f in /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/auth.log* /var/log/sh.log* /var/log/bash.log* /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* /var/log/named* /var/log/dns*; do
@@ -4620,7 +4791,7 @@ else
 fi
 printf '%s\n' 'Correlation guidance: SOCRadar attributes delayed processing to admautoregd and reports a possible delay of up to 24 hours or processing after a reboot. For each matching injection, review HTTP, shell, DNS, firewall/proxy, reboot and file/process evidence through the following 24 hours. This report identifies co-occurring indicators but does not infer that time relationship across all external telemetry.'
 
-subsection 'VPN icon requests combined with encoded PHP markers'
+subsection 'VPN icon requests combined with encoded PHP markers' 'DEYDA-0052'
 ICO_STAGE_HITS=$(zgrep -E -i -n '/vpn/media/[^[:space:]]+[.]ico[^[:cntrl:]]*PD9[A-Za-z0-9+/=]{12,}|PD9[A-Za-z0-9+/=]{12,}[^[:cntrl:]]*/vpn/media/[^[:space:]]+[.]ico' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -30)
 if [ -n "$ICO_STAGE_HITS" ]; then
     status ACTION 'HTTP log line combines a /vpn/media/*.ico request with a User-Agent-like base64 PHP prefix (PD9). Treat as a targeted exploitation lead and correlate with log injection and resulting files:'
@@ -4628,7 +4799,7 @@ if [ -n "$ICO_STAGE_HITS" ]; then
 else
     status OK 'No selected /vpn/media/*.ico plus base64-PHP (PD9...) pattern found in available HTTP logs.'
 fi
-subsection 'Webshell/tunneler HTTP markers and staging-path requests'
+subsection 'Webshell/tunneler HTTP markers and staging-path requests' 'DEYDA-0053'
 UX_HEADER_LOG_HITS=$(zgrep -E -i -n 'HTTP_NSC_(LDAP|CLIENTTYPE)|HTTP_X_UX(_[0-9]+)?|/vpn/media/[^[:space:]]+[.]ico|/vpn/scripts/(linux|vista|mac)/[^[:space:]]+[.](sig|deb|php)' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* 2>/dev/null | chrono_sort | tail -40)
 if [ -n "$UX_HEADER_LOG_HITS" ]; then
     status CHECK 'HTTP logs contain reported webshell/tunneler header names or VPN staging-path requests. Logs may not record request headers; correlate timestamps and inspect response status, size, duration, and corresponding error-log entries:'
@@ -4652,7 +4823,7 @@ else
     status OK 'No additional selected public-research HTTP markers found in retained HTTP logs; header/body logging and retention limit coverage.'
 fi
 
-subsection 'Bootstrap and downloader log markers'
+subsection 'Bootstrap and downloader log markers' 'DEYDA-0054'
 BOOTSTRAP_LOG_COUNTS=$(zgrep -hE '/api/v1/install/|PLATYPUS_INGRESS_CA|AGENT_TOKEN|plt_[[:alnum:]]{12,}[.]|fetch([^[:cntrl:]]{0,40})-qo[[:space:]]+/v([[:space:]]|$)|:443/t/[[:xdigit:]]{6}' \
     /var/log/httpaccess* /var/log/httperror* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/sh.log* /var/log/bash.log* 2>/dev/null |
     awk '{total++; if (/\/api\/v1\/install\//) bootstrap++; if (/PLATYPUS_INGRESS_CA|AGENT_TOKEN|plt_/) token++; if (/fetch|:443\/t\//) download++} END {printf "%d %d %d %d", total, bootstrap, token, download}')
@@ -4666,7 +4837,7 @@ else
     status OK 'No selected bootstrap/downloader log marker found in readable retained candidate logs; review the general log-coverage result.'
 fi
 
-subsection 'Reported receiver/tunnel requests and exfiltration destination'
+subsection 'Reported receiver/tunnel requests and exfiltration destination' 'DEYDA-0055'
 # HTTP headers are not normally retained in common access logs. Look only in
 # existing retained text; do not claim a clean X-Cmd result if no header was seen.
 SLAP_REQUEST_HITS=$(zgrep -hE -i '[.]slap[.]receiver|receiver[.]deb|receiver[.]v2[.]min([.][[:xdigit:]]+)?[.]css|httpd[.]conf[.]slap[.]bak|/(flash/)?nsconfig/[.]slap/|/var/tmp/[.]ux/(slapshot|whipd|whippid)[.]py' \
@@ -4707,7 +4878,7 @@ fi
 printf '%s\n' 'Follow-up: inspect external egress records from NSIP/SNIP for configuration/key/backup transfers and internal tunneling, including /nsconfig, F1.key/F2.key, ns.conf saved copies, and /var/ns_sys_backup. Do not print archive or private-key contents. NSGW banner or HTTP 404 alone is insufficient. No active network probe is performed.'
 
 
-subsection 'Operator-reported payload delivery: pylrk.cc domains'
+subsection 'Operator-reported payload delivery: pylrk.cc domains' 'DEYDA-0056'
 # Domain boundaries exclude lookalikes such as evilpylrk.cc / pylrk.cc.example.
 # Count only, no attacker URLs/tokens or logged credential fields are printed.
 PYLRK_LOG_COVERAGE=0
@@ -4725,7 +4896,7 @@ else
 fi
 printf '%s\n' 'Follow-up: validate the dated domain report with your security team; assess an egress block for the base domain/subdomains using approved DNS/proxy/firewall controls. Do not infer HTTPS merely from port 443. This script performs no DNS lookup, download or automatic blocking.'
 
-subsection 'Public callback destinations and DNS references'
+subsection 'Public callback destinations and DNS references' 'DEYDA-0057'
 PUBLIC_CALLBACK_HITS=$(zgrep -E -i -n 'instances[.]httpworkbench[.]com|httpworkbench[.]com|entretiensol[.]com|gsocket[.]io|31[.]56[.]197[.]72|64[.]94[.]85[.]67|139[.]180[.]152[.]138|77[.]83[.]199[.]39|104[.]248[.]244[.]66|23[.]27[.]143[.]20|62[.]133[.]62[.]80|45[.]141[.]21[.]130|199[.]233[.]217[.]13|130[.]94[.]20[.]222' /var/log/httpaccess* /var/log/httperror* /var/log/httperror-vpn* /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* 2>/dev/null | chrono_sort | tail -40)
 if [ -n "$PUBLIC_CALLBACK_HITS" ]; then
     status CHECK 'References to selected public NetScaler campaign payload/callback indicators found in retained logs. IPs/domains are time-sensitive, may be reused or victim-specific, and must not be treated as a blocklist or attribution by themselves:'
@@ -4764,7 +4935,7 @@ else
 fi
 printf '%s\n' 'Coverage: selected conventional access-log checks parse status and response bytes. This broader text search does not parse every log format or reconstruct response content/duration; review original records for suspected 404 staging.'
 
-subsection 'Administrative-account and EPA modification audit evidence'
+subsection 'Administrative-account and EPA modification audit evidence' 'DEYDA-0058'
 ACCESS_AUDIT_FOUND=0
 ACCESS_AUDIT_HITS=0
 for f in /var/log/ns.log* /var/log/messages* /var/log/notice.log* /var/log/nsvpn.log* /var/log/sh.log* /var/log/bash.log* /var/log/audit.log*; do
@@ -4848,21 +5019,21 @@ fi
 status CHECK 'Firewall, DNS, SMB/LDAP/Kerberos/RDP, traffic-volume, and internal-scan history require external network/firewall/SIEM telemetry and are not inferred from this connection snapshot.'
 
 
-section '6. Post-scan validation'
+section '6. Post-scan validation' 'DEYDA-0059'
 printf '%s\n' 'Complete these vendor-supported validation steps separately; this read-only helper does not perform them.'
-subsection 'Firewall containment reminder: reported payload IP'
+subsection 'Firewall containment reminder: reported payload IP' 'DEYDA-0060'
 status CHECK 'BLOCKING RECOMMENDATION: block 213.209.159.55 on upstream firewalls for inbound access to public NetScaler VIPs and outbound connections from the appliance (NSIP/SNIP, including TCP 443). Validate and document the rule with the security team; this script cannot inspect or confirm upstream firewall enforcement.'
 printf '%s\n' 'Context: the IP is a reported payload destination. The operator-provided community comment also describes it as an incoming attack source; that attribution is not independently verified here. An IP reference inside a crafted username does not identify the incoming request source.'
 printf '%s\n' 'Port 443 may carry plain HTTP in this reported activity. An IP block does not replace patching or incident investigation; delivery infrastructure can change. The SAML responder workaround is an interim mitigation for affected builds and is not required once the applicable CVE-2026-88779 fixed build is installed. No firewall/ADC configuration is modified by this script.'
 
-subsection 'File Integrity Monitoring'
+subsection 'File Integrity Monitoring' 'DEYDA-0061'
 status CHECK 'Run the supported Citrix/NetScaler File Integrity Monitoring scan and compare results with a known-good baseline; this script does not run that scan.'
 else
-section 'Appliance-only checks'
+section 'Appliance-only checks' 'DEYDA-0062'
 status CHECK 'Skipped: this run targets an exported configuration file. Run the script locally on each ADC to scan logs, files, reboots, and other host indicators.'
 fi
 
-section '7. Incident response guidance — use if compromise is suspected'
+section '7. Incident response guidance — use if compromise is suspected' 'DEYDA-0063'
 cat <<'IRGUIDE'
 These are response reminders, not automated actions. Follow your incident-response process and coordinate with security, operations, and legal teams as appropriate.
 
@@ -4954,6 +5125,13 @@ if [ -n "$SUMMARY_TMP" ] && [ -n "$REPORT_TMP" ]; then
                 /^\[CHECK\]/ && major!="" && !seen[major]++ {print "  - " major}
             ' "$OUT"
         fi
+        printf '\nSCAN COVERAGE\n'
+        awk '
+          /^--- / {scope=$0}
+          scope ~ /Saved versus running configuration/ && /^(Evidence source:|\[CHECK\] UNKNOWN:|SAML objects)/ {print "  " $0}
+          scope ~ /Evidence coverage: retained log timestamps/ && /\[(CHECK|OK)\].*(Log coverage:|UNKNOWN:|Approved file baseline:|exceeded 60 seconds)/ {print "  " $0}
+        ' "$OUT"
+        printf '%s\n' '  Symlinks are outside file-baseline coverage; timestamp ranges do not prove log continuity.'
         printf '\n%s\n' 'The lists above point to report sections; each finding, evidence item, and recommended response is detailed once in its section below.'
         printf '\n'
     } > "$SUMMARY_TMP"
@@ -4974,31 +5152,95 @@ else
 fi
 
 
-# Export the final deduplicated report; no raw configuration is added to JSON.
-# Deterministic IDs for legacy text findings derive from section + message. Variable
-# counts may change legacy IDs; extensions retain section/source provenance.
+
+# Export fixed group IDs; individual messages remain evidence within each group.
+# IDs are literal arguments at section/subsection callsites: preserve them on edits.
 if command -v perl >/dev/null 2>&1; then
-    perl - "$OUT" "$OUT.json" "$SCRIPT_VERSION" "$CURRENT_INPUT" <<'DEYDA_JSON_PERL'
+    perl - "$OUT" "$OUT.json" "$SCRIPT_VERSION" "$CURRENT_INPUT" "$HOST" <<'DEYDA_JSON_PERL'
 use strict;use warnings;use JSON::PP;use Digest::SHA qw(sha256_hex);
-my($report,$json,$version,$build)=@ARGV;
+my($report,$json,$version,$build,$host)=@ARGV;
 my $data={schema=>'deyda-ioc-v1',script_version=>$version,build=>$build,evidence_source=>'UNKNOWN',enhanced_isn=>'UNKNOWN'};
 if (-f $json) {eval {open my $f,'<',$json or die;local $/;$data=decode_json(<$f>);close $f;1};}
-$data->{schema}='deyda-ioc-v1';$data->{script_version}=$version;$data->{build}=$build;
-$data->{generated_at_epoch}=time;$data->{findings}=[];
+$data->{schema}='deyda-ioc-v1';$data->{script_version}=$version;$data->{build}=$build;$data->{hostname}=$host;
+$data->{check_id_scheme}='deyda-group-v1';$data->{generated_at_epoch}=time;
+$data->{findings}=[];$data->{coverage}=[];$data->{checks}=[];
 open my $fh,'<',$report or exit 1;
-my($section,$subsection)=('Report','');my %seen;
+my($section,$subsection,$id)=('Report','','');my (%seen,%groups);
+my %rank=(OK=>0,CHECK=>1,ACTION=>2,SUSPECT=>2,TARGETED=>2);
 while(my $line=<$fh>) {
-    $section=$1 if $line =~ /^===== (.*?) =====/;
-    $subsection=$1 if $line =~ /^--- (.*?) ---/;
-    if($line =~ /^\[(OK|CHECK|ACTION|SUSPECT|TARGETED)\]\s+(.*)/) {
-        my($status,$message)=($1,$2);my $id='DEYDA-'.substr(sha256_hex("$section\0$subsection\0$message"),0,16);
-        next if $seen{$id}++;
-        push @{$data->{findings}},{check_id=>$id,status=>$status,section=>$section,check=>$subsection,message=>$message,source=>'text_report'};
+    if ($line =~ /(?:Log coverage:|Approved file baseline:|UNKNOWN: running configuration|UNKNOWN: configuration tokenization|coverage.file-baseline scan exceeded|Variable Python-cache baseline differences:)/) {
+        chomp(my $cl=$line);$cl =~ s/^\s+|\s+$//g;
+        push @{$data->{coverage}},$cl unless grep {$_ eq $cl} @{$data->{coverage}};
     }
+    if ($line =~ /^===== (.*?) =====/) {$section=$1;$subsection='';$id='';}
+    if ($line =~ /^--- (.*?) ---/) {$subsection=$1;$id='';}
+    if ($line =~ /^Check-ID: (DEYDA-\d{4})\s*$/) {
+        $id=$1;$groups{$id}//={check_id=>$id,section=>$section,check=>$subsection,status=>'NOT_ASSESSED',finding_count=>0};
+    }
+    next unless $id && $line =~ /^\[(OK|CHECK|ACTION|SUSPECT|TARGETED)\]\s+(.*)/;
+    my($status,$message)=($1,$2);
+    my $evidence_id='EVIDENCE-'.substr(sha256_hex("$id\0$status\0$message"),0,16);next if $seen{$evidence_id}++;
+    my $g=$groups{$id};$g->{finding_count}++;
+    $g->{status}=$status if $g->{status} eq 'NOT_ASSESSED' || $rank{$status}>$rank{$g->{status}};
+    $g->{coverage_incomplete}=JSON::PP::true if $message =~ /UNKNOWN|unavailable|unreadable|incomplete=[1-9]|exceeded|timed out|capped files=[1-9]|unparsed|could not/i;
+    push @{$data->{findings}},{check_id=>$id,evidence_id=>$evidence_id,status=>$status,section=>$section,check=>$subsection,message=>$message,source=>'text_report'};
 }
 close $fh;
+$data->{checks}=[map {$groups{$_}} sort keys %groups];
+my $comparison={status=>'NOT_REQUESTED'};
+if (my $previous=$ENV{DEYDA_PREVIOUS_REPORT_JSON}) {
+    my $prior;
+    my $ok=eval {open my $pf,'<',$previous or die;local $/;my $raw=<$pf>;die if length($raw)>32*1024*1024;$prior=decode_json($raw);close $pf;
+        die unless ref($prior) eq 'HASH' && ($prior->{schema}//'') eq 'deyda-ioc-v1' && ($prior->{check_id_scheme}//'') eq 'deyda-group-v1' &&
+            ref($prior->{checks}) eq 'ARRAY' && ($prior->{hostname}//'') eq $host;1};
+    if (!$ok) {$comparison={status=>'UNKNOWN',reason=>'Previous report unreadable, incompatible IDs, or hostname mismatch. Use a v9.90+ report from this node.'};}
+    else {
+        my (%old,%seen_old);my $valid=1;
+        for my $g(@{$prior->{checks}}) {
+            if (ref($g) ne 'HASH' || ($g->{check_id}//'')!~/^DEYDA-\d{4}$/ || $seen_old{$g->{check_id}}++ || !exists($rank{$g->{status}//''}) && ($g->{status}//'') ne 'NOT_ASSESSED') {$valid=0;last;}
+            $old{$g->{check_id}}=$g;
+        }
+        if (!$valid) {$comparison={status=>'UNKNOWN',reason=>'Previous report contains invalid or duplicate check records.'};}
+        else {
+            $comparison={status=>'COMPARED',previous_build=>$prior->{build},current_build=>$build,previous_generated_at_epoch=>$prior->{generated_at_epoch},
+                new=>[],improved=>[],worsened=>[],now_ok=>[],not_assessed=>[],coverage_worsened=>[],unchanged=>[]};
+            my %ids=map {$_=>1}(keys %old,keys %groups);
+            for my $key(sort keys %ids) {
+                my($before,$after)=($old{$key},$groups{$key});
+                my $row={check_id=>$key,before=>$before?$before->{status}:'NOT_PRESENT',after=>$after?$after->{status}:'NOT_PRESENT'};
+                if (!$after || $after->{status} eq 'NOT_ASSESSED') {push @{$comparison->{not_assessed}},$row;next;}
+                if (!$before || $before->{status} eq 'NOT_ASSESSED') {push @{$comparison->{new}},$row;next;}
+                if ($after->{coverage_incomplete} && !$before->{coverage_incomplete}) {push @{$comparison->{coverage_worsened}},$row;}
+                if ($rank{$after->{status}}>$rank{$before->{status}}) {push @{$comparison->{worsened}},$row;}
+                elsif ($rank{$after->{status}}<$rank{$before->{status}}) {
+                    push @{$comparison->{improved}},$row;
+                    push @{$comparison->{now_ok}},$row if $after->{status} eq 'OK' && !$after->{coverage_incomplete};
+                } else {push @{$comparison->{unchanged}},$row;}
+            }
+            $comparison->{scope}='Group-level comparison; now_ok means selected check results are OK, not proof of remediation or absence of compromise. Verify same partition and equivalent inputs.';
+        }
+    }
+}
+$data->{comparison}=$comparison;
 open my $out,'>',$json or exit 1;
 print $out JSON::PP->new->canonical->pretty->encode($data);close $out or exit 1;
+# Append comparison after export, so derived findings cannot contaminate scanned IDs.
+if (($comparison->{status}//'') ne 'NOT_REQUESTED') {
+    open my $rf,'>>',$report or exit 1;
+    print $rf "\n===== Comparison with previous JSON report =====\n";
+    if ($comparison->{status} eq 'COMPARED') {
+        for my $key(qw(new improved worsened now_ok not_assessed coverage_worsened unchanged)) {
+            print $rf "$key: ".scalar(@{$comparison->{$key}})."\n";
+            my $printed=0;
+            for my $row(@{$comparison->{$key}}) {
+                last if $printed++>=100;
+                print $rf "  $row->{check_id}: $row->{before} -> $row->{after}\n";
+            }
+        }
+        print $rf "$comparison->{scope}\n";
+    } else {print $rf "[CHECK] Report comparison UNKNOWN: $comparison->{reason}\n";}
+    close $rf;
+}
 DEYDA_JSON_PERL
     JSON_RC=$?
     if [ "$JSON_RC" -eq 0 ]; then
